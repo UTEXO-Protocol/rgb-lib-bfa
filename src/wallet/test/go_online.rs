@@ -786,3 +786,78 @@ fn proxy_auth_keys() {
     let online_data = party.wallet.online_data().as_ref().unwrap();
     assert!(online_data.proxy_auth_keys.is_empty());
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn evm_rpc_urls() {
+    initialize();
+
+    let mut party = offline_party!(get_test_wallet(true, None));
+
+    let options_with_urls = |evm_rpc_urls: HashMap<u64, String>| {
+        let mut online_options = test_go_online_options(None);
+        online_options.evm_rpc_urls = evm_rpc_urls;
+        online_options
+    };
+
+    // endpoint that cannot be reached
+    let result = party.wallet.go_online(options_with_urls(HashMap::from([(
+        ANVIL_CHAIN_ID,
+        s!("http://127.0.0.1:1"),
+    )])));
+    assert!(matches!(
+        result,
+        Err(Error::InvalidEvmRpcUrl { details: _ })
+    ));
+
+    // endpoint that is not an EVM JSON-RPC server
+    let result = party.wallet.go_online(options_with_urls(HashMap::from([(
+        ANVIL_CHAIN_ID,
+        format!("http://{PROXY_HOST}"),
+    )])));
+    assert!(matches!(
+        result,
+        Err(Error::InvalidEvmRpcUrl { details: _ })
+    ));
+
+    // endpoint on a chain other than the one it is configured for
+    let result = party.wallet.go_online(options_with_urls(HashMap::from([(
+        ANVIL_CHAIN_ID + 1,
+        EVM_RPC_URL.to_string(),
+    )])));
+    assert!(matches!(
+        result,
+        Err(Error::EvmChainIdMismatch { expected, actual })
+            if expected == ANVIL_CHAIN_ID + 1 && actual == ANVIL_CHAIN_ID
+    ));
+    assert!(party.wallet.online_data().is_none());
+
+    // no endpoints: going online works, mint operations will need one
+    let online = party
+        .wallet
+        .go_online(options_with_urls(HashMap::new()))
+        .unwrap();
+    assert!(
+        party
+            .wallet
+            .online_data()
+            .as_ref()
+            .unwrap()
+            .evm_rpc_urls
+            .is_empty()
+    );
+
+    // going online again with the same indexer keeps the online object and replaces the URLs
+    let online_2 = party
+        .wallet
+        .go_online(options_with_urls(HashMap::from([(
+            ANVIL_CHAIN_ID,
+            EVM_RPC_URL.to_string(),
+        )])))
+        .unwrap();
+    assert_eq!(online_2, online);
+    let online_data = party.wallet.online_data().as_ref().unwrap();
+    assert_eq!(online_data.evm_rpc_urls.len(), 1);
+    assert_eq!(online_data.evm_rpc_urls[&ANVIL_CHAIN_ID], EVM_RPC_URL);
+}
