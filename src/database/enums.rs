@@ -18,6 +18,9 @@ pub enum AssetSchema {
     /// IFA schema
     #[sea_orm(num_value = 4)]
     Ifa = 4,
+    /// BFA schema
+    #[sea_orm(num_value = 5)]
+    Bfa = 5,
 }
 
 impl fmt::Display for AssetSchema {
@@ -35,6 +38,7 @@ impl TryFrom<String> for AssetSchema {
             SCHEMA_ID_UDA => AssetSchema::Uda,
             SCHEMA_ID_CFA => AssetSchema::Cfa,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
+            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -50,7 +54,7 @@ impl TryFrom<SchemaId> for AssetSchema {
 
 impl AssetSchema {
     pub(crate) const VALUES: [Self; NUM_KNOWN_SCHEMAS] =
-        [Self::Nia, Self::Uda, Self::Cfa, Self::Ifa];
+        [Self::Nia, Self::Uda, Self::Cfa, Self::Ifa, Self::Bfa];
 
     fn from_schema_id_str(schema_id: String) -> Result<Self, Error> {
         Ok(match &schema_id[..] {
@@ -58,6 +62,7 @@ impl AssetSchema {
             SCHEMA_ID_UDA => AssetSchema::Uda,
             SCHEMA_ID_CFA => AssetSchema::Cfa,
             SCHEMA_ID_IFA => AssetSchema::Ifa,
+            SCHEMA_ID_BFA => AssetSchema::Bfa,
             _ => return Err(Error::UnknownRgbSchema { schema_id }),
         })
     }
@@ -82,6 +87,7 @@ impl AssetSchema {
             Self::Uda => UniqueDigitalAsset::schema_rules(),
             Self::Cfa => CollectibleFungibleAsset::schema_rules(),
             Self::Ifa => InflatableFungibleAsset::schema_rules(),
+            Self::Bfa => BridgedFungibleAsset::schema_rules(),
         }
     }
 
@@ -91,6 +97,7 @@ impl AssetSchema {
             Self::Uda => UniqueDigitalAsset::schema_definition(),
             Self::Cfa => CollectibleFungibleAsset::schema_definition(),
             Self::Ifa => InflatableFungibleAsset::schema_definition(),
+            Self::Bfa => BridgedFungibleAsset::schema_definition(),
         }
     }
 
@@ -106,6 +113,7 @@ impl From<AssetSchema> for SchemaId {
             AssetSchema::Ifa => SchemaId::from_str(SCHEMA_ID_IFA).unwrap(),
             AssetSchema::Nia => SchemaId::from_str(SCHEMA_ID_NIA).unwrap(),
             AssetSchema::Uda => SchemaId::from_str(SCHEMA_ID_UDA).unwrap(),
+            AssetSchema::Bfa => SchemaId::from_str(SCHEMA_ID_BFA).unwrap(),
         }
     }
 }
@@ -368,6 +376,8 @@ pub enum Assignment {
     NonFungible,
     /// Inflation right
     InflationRight(u64),
+    /// Mint right
+    MintRight,
     /// Any assignment
     Any,
 }
@@ -380,6 +390,7 @@ impl Assignment {
                 Self::InflationRight(amt.as_u64())
             }
             AllocatedState::Data(_) => Self::NonFungible,
+            AllocatedState::Void if opout.ty == OS_MINT => Self::MintRight,
             _ => unreachable!(),
         }
     }
@@ -399,6 +410,12 @@ impl Assignment {
                     .inflation
                     .checked_add(*amt)
                     .expect("total inflation amount cannot exceed u64::MAX")
+            }
+            Self::MintRight => {
+                assignments.mint = assignments
+                    .mint
+                    .checked_add(1)
+                    .expect("total mint rights cannot exceed u64::MAX")
             }
             _ => unreachable!("when using this method we should know the assignment type"),
         }
@@ -496,6 +513,9 @@ mod tests {
             let schema_id = asset_schema.into();
             let asset_schema_from_schema_id = AssetSchema::from_schema_id(schema_id).unwrap();
             assert_eq!(asset_schema, asset_schema_from_schema_id);
+            // the constants match the compiled schemata
+            #[cfg(feature = "_online")]
+            assert_eq!(asset_schema.schema_rules().schema_id(), schema_id);
         }
 
         // unknown
@@ -509,6 +529,7 @@ mod tests {
         assert_eq!(AssetSchema::Uda.to_string(), "Uda");
         assert_eq!(AssetSchema::Cfa.to_string(), "Cfa");
         assert_eq!(AssetSchema::Ifa.to_string(), "Ifa");
+        assert_eq!(AssetSchema::Bfa.to_string(), "Bfa");
     }
 
     #[test]

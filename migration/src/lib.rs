@@ -10,6 +10,7 @@ mod m20260727_115821_add_bdk_tables;
 mod m20261006_093003_add_pending_witness_indexes;
 mod m20261006_131232_add_rgb_storage_tables;
 mod m20261006_141724_proxy_v1;
+mod m20261007_214849_asset_transfer_transition;
 
 pub struct Migrator;
 
@@ -27,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261006_093003_add_pending_witness_indexes::Migration),
             Box::new(m20261006_131232_add_rgb_storage_tables::Migration),
             Box::new(m20261006_141724_proxy_v1::Migration),
+            Box::new(m20261007_214849_asset_transfer_transition::Migration),
         ]
     }
 }

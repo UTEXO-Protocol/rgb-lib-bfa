@@ -513,6 +513,8 @@ fn supported_schemas() {
     assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
     let result = party_nia.issue_asset_uda_result(None, None, vec![]);
     assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
+    let result = party_nia.issue_asset_bfa_result(1, s!("FAKEAdd"), None);
+    assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
 
     // recipient wallet (UDA schema supported)
     let keys_rcv = generate_keys(bitcoin_network, WitnessVersion::Taproot);
@@ -595,6 +597,38 @@ fn supported_schemas() {
     let result = party_cfa.send_result(&recipient_map);
     assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
 
+    // wallet (BFA schema supported)
+    let mut wallet_bfa = Wallet::new(
+        WalletData {
+            data_dir: get_test_data_dir_string(),
+            bitcoin_network,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+            supported_schemas: vec![AssetSchema::Bfa],
+        },
+        SinglesigKeys::from_keys(&keys, None),
+    )
+    .unwrap();
+    let online_bfa = wallet_bfa.go_online(test_go_online_options(None)).unwrap();
+    let mut party_bfa = party!(wallet_bfa, online_bfa);
+
+    // send asset unsupported by the sender
+    let receive_data = rcv_party_uda.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_nia.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(66),
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+        }],
+    )]);
+    let result = party_bfa.send_result(&recipient_map);
+    assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
+
     // wallet (no schema supported)
     let result = Wallet::new(
         WalletData {
@@ -627,7 +661,34 @@ fn supported_schemas() {
     // IFA on mainnet not allowed
     assert!(result.is_err());
     if let Err(e) = result {
-        assert_matches!(e, Error::CannotUseIfaOnMainnet);
+        assert_matches!(
+            e,
+            Error::CannotUseSchemaOnMainnet {
+                asset_schema: AssetSchema::Ifa
+            }
+        );
+    }
+
+    // wallet (mainnet, BFA schema supported)
+    let result = Wallet::new(
+        WalletData {
+            data_dir: get_test_data_dir_string(),
+            bitcoin_network,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+            supported_schemas: vec![AssetSchema::Nia, AssetSchema::Bfa],
+        },
+        SinglesigKeys::from_keys(&keys_mainnet, None),
+    );
+    // BFA on mainnet not allowed
+    assert!(result.is_err());
+    if let Err(e) = result {
+        assert_matches!(
+            e,
+            Error::CannotUseSchemaOnMainnet {
+                asset_schema: AssetSchema::Bfa
+            }
+        );
     }
 }
 

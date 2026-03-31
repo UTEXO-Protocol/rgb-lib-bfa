@@ -460,6 +460,18 @@ pub fn script_buf_from_recipient_id(recipient_id: String) -> Result<Option<Scrip
     }
 }
 
+/// The URL of a BFA reject list, if the contract declares one served at a URL.
+///
+/// This is only the URL recorded in the DB and reported in the asset metadata: a reject list kept
+/// by an EVM contract has no URL, so it gives `None` here, but it is still enforced, as the reject
+/// list of a BFA asset is read off its contract when needed (see `asset_reject_list_source`).
+pub(crate) fn bfa_reject_list_url(location: Option<RejectListLocation>) -> Option<String> {
+    match location? {
+        RejectListLocation::Url(url) => Some(url.to_string()),
+        RejectListLocation::Evm(_) => None,
+    }
+}
+
 pub(crate) fn beneficiary_from_script_buf(script_buf: ScriptBuf) -> Beneficiary {
     let address_payload = AddressPayload::from_script(&script_buf).unwrap();
     Beneficiary::WitnessVout(Pay2Vout::new(address_payload), None)
