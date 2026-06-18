@@ -276,6 +276,11 @@ impl WalletOnline for MultisigWallet {
         false
     }
 
+    // every cosigner downloads the consignment from the recipient proxy
+    fn releases_received_transfer_data(&self) -> bool {
+        false
+    }
+
     fn get_hub_fail_status(&self, batch_transfer_idx: i32) -> Result<bool, Error> {
         Ok(self
             .hub_client()
@@ -378,6 +383,7 @@ struct ReceiveMetadata {
     min_confirmations: u8,
     expiration_timestamp: i64,
     secret_seal: Option<GraphSeal>,
+    seed: String,
 }
 
 /// Operations for multisig wallets.
@@ -1284,7 +1290,7 @@ impl MultisigWallet {
         files.append(&mut additional_files);
         let response = self
             .hub_client()
-            .post_operation(files, OperationType::Issuance)?;
+            .post_operation(files, OperationType::Issuance, None)?;
         let mut stock = self.rgb_stock(txn)?;
         let asset = self.import_and_save_contract(txn, issue_data, &mut stock)?;
         self.mark_operation_as_processed(txn, response.operation_idx)?;
@@ -1454,8 +1460,10 @@ impl MultisigWallet {
         Ok(res)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn receive_impl(
         &mut self,
+        online: Online,
         asset_id: Option<String>,
         assignment: Assignment,
         expiration_timestamp: u64,
@@ -1463,6 +1471,7 @@ impl MultisigWallet {
         min_confirmations: u8,
         recipient_type: RecipientType,
         operation_type: OperationType,
+        encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
         if transport_endpoints.is_empty() {
             return Err(Error::UnsupportedTransportType);
@@ -1473,11 +1482,13 @@ impl MultisigWallet {
         // shared receive data creation logic
         let receive_data_internal = self.create_receive_data(
             &txn,
+            Some(online),
             asset_id,
             assignment,
             expiration_timestamp as i64,
             transport_endpoints,
             recipient_type,
+            encryption,
         )?;
 
         // post operation and metadata to hub
@@ -1487,10 +1498,15 @@ impl MultisigWallet {
             min_confirmations,
             expiration_timestamp,
             secret_seal: receive_data_internal.blind_seal,
+            seed: hex::encode(&receive_data_internal.operation_secret_key),
         };
         let metadata_json = serde_json::to_vec(&receive_metadata).expect("serializable");
         let files = vec![(FileType::OperationData, FileSource::Bytes(metadata_json))];
-        let response = self.hub_client().post_operation(files, operation_type)?;
+        let response = self.hub_client().post_operation(
+            files,
+            operation_type,
+            Some(&receive_data_internal.operation_secret_key),
+        )?;
 
         // store transfer
         let batch_transfer_idx =
@@ -1507,6 +1523,7 @@ impl MultisigWallet {
             recipient_id: receive_data_internal.recipient_id,
             expiration_timestamp: expiration_timestamp as u64,
             batch_transfer_idx,
+            public_key: hex::encode(&receive_data_internal.recipient_pubkey),
         })
     }
 
@@ -1542,6 +1559,7 @@ impl MultisigWallet {
         expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
+        encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger(),
@@ -1552,6 +1570,7 @@ impl MultisigWallet {
         self.check_online(online)?;
         self.check_is_cosigner()?;
         let receive_data = self.receive_impl(
+            online,
             asset_id,
             assignment,
             expiration_timestamp,
@@ -1559,6 +1578,7 @@ impl MultisigWallet {
             min_confirmations,
             RecipientType::Blind,
             OperationType::BlindReceive,
+            encryption,
         )?;
         info!(self.logger(), "Blind receive completed");
         Ok(receive_data)
@@ -1596,6 +1616,7 @@ impl MultisigWallet {
         expiration_timestamp: u64,
         transport_endpoints: Vec<String>,
         min_confirmations: u8,
+        encryption: Option<Encryption>,
     ) -> Result<ReceiveData, Error> {
         info!(
             self.logger(),
@@ -1606,6 +1627,7 @@ impl MultisigWallet {
         self.check_online(online)?;
         self.check_is_cosigner()?;
         let receive_data = self.receive_impl(
+            online,
             asset_id,
             assignment,
             expiration_timestamp,
@@ -1613,6 +1635,7 @@ impl MultisigWallet {
             min_confirmations,
             RecipientType::Witness,
             OperationType::WitnessReceive,
+            encryption,
         )?;
         info!(self.logger(), "Witness receive completed");
         Ok(receive_data)
@@ -1791,6 +1814,17 @@ impl MultisigWallet {
             blind_seal,
             recipient_type_full,
             script_pubkey,
+            operation_secret_key: hex::decode(&receive_metadata.seed).map_err(|_| {
+                Error::MultisigUnexpectedData {
+                    details: s!("invalid operation seed"),
+                }
+            })?,
+            recipient_pubkey: invoice_data
+                .public_key
+                .as_ref()
+                .and_then(|h| hex::decode(h).ok())
+                .unwrap_or_default(),
+            encryption: invoice_data.encryption,
         };
         let batch_transfer_idx =
             self.store_receive_transfer(txn, &receive_data_internal, min_confirmations)?;
@@ -1800,6 +1834,7 @@ impl MultisigWallet {
             recipient_id,
             expiration_timestamp: receive_data_internal.expiration_timestamp as u64,
             batch_transfer_idx,
+            public_key: hex::encode(&receive_data_internal.recipient_pubkey),
         })
     }
 
@@ -1809,6 +1844,11 @@ impl MultisigWallet {
     /// local index) from the hub.
     /// If the operation is found, it is processed and the operation info is returned.
     /// If the operation isn't found (i.e. the cosigner is already in sync), None is returned.
+    ///
+    /// A send or receive operation created with the previous proxy protocol, which is
+    /// not backward compatible, cannot be processed: [`Error::MultisigLegacyOperation`] is
+    /// returned and the sync does not move past it, as the group must be drained with the
+    /// previous version and abandoned.
     pub fn sync_with_hub(&mut self, online: Online) -> Result<Option<OperationInfo>, Error> {
         info!(self.logger(), "Syncing with hub...");
         self.check_online(online)?;
@@ -1989,8 +2029,63 @@ impl MultisigWallet {
         }
     }
 
+    /// Name of the operation key field in the operation data of the given operation type, if the
+    /// type has one (`operation_secret_key` for a send, `seed` for a receive).
+    fn operation_key_name(operation_type: &OperationType) -> Option<&'static str> {
+        match operation_type {
+            OperationType::SendRgb => Some("operation_secret_key"),
+            OperationType::BlindReceive | OperationType::WitnessReceive => Some("seed"),
+            _ => None,
+        }
+    }
+
+    /// Whether the given operation data lacks the operation key field, as data created with the
+    /// previous proxy protocol does.
+    fn operation_data_lacks_key(key: &str, data: &serde_json::Value) -> bool {
+        data.get(key).is_none_or(|v| v.is_null())
+    }
+
+    /// Whether a send or receive operation was created with the previous proxy protocol, i.e. its
+    /// operation data carries no operation key. The protocol keeps no backward compatibility, so
+    /// such an operation can only come from a group that was not drained before upgrading, which
+    /// cannot be used with this version. The key is written to the operation data when the
+    /// operation is created, so this is detected as soon as the operation is seen, whatever its
+    /// status.
+    fn is_legacy_operation(op: &OperationResponse, files: &[FileResponse]) -> Result<bool, Error> {
+        let Some(key) = Self::operation_key_name(&op.operation_type) else {
+            return Ok(false);
+        };
+        // a legacy operation still has this file, just without the key checked below; a missing
+        // file is a different, unexpected failure, left for the normal handler to report
+        let Some(data_file) = files
+            .iter()
+            .find(|f| matches!(f.r#type, FileType::OperationData))
+        else {
+            return Ok(false);
+        };
+        let reader = io::BufReader::new(fs::File::open(&data_file.filepath)?);
+        let data: serde_json::Value =
+            serde_json::from_reader(reader).map_err(|_| Error::MultisigUnexpectedData {
+                details: s!("invalid operation data"),
+            })?;
+        Ok(Self::operation_data_lacks_key(key, &data))
+    }
+
     fn process_operation(&mut self, op: &OperationResponse) -> Result<Operation, Error> {
         let files = self.get_or_download_files(op.files.clone())?;
+        // an operation from the previous proxy protocol cannot be processed and is not marked as
+        // processed either: the sync stops here on every call, as the group must be drained with
+        // the previous version and abandoned
+        if Self::is_legacy_operation(op, &files)? {
+            error!(
+                self.logger(),
+                "Operation {} was created with the previous proxy protocol, the group cannot be used",
+                op.operation_idx
+            );
+            return Err(Error::MultisigLegacyOperation {
+                operation_idx: op.operation_idx,
+            });
+        }
         Ok(match op.operation_type {
             OperationType::CreateUtxos => {
                 self.handle_operation::<CreateUtxosHandler>(op, &files)?
@@ -2116,6 +2211,18 @@ impl MultisigWallet {
         operation_type: OperationType,
         post_data: PostData,
     ) -> Result<InitOperationResult, Error> {
+        // the hub only accepts the operation seed for the operation types requiring it
+        let seed = if OPERATION_TYPES_REQUIRING_SEED.contains(&operation_type) {
+            match &post_data {
+                PostData::Psbt(_) => None,
+                PostData::BeginOperationData(data) => {
+                    data.info_batch_transfer.operation_secret_key.clone()
+                }
+            }
+        } else {
+            None
+        };
+
         // collect operation files
         let mut files = vec![];
         let psbt = match post_data {
@@ -2136,7 +2243,9 @@ impl MultisigWallet {
         files.push((FileType::OperationPsbt, FileSource::Bytes(psbt.serialize())));
 
         // post operation and its files
-        let response = self.hub_client().post_operation(files, operation_type)?;
+        let response = self
+            .hub_client()
+            .post_operation(files, operation_type, seed.as_deref())?;
 
         Ok(InitOperationResult {
             psbt: psbt.to_string(),
@@ -2241,6 +2350,7 @@ impl MultisigWallet {
         fee_rate: u64,
         min_confirmations: u8,
         expiration_timestamp: u64,
+        sender_transport_endpoint: String,
     ) -> Result<InitOperationResult, Error> {
         info!(self.logger(), "Initiate sending...");
         self.check_online(online)?;
@@ -2253,6 +2363,7 @@ impl MultisigWallet {
             fee_rate,
             min_confirmations,
             Some(expiration_timestamp as i64),
+            Some(sender_transport_endpoint),
             true,
         )?;
         let res = self.post_operation(
@@ -2351,6 +2462,43 @@ impl MultisigWallet {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[cfg(feature = "_online")]
+    #[test]
+    fn legacy_operation_detection() {
+        // only sends and receives carry an operation key
+        assert_eq!(
+            MultisigWallet::operation_key_name(&OperationType::SendRgb),
+            Some("operation_secret_key")
+        );
+        assert_eq!(
+            MultisigWallet::operation_key_name(&OperationType::BlindReceive),
+            Some("seed")
+        );
+        assert_eq!(
+            MultisigWallet::operation_key_name(&OperationType::WitnessReceive),
+            Some("seed")
+        );
+        for op_type in [
+            OperationType::CreateUtxos,
+            OperationType::SendBtc,
+            OperationType::Inflation,
+            OperationType::Burn,
+        ] {
+            assert_eq!(MultisigWallet::operation_key_name(&op_type), None);
+        }
+
+        // legacy data has no key (or a null one), current data has it
+        let legacy = serde_json::json!({ "min_confirmations": 1 });
+        assert!(MultisigWallet::operation_data_lacks_key(
+            "operation_secret_key",
+            &legacy
+        ));
+        let null_key = serde_json::json!({ "seed": null });
+        assert!(MultisigWallet::operation_data_lacks_key("seed", &null_key));
+        let current = serde_json::json!({ "seed": "00".repeat(32) });
+        assert!(!MultisigWallet::operation_data_lacks_key("seed", &current));
+    }
 
     #[test]
     fn cosigner_display_and_parse() {

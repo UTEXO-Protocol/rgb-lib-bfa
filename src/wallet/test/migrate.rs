@@ -3,6 +3,23 @@ use super::*;
 const LEGACY_FIXTURE_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
+/// Extract the legacy wallet fixture into `data_dir`, returning the wallet keys.
+fn extract_legacy_fixture(data_dir: &Path) -> Keys {
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("legacy_nia.zip");
+    let file = File::open(fixture_path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    archive.extract(data_dir).unwrap();
+    restore_keys(
+        BitcoinNetwork::Regtest,
+        LEGACY_FIXTURE_MNEMONIC.to_string(),
+        WitnessVersion::Taproot,
+    )
+    .unwrap()
+}
+
 /// Test for the one-time migration of RGB data from the legacy filesystem store
 /// (`<wallet_dir>/rgb/{stash,state,index}.dat`) into the rgb-lib database.
 ///
@@ -13,20 +30,8 @@ const LEGACY_FIXTURE_MNEMONIC: &str =
 #[parallel]
 fn migrate_legacy_fs_store() {
     let tmp_dir = tempfile::tempdir().unwrap();
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("legacy_nia.zip");
-    let file = File::open(fixture_path).unwrap();
-    let mut archive = zip::ZipArchive::new(file).unwrap();
-    archive.extract(tmp_dir.path()).unwrap();
     let data_dir = tmp_dir.path().to_path_buf();
-    let keys = restore_keys(
-        BitcoinNetwork::Regtest,
-        LEGACY_FIXTURE_MNEMONIC.to_string(),
-        WitnessVersion::Taproot,
-    )
-    .unwrap();
+    let keys = extract_legacy_fixture(&data_dir);
     let wallet_dir = data_dir.join(&keys.master_fingerprint);
 
     // sanity: the fixture really is a legacy (fs-store) wallet not yet migrated
@@ -161,4 +166,132 @@ fn migrate_legacy_fs_store() {
         !restored_wallet_dir.join(RGB_RUNTIME_DELETING_DIR).exists(),
         "a leftover retired legacy store should be excluded from backups"
     );
+}
+
+/// Collect the witness TXs carried by every consignment (received or sent) under `dir`.
+fn collect_consignment_txs(dir: &Path, txs: &mut HashMap<String, BdkTransaction>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_consignment_txs(&path, txs);
+            continue;
+        }
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if name == CONSIGNMENT_RCV_FILE || name == CONSIGNMENT_FILE {
+            let consignment = RgbTransfer::load_file(&path).unwrap();
+            for witness_bundle in consignment.bundled_witnesses() {
+                txs.insert(
+                    witness_bundle.tx.compute_txid().to_string(),
+                    witness_bundle.tx.clone(),
+                );
+            }
+        }
+    }
+}
+
+/// A wallet upgraded with transfers still pending must bring every one of them to a final status
+/// without errors (nor panics): the ones whose TX is on chain settle, the others are failed since,
+/// the proxy protocol being not backward compatible, they can no longer be completed.
+///
+/// The fixture holds one batch transfer per pending status (see the storage migration test), the
+/// ones that cannot complete already expired. The regtest knows nothing of the fixture's TXs, so
+/// the chain is mocked: every TX carried by the wallet's consignments counts as mined in the
+/// current tip block, except for the transfers whose counterparty never broadcast (the ones not
+/// yet past the ACK), which stay unknown.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn legacy_pending_transfers() {
+    initialize();
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let data_dir = tmp_dir.path().to_path_buf();
+    let keys = extract_legacy_fixture(&data_dir);
+    let wallet_dir = data_dir.join(&keys.master_fingerprint);
+    let wallet_data = get_test_wallet_data(data_dir.to_str().unwrap());
+    let mut wallet = Wallet::new(wallet_data, SinglesigKeys::from_keys(&keys, None)).unwrap();
+    let online = wallet.go_online(test_go_online_options(None)).unwrap();
+    let mut w = party!(wallet, online);
+
+    let pending: Vec<DbBatchTransfer> = w
+        .db_batch_transfers()
+        .into_iter()
+        .filter(|bt| bt.waiting())
+        .collect();
+    assert_eq!(pending.len(), 7);
+    assert!(pending.iter().all(|bt| bt.is_legacy()));
+    let status_of = |w: &SinglesigParty, idx: i32| {
+        w.db_batch_transfers()
+            .into_iter()
+            .find(|bt| bt.idx == idx)
+            .unwrap()
+            .status
+    };
+
+    // mock the chain
+    let never_broadcast: HashSet<String> = pending
+        .iter()
+        .filter(|bt| {
+            matches!(
+                bt.status,
+                TransferStatus::WaitingCounterparty
+                    | TransferStatus::WaitingSafeHeight
+                    | TransferStatus::WaitingBroadcast
+            )
+        })
+        .filter_map(|bt| bt.txid.clone())
+        .collect();
+    let tip = w.wallet.indexer().get_latest_block_height().unwrap();
+    let mut txs = HashMap::new();
+    collect_consignment_txs(&wallet_dir.join(TRANSFERS_DIR), &mut txs);
+    MOCK_CHAIN_TXS.with_borrow_mut(|m| {
+        *m = txs
+            .into_iter()
+            .filter(|(txid, _)| !never_broadcast.contains(txid))
+            .map(|(txid, tx)| (txid, (tx, tip)))
+            .collect();
+    });
+
+    // refresh (no chain sync: the regtest doesn't know the wallet) and check that no transfer
+    // errored, that the ones whose TX is on chain settled and that the others failed
+    let refresh_and_check = |w: &mut SinglesigParty| {
+        let refresh_res = w.wallet.refresh(w.online, None, vec![], true).unwrap();
+        let mut errors = vec![];
+        for bt in &pending {
+            // a settled or failed transfer is no longer refreshed
+            let failure = refresh_res.get(&bt.idx).and_then(|r| r.failure.as_ref());
+            let status = status_of(w, bt.idx);
+            println!(
+                "batch transfer {} ({}, was {:?}): now {status:?}, failure: {failure:?}",
+                bt.idx,
+                if bt.incoming { "incoming" } else { "outgoing" },
+                bt.status,
+            );
+            if let Some(e) = failure {
+                errors.push(format!("batch transfer {} ({:?}): {e}", bt.idx, bt.status));
+            }
+            let expected = match bt.status {
+                TransferStatus::WaitingConfirmations => TransferStatus::Settled,
+                _ => TransferStatus::Failed,
+            };
+            if status != expected {
+                errors.push(format!(
+                    "batch transfer {} ({:?}): expected {expected:?}, got {status:?}",
+                    bt.idx, bt.status
+                ));
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "refresh problems:\n{}",
+            errors.join("\n")
+        );
+    };
+    refresh_and_check(&mut w);
+
+    // nothing is left pending: a further refresh (and a fail of the expired transfers) is a no-op
+    refresh_and_check(&mut w);
+    assert!(!w.fail_transfers(None, false, true).unwrap());
+
+    MOCK_CHAIN_TXS.with_borrow_mut(|m| m.clear());
 }

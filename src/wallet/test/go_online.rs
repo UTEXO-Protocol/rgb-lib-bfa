@@ -167,6 +167,9 @@ fn bitcoind() {
             recipient_id: receive_data.recipient_id.clone(),
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
         }],
     )]);
     let txid = party
@@ -178,6 +181,7 @@ fn bitcoind() {
             FEE_RATE,
             MIN_CONFIRMATIONS,
             default_send_expiration(),
+            Some(PROXY_ENDPOINT.clone()),
         )
         .unwrap()
         .txid;
@@ -191,7 +195,6 @@ fn bitcoind() {
     };
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(Some(&asset.asset_id));
-    rcv_party.wait_for_refresh(None);
     assert_eq!(
         transfer_statuses(&party, &rcv_party),
         (
@@ -616,4 +619,99 @@ fn offline() {
     // the online check should report that the wallet is offline
     let result = party.create_utxos_begin_result(true, None, None, FEE_RATE);
     assert!(matches!(result, Err(Error::Offline)));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_auth_keys() {
+    initialize();
+
+    let mut party = offline_party!(get_test_wallet(true, None));
+
+    // the test seed matches the pubkey the proxy-auth service is started with
+    let seed: [u8; 32] = hex::decode(PROXY_AUTH_SEED).unwrap().try_into().unwrap();
+    let sk = ed25519_from_seed(&seed);
+    assert_eq!(
+        hex::encode(sk.verifying_key().to_bytes()),
+        PROXY_AUTH_PUBKEY
+    );
+
+    let options_with_keys = |proxy_auth_keys: HashMap<String, String>| {
+        let mut online_options = test_go_online_options(None);
+        online_options.proxy_auth_keys = proxy_auth_keys;
+        online_options
+    };
+
+    // invalid transport endpoint
+    let result = party.wallet.go_online(options_with_keys(HashMap::from([(
+        PROXY_HOST.to_string(),
+        PROXY_AUTH_SEED.to_string(),
+    )])));
+    assert!(matches!(
+        result,
+        Err(Error::InvalidTransportEndpoint { details: _ })
+    ));
+
+    // unsupported transport endpoint
+    let result = party.wallet.go_online(options_with_keys(HashMap::from([(
+        format!("ws://{PROXY_HOST}"),
+        PROXY_AUTH_SEED.to_string(),
+    )])));
+    assert!(matches!(result, Err(Error::UnsupportedTransportType)));
+
+    // invalid seeds: not hex, wrong length
+    for seed in [
+        "not hex",
+        &PROXY_AUTH_SEED[..62],
+        &format!("{PROXY_AUTH_SEED}00"),
+    ] {
+        let result = party.wallet.go_online(options_with_keys(HashMap::from([(
+            PROXY_ENDPOINT.clone(),
+            seed.to_string(),
+        )])));
+        assert!(matches!(
+            result,
+            Err(Error::InvalidProxyAuthKey { details: _ })
+        ));
+    }
+    assert!(party.wallet.online_data().is_none());
+
+    // keys are stored by proxy URL
+    let online = party
+        .wallet
+        .go_online(options_with_keys(HashMap::from([(
+            PROXY_ENDPOINT.clone(),
+            PROXY_AUTH_SEED.to_string(),
+        )])))
+        .unwrap();
+    let online_data = party.wallet.online_data().as_ref().unwrap();
+    assert_eq!(online_data.proxy_auth_keys.len(), 1);
+    assert_eq!(online_data.proxy_auth_keys[PROXY_URL].to_bytes(), seed);
+
+    // signatures are only produced for configured proxies and verify against the pubkey
+    let message = "message";
+    let digest = sha256_digest(message.as_bytes());
+    let signature = online_data
+        .proxy_auth_signature(PROXY_URL, message)
+        .unwrap();
+    assert!(verify_ed25519(
+        &sk.verifying_key(),
+        &digest,
+        &hex::decode(signature).unwrap()
+    ));
+    assert!(
+        online_data
+            .proxy_auth_signature("http://other/json-rpc", message)
+            .is_none()
+    );
+
+    // going online again with the same indexer keeps the online object and replaces the keys
+    let online_2 = party
+        .wallet
+        .go_online(options_with_keys(HashMap::new()))
+        .unwrap();
+    assert_eq!(online_2, online);
+    let online_data = party.wallet.online_data().as_ref().unwrap();
+    assert!(online_data.proxy_auth_keys.is_empty());
 }

@@ -426,6 +426,67 @@ pub(crate) fn get_proxy_client(proxy_url: Option<&str>) -> ProxyClient {
     ProxyClient::new(proxy_url.unwrap_or(PROXY_URL)).unwrap()
 }
 
+/// Post a consignment file to the invoice of `recipient_id` (with pubkey `recipient_pk`) acting as
+/// a sender with a fresh key, returning the sender key and the transfer ID.
+#[cfg(feature = "electrum")]
+pub(crate) fn post_test_consignment(
+    proxy_client: &ProxyClient,
+    recipient_id: &str,
+    recipient_pk: &str,
+    consignment_path: &Path,
+    consignment_hash: &str,
+) -> (ed25519_dalek::SigningKey, String) {
+    let sender_sk = gen_ed25519();
+    let sender_pk = hex::encode(sender_sk.verifying_key().to_bytes());
+    let invoice_id = invoice_id(recipient_id, recipient_pk);
+    let transfer_id = transfer_id(&invoice_id, &sender_pk);
+    let blob_hash = hash_file(consignment_path).unwrap();
+    let digest = sha256_digest(
+        post_consignment_message(&transfer_id, consignment_hash, &blob_hash).as_bytes(),
+    );
+    let data = PostConsignmentData {
+        invoice_id,
+        transfer_id: transfer_id.clone(),
+        sender_transport_endpoint: PROXY_ENDPOINT.clone(),
+        sender_pk,
+        consignment_hash: consignment_hash.to_string(),
+        batch: false,
+        signature: hex::encode(sign_ed25519(&sender_sk, &digest)),
+    };
+    let res = proxy_client
+        .post_consignment(
+            &data,
+            consignment_path,
+            &now().unix_timestamp().to_string(),
+            "0",
+        )
+        .unwrap();
+    assert_eq!(res.result, Some(true), "{:?}", res.error);
+    (sender_sk, transfer_id)
+}
+
+/// Post a media file for a transfer created with [`post_test_consignment`].
+#[cfg(feature = "electrum")]
+pub(crate) fn post_test_media(
+    proxy_client: &ProxyClient,
+    sender_sk: &ed25519_dalek::SigningKey,
+    transfer_id: &str,
+    media_id: &str,
+    media_path: &Path,
+) {
+    let blob_hash = hash_file(media_path).unwrap();
+    let digest = sha256_digest(post_media_message(transfer_id, media_id, &blob_hash).as_bytes());
+    let res = proxy_client
+        .post_media(
+            transfer_id,
+            media_id,
+            media_path,
+            &hex::encode(sign_ed25519(sender_sk, &digest)),
+        )
+        .unwrap();
+    assert_eq!(res.result, Some(true), "{:?}", res.error);
+}
+
 #[cfg(feature = "bitcoind")]
 pub(crate) fn bitcoind_pass_auth() -> BitcoindAuth {
     BitcoindAuth::UserPass {
@@ -485,6 +546,7 @@ pub(crate) fn test_go_online_options(indexer_url: Option<&str>) -> OnlineOptions
         skip_consistency_check: true,
         vanilla_sync_lookback: INDEXER_SYNC_LOOKBACK as u32,
         failed_witness_receive_grace_secs: FAILED_WITNESS_RECEIVE_GRACE_SECS,
+        proxy_auth_keys: HashMap::new(),
     }
 }
 
