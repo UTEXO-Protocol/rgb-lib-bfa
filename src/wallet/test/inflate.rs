@@ -109,7 +109,7 @@ fn success() {
         assert!(transfer.expiration_timestamp.is_none());
         assert!(transfer.transport_endpoints.is_empty());
         assert!(transfer.invoice_string.is_none());
-        assert!(transfer.consignment_path.is_some());
+        assert!(transfer.consignment_path.is_none());
     }
     assert_eq!(recipient_id_set.len(), inflation_amounts.len());
     assert_eq!(receive_utxo_set.len(), inflation_amounts.len());
