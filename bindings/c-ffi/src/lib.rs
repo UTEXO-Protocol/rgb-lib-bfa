@@ -13,6 +13,7 @@ use std::{
 
 use rgb_lib::{
     AssetSchema, Assignment, Encryption, Error as RgbLibError,
+    inspect::BundleFilter,
     keys::WitnessVersion,
     utils::BitcoinNetwork,
     wallet::{
@@ -356,6 +357,14 @@ pub extern "C" fn rgblib_inflate_end(
     signed_psbt: *const c_char,
 ) -> CResultString {
     inflate_end(wallet, online, signed_psbt).into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_inspect_consignment(
+    consignment_path: *const c_char,
+    bundle_filter: *const c_char,
+) -> CResultString {
+    inspect_consignment(consignment_path, bundle_filter).into()
 }
 
 #[unsafe(no_mangle)]

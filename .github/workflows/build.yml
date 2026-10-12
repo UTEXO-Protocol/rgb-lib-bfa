@@ -56,6 +56,8 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Build with no default features
         run: cargo build --release --no-default-features
+      - name: Build with wallet feature
+        run: cargo build --release --no-default-features --features wallet
 
   build_feature_electrum:
     timeout-minutes: 30
