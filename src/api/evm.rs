@@ -763,6 +763,68 @@ impl ResolveAnchor for EvmClient {
     }
 }
 
+/// An anchor resolver over an [`EvmClient`] scanning for each mint event only the given number of
+/// blocks after the one the anchor commits to (`after_block`), if a limit is given.
+///
+/// The `after_block` of an anchor is chosen by whoever created the mint, so without a limit a
+/// consignment can make the scan go through the whole chain (e.g. with `after_block` set to 0).
+pub(crate) struct BoundedAnchorResolver<'a> {
+    client: &'a EvmClient,
+    /// Maximum number of blocks to scan after `after_block`, if any
+    max_scan_blocks: Option<u64>,
+}
+
+impl<'a> BoundedAnchorResolver<'a> {
+    pub(crate) fn new(client: &'a EvmClient, max_scan_blocks: Option<u64>) -> Self {
+        Self {
+            client,
+            max_scan_blocks,
+        }
+    }
+}
+
+impl ResolveAnchor for BoundedAnchorResolver<'_> {
+    fn evm_chain_id(&self) -> Result<u64, AnchorResolverError> {
+        self.client.evm_chain_id()
+    }
+
+    /// Whether `anchor` is confirmed, as [`EvmClient`] resolves it, within the scan limit.
+    fn is_confirmed(
+        &self,
+        location: &BridgeLocation,
+        anchor: &ExternalAnchor,
+    ) -> Result<bool, AnchorResolverError> {
+        let Some(max_scan_blocks) = self.max_scan_blocks else {
+            return self.client.is_confirmed(location, anchor);
+        };
+        let BridgeLocation::Evm(EvmContract { address, .. }) = location;
+        let ExternalAnchor::MintEvent {
+            opid,
+            amount,
+            after_block,
+        } = anchor;
+        let finalized_block = self
+            .client
+            .finalized_block_number()
+            .map_err(resolver_issue)?;
+        let last_block =
+            std::cmp::min(finalized_block, after_block.saturating_add(max_scan_blocks));
+        let confirming_block = self
+            .client
+            .find_funds_in_block(
+                address,
+                opid,
+                *amount,
+                *after_block,
+                *after_block,
+                last_block,
+                LOGS_BLOCK_RANGE,
+            )
+            .map_err(resolver_issue)?;
+        Ok(confirming_block.is_some())
+    }
+}
+
 /// An anchor resolver over an [`EvmClient`] resuming the scan for each mint event after the last
 /// finalized block a previous scan covered without finding it, and recording how far each scan
 /// got, so that a mint waited for across refreshes doesn't have its blocks scanned again.

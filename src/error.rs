@@ -86,6 +86,20 @@ pub enum Error {
         asset_schema: AssetSchema,
     },
 
+    /// The consignment has terminals rejected by the reject list of its asset
+    #[error("Consignment rejected by the reject list, rejected opouts: {opouts:?}")]
+    ConsignmentRejected {
+        /// The rejected terminal opouts
+        opouts: Vec<String>,
+    },
+
+    /// The consignment failed validation
+    #[error("Consignment validation failed: {details}")]
+    ConsignmentValidationFailed {
+        /// Error details
+        details: String,
+    },
+
     /// A database error has been encountered
     #[error("Database error: {details}")]
     Database {
@@ -651,6 +665,13 @@ pub enum Error {
     /// Trying to perform an online operation with offline wallet
     #[error("Wallet is offline. Hint: call go_online")]
     Offline,
+
+    /// The provided offchain TXID is not the one of a witness transaction in the consignment
+    #[error("Offchain TXID {txid} not found in the consignment")]
+    OffchainTxidNotFound {
+        /// The offchain TXID
+        txid: String,
+    },
 
     /// The Online object is needed to perform this operation
     #[error("The Online object is needed to perform this operation")]

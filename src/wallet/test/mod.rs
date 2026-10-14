@@ -608,4 +608,6 @@ mod send_btc;
 mod sign_psbt;
 #[cfg(feature = "electrum")]
 mod sync;
+#[cfg(feature = "electrum")]
+mod validate_consignment;
 mod witness_receive;

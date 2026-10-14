@@ -440,6 +440,58 @@ fn witness_recipient() {
 #[cfg(feature = "electrum")]
 #[test]
 #[serial(evm)]
+fn revalidate_received_mint() {
+    initialize();
+
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
+
+    let receive_data = rcv_party.blind_receive();
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        encryption: Encryption::Optional,
+    };
+    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
+    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
+    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
+    evm_mine(EVM_FINALITY_DEPTH);
+    rcv_party.wait_for_refresh(None);
+
+    // without its validated copy, the received mint consignment is validated again, confirming
+    // its external anchor on the bridge's chain
+    let consignment_path = rcv_party
+        .wallet
+        .get_receive_consignment_path(&receive_data.recipient_id);
+    let valid_consignment_path = rcv_party
+        .wallet
+        .get_receive_valid_consignment_path(&consignment_path);
+    fs::remove_file(&valid_consignment_path).unwrap();
+
+    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
+    party.mint_end(party.online, signed_psbt);
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        )
+    );
+    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, AMOUNT);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[serial(evm)]
 fn concurrent_mints() {
     initialize();
 

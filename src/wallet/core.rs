@@ -591,14 +591,15 @@ pub trait WalletCore {
     }
 
     #[cfg(feature = "_online")]
+    /// The configured EVM RPC URLs, keyed by chain ID
+    fn evm_rpc_urls(&self) -> &HashMap<u64, String> {
+        &self.online_data().as_ref().unwrap().evm_rpc_urls
+    }
+
+    #[cfg(feature = "_online")]
     /// The configured EVM RPC URL for the given chain ID, if any
     fn evm_rpc_url(&self, chain_id: u64) -> Option<&str> {
-        self.online_data()
-            .as_ref()
-            .unwrap()
-            .evm_rpc_urls
-            .get(&chain_id)
-            .map(String::as_str)
+        self.evm_rpc_urls().get(&chain_id).map(String::as_str)
     }
 
     #[cfg(feature = "_online")]

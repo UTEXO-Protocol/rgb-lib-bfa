@@ -238,6 +238,197 @@ impl fmt::Display for IndexerProtocol {
     }
 }
 
+/// Options for the [`validate_consignment`] and [`validate_consignment_with_resolver`] functions.
+#[cfg(feature = "_online")]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ValidationOptions {
+    /// Bitcoin network the consignment is expected to be for
+    pub bitcoin_network: BitcoinNetwork,
+    /// TXID of a witness transaction to be taken from the consignment, as it may not have been
+    /// broadcast yet, instead of being resolved by the indexer.
+    ///
+    /// The transaction is accepted as it is in the consignment, without checking it against the
+    /// chain: it may never be broadcast, or conflict with one that is. Validation fails with an
+    /// [`Error::OffchainTxidNotFound`] if the consignment has no witness with this TXID.
+    pub offchain_txid: Option<String>,
+    /// EVM JSON-RPC endpoints to confirm external anchors (mint events of a BFA asset) and read
+    /// reject lists kept by EVM contracts with, by the EIP-155 chain ID of the chain they are
+    /// connected to
+    pub evm_rpc_urls: HashMap<u64, String>,
+    /// Maximum number of blocks, after the one a mint event commits to (its `after_block`), in
+    /// which the event confirming it is searched for, `None` for no limit.
+    ///
+    /// The `after_block` is chosen by whoever created the mint, so without a limit an untrusted
+    /// consignment can make the scan go through the whole EVM chain (e.g. with `after_block` set
+    /// to 0), with at least one `eth_getLogs` call every 1000 blocks. A mint whose event is not
+    /// found within the limit fails validation with an [`Error::MintEventNotFound`], so the limit
+    /// needs to cover the time a minter may take to lock the funds after beginning the mint.
+    pub max_mint_scan_blocks: Option<u64>,
+}
+
+/// Result of validating an RGB consignment, see [`validate_consignment`].
+///
+/// A consignment that fails validation is reported as an [`Error::ConsignmentValidationFailed`]
+/// instead, so a result is only returned for a valid one, which may still have warnings.
+#[cfg(feature = "_online")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ConsignmentValidation {
+    /// ID of the consignment
+    pub consignment_id: String,
+    /// Whether this is a transfer consignment (`false` for a contract consignment)
+    pub is_transfer: bool,
+    /// ID of the asset
+    pub asset_id: String,
+    /// Schema of the asset
+    pub asset_schema: AssetSchema,
+    /// Height the witnesses were checked against: the ones mined above it, or not mined at all,
+    /// are reported in a [`ValidationWarning::UnsafeHistory`]. `None` if no confirmation policy
+    /// was applied, in which case no witness is reported, whatever its status: check the
+    /// [`Self::witnesses`] to apply one
+    pub safe_height: Option<u32>,
+    /// Witness transactions of the consignment, sorted by TXID
+    pub witnesses: Vec<ValidatedWitness>,
+    /// Validation warnings, empty if there's none
+    pub warnings: Vec<ValidationWarning>,
+}
+
+/// A witness transaction of a validated consignment, see [`ConsignmentValidation::witnesses`].
+#[cfg(feature = "_online")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct ValidatedWitness {
+    /// TXID of the witness transaction
+    pub txid: String,
+    /// Status of the witness transaction
+    pub status: WitnessValidationStatus,
+    /// Whether the witness transaction has been taken from the consignment (as it's the one with
+    /// the [`ValidationOptions::offchain_txid`]), without checking it against the chain
+    pub from_consignment: bool,
+}
+
+/// Status of a witness transaction of a validated consignment, see [`ValidatedWitness::status`].
+#[cfg(feature = "_online")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub enum WitnessValidationStatus {
+    /// Mined in a block
+    Mined {
+        /// Height of the block
+        height: u32,
+        /// Timestamp of the block
+        timestamp: i64,
+    },
+    /// Not mined, e.g. in the mempool, or not broadcast yet if taken from the consignment
+    Tentative,
+    /// To be ignored, as the resolver reported it
+    Ignored,
+    /// Archived (e.g. replaced or double spent), as the resolver reported it
+    Archived,
+}
+
+#[cfg(feature = "_online")]
+impl From<WitnessOrd> for WitnessValidationStatus {
+    fn from(ord: WitnessOrd) -> Self {
+        match ord {
+            WitnessOrd::Mined(pos) => Self::Mined {
+                height: pos.height().get(),
+                timestamp: pos.timestamp(),
+            },
+            WitnessOrd::Tentative => Self::Tentative,
+            WitnessOrd::Ignored => Self::Ignored,
+            WitnessOrd::Archived => Self::Archived,
+        }
+    }
+}
+
+/// A warning of a validated consignment, see [`ConsignmentValidation::warnings`].
+#[cfg(feature = "_online")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub enum ValidationWarning {
+    /// Witness transactions mined above the [`ConsignmentValidation::safe_height`], or not mined
+    UnsafeHistory {
+        /// TXIDs of the witness transactions, sorted
+        txids: Vec<String>,
+    },
+    /// The SPV proof carried by the consignment for a bundle is invalid, so its witness
+    /// transaction has been resolved without it
+    InvalidSpvProof {
+        /// ID of the bundle
+        bundle_id: String,
+        /// TXID of the witness transaction
+        txid: String,
+    },
+    /// Another warning
+    Other {
+        /// Warning details
+        details: String,
+    },
+}
+
+#[cfg(feature = "_online")]
+impl From<&Warning> for ValidationWarning {
+    fn from(warning: &Warning) -> Self {
+        match warning {
+            Warning::UnsafeHistory(unsafe_history) => {
+                let mut txids: Vec<String> = unsafe_history
+                    .values()
+                    .flatten()
+                    .map(|txid| txid.to_string())
+                    .collect();
+                txids.sort();
+                Self::UnsafeHistory { txids }
+            }
+            Warning::InvalidSpvProof(bundle_id, txid) => Self::InvalidSpvProof {
+                bundle_id: bundle_id.to_string(),
+                txid: txid.to_string(),
+            },
+            Warning::Custom(details) => Self::Other {
+                details: details.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "_online")]
+impl ConsignmentValidation {
+    /// Report the given validated consignment, validated with the given safe height, having the
+    /// witness with the given ID (if any) taken from the consignment.
+    pub(crate) fn new<const TRANSFER: bool>(
+        valid_consignment: &ValidConsignment<TRANSFER>,
+        safe_height: Option<NonZeroU32>,
+        offchain_witness_id: Option<RgbTxid>,
+    ) -> Self {
+        let status = valid_consignment.validation_status();
+        let mut witnesses: Vec<ValidatedWitness> = status
+            .tx_ord_map
+            .iter()
+            .map(|(txid, ord)| ValidatedWitness {
+                txid: txid.to_string(),
+                status: (*ord).into(),
+                from_consignment: offchain_witness_id == Some(*txid),
+            })
+            .collect();
+        witnesses.sort_by(|a, b| a.txid.cmp(&b.txid));
+        Self {
+            consignment_id: valid_consignment.consignment_id().to_string(),
+            is_transfer: TRANSFER,
+            asset_id: valid_consignment.contract_id().to_string(),
+            asset_schema: AssetSchema::try_from(valid_consignment.schema_id())
+                .expect("validated consignment has a supported schema"),
+            safe_height: safe_height.map(NonZeroU32::get),
+            witnesses,
+            warnings: status
+                .warnings
+                .iter()
+                .map(ValidationWarning::from)
+                .collect(),
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────
 // Bitcoin primitives
 // ────────────────────────────────────────────────────────────
@@ -2233,6 +2424,49 @@ pub struct RejectList {
 
 #[cfg(feature = "_online")]
 impl RejectList {
+    /// Parse a reject list served at a URL: one opout per line, rejected or, if prefixed by `!`,
+    /// allowed (the last line for an opout wins). Invalid lines are ignored and returned.
+    pub(crate) fn parse(list: &str) -> (Self, Vec<String>) {
+        let mut opout_map = HashMap::new();
+        let mut invalid = vec![];
+        for line in list.trim().lines() {
+            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
+            match Opout::from_str(opout_str) {
+                Ok(opout) => {
+                    opout_map.insert(opout, is_allow);
+                }
+                Err(_) => invalid.push(line.to_string()),
+            }
+        }
+        let (allow_opouts, reject_opouts) = opout_map.into_iter().fold(
+            (HashSet::new(), HashSet::new()),
+            |(mut allow, mut reject), (o, allowed)| {
+                if allowed {
+                    allow.insert(o);
+                } else {
+                    reject.insert(o);
+                }
+                (allow, reject)
+            },
+        );
+        (
+            Self {
+                reject_opouts,
+                allow_opouts,
+            },
+            invalid,
+        )
+    }
+
+    /// Read the reject list kept by the `IRgbRejectList` contract at `address`.
+    pub(crate) fn from_evm(evm_client: &EvmClient, address: &EvmAddress) -> Result<Self, Error> {
+        let (reject_opouts, allow_opouts) = evm_client.reject_list_entries(address)?.decisions();
+        Ok(Self {
+            reject_opouts,
+            allow_opouts,
+        })
+    }
+
     pub(crate) fn rejects(&self, opout: &Opout) -> bool {
         self.reject_opouts.contains(opout)
     }

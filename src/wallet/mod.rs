@@ -40,13 +40,17 @@ pub use objects::{
 };
 #[cfg(feature = "_online")]
 pub use objects::{
-    BitcoindAuth, BurnBeginResult, BurnDetails, IndexerConfig, IndexerProtocol, InflateBeginResult,
-    InflateDetails, MintBeginResult, MintDetails, OnlineOptions, OperationResult, RefreshFilter,
-    RefreshResult, RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
+    BitcoindAuth, BurnBeginResult, BurnDetails, ConsignmentValidation, IndexerConfig,
+    IndexerProtocol, InflateBeginResult, InflateDetails, MintBeginResult, MintDetails,
+    OnlineOptions, OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus,
+    RefreshedTransfer, SendBeginResult, SendDetails, ValidatedWitness, ValidationOptions,
+    ValidationWarning, WitnessValidationStatus,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
-pub use online::{RgbWalletOpsOnline, check_indexer_url};
+pub use online::{RgbWalletOpsOnline, check_indexer_url, validate_consignment};
+#[cfg(feature = "_online")]
+pub(crate) use rust_only::validate_consignment_with_resolver;
 pub use singlesig::{SinglesigKeys, Wallet};
 
 pub(crate) use backup::WalletBackup;

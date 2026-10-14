@@ -1181,17 +1181,21 @@ impl ResolveWitness for ChainResolver<'_> {
     }
 }
 
+/// Witness resolver looking up the witness with the given ID (if any) in the consignment, as it may
+/// not have been broadcast yet, and the other witnesses with the fallback chain resolver.
 #[cfg(feature = "_online")]
-pub(crate) struct OffchainResolver<'a, 'cons, const TRANSFER: bool> {
-    pub(crate) witness_id: RgbTxid,
+pub(crate) struct OffchainResolver<'cons, 'r, R: ResolveWitness + ?Sized, const TRANSFER: bool> {
+    pub(crate) witness_id: Option<RgbTxid>,
     pub(crate) consignment: &'cons Consignment<TRANSFER>,
-    pub(crate) fallback: ChainResolver<'a>,
+    pub(crate) fallback: &'r R,
 }
 
 #[cfg(feature = "_online")]
-impl<const TRANSFER: bool> ResolveWitness for OffchainResolver<'_, '_, TRANSFER> {
+impl<R: ResolveWitness + ?Sized, const TRANSFER: bool> ResolveWitness
+    for OffchainResolver<'_, '_, R, TRANSFER>
+{
     fn resolve_witness(&self, witness_id: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
-        if witness_id != self.witness_id {
+        if Some(witness_id) != self.witness_id {
             #[cfg(test)]
             if spv_only() {
                 return Err(WitnessResolverError::ResolverIssue(
@@ -1217,6 +1221,208 @@ impl<const TRANSFER: bool> ResolveWitness for OffchainResolver<'_, '_, TRANSFER>
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
         self.fallback.check_chain_net(chain_net)
     }
+}
+
+/// Validate the given consignment with the given validation config, resolving the witness with
+/// the given ID (if any) from the consignment itself, as it may not have been broadcast yet, and
+/// the other witnesses with the given chain resolver.
+///
+/// External anchors (mint events) are confirmed on the chain the asset's bridge lives on, through
+/// the EVM RPC URL configured for it in `evm_rpc_urls`, scanning for each mint event at most
+/// `max_mint_scan_blocks` blocks (if provided) after the one it commits to.
+#[cfg(feature = "_online")]
+pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+    offchain_witness_id: Option<RgbTxid>,
+    chain_resolver: &(impl ResolveWitness + ?Sized),
+    evm_rpc_urls: &HashMap<u64, String>,
+    max_mint_scan_blocks: Option<u64>,
+    validation_config: &ValidationConfig,
+) -> Result<ValidConsignment<TRANSFER>, Error> {
+    let validation_error = |e: ValidationError| match e {
+        ValidationError::InvalidConsignment(e) => Error::ConsignmentValidationFailed {
+            details: e.to_string(),
+        },
+        ValidationError::ResolverError(e) => Error::Network {
+            details: e.to_string(),
+        },
+        e => Error::Internal {
+            details: format!("unexpected consignment validation error: {e}"),
+        },
+    };
+
+    let asset_schema = AssetSchema::try_from(consignment.schema_id())?;
+    // phase 1: everything that only depends on the consignment itself
+    let mut pending = consignment
+        .clone()
+        .validate_deterministic(&asset_schema.schema_rules(), validation_config)
+        .map_err(validation_error)?;
+
+    // external anchors (mint events) live on the chain the asset's bridge contract is deployed on
+    // and cannot be resolved by the witness resolver: confirm them against that chain before
+    // resolving the witnesses
+    let anchors: Vec<ExternalAnchor> = pending.pending().unresolved_anchors().cloned().collect();
+    if !anchors.is_empty() {
+        if !asset_schema.supports_mint() {
+            return Err(Error::ConsignmentValidationFailed {
+                details: format!("{asset_schema} schema does not support external anchors"),
+            });
+        }
+        let bridge_location = BridgedFungibleAsset::bridge_location(consignment.genesis())
+            .map_err(|e| Error::Internal {
+                details: format!("unexpected bridge location error: {e}"),
+            })?;
+        let BridgeLocation::Evm(EvmContract { chain_id, .. }) = &bridge_location;
+        let evm_rpc_url = evm_rpc_urls.get(chain_id).ok_or(Error::NoEvmRpcUrl {
+            chain_id: *chain_id,
+        })?;
+        let evm_client = EvmClient::new(evm_rpc_url)?;
+        let anchor_resolver = CheckedAnchorResolver::with(
+            BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks),
+            bridge_location,
+        )?;
+        for anchor in &anchors {
+            pending.resolve_anchor(&anchor_resolver, anchor)?;
+        }
+    }
+
+    // phase 2: resolve the witnesses
+    let resolver = OffchainResolver {
+        witness_id: offchain_witness_id,
+        consignment,
+        fallback: chain_resolver,
+    };
+    pending
+        .pending()
+        .resolve_all(&resolver)
+        .map_err(validation_error)?;
+    Ok(pending.finalize())
+}
+
+/// The EVM RPC client for the chain with the given `chain_id`, among the given `evm_rpc_urls`,
+/// checked to be connected to it.
+#[cfg(feature = "_online")]
+pub(crate) fn checked_evm_client(
+    evm_rpc_urls: &HashMap<u64, String>,
+    chain_id: u64,
+) -> Result<EvmClient, Error> {
+    let evm_rpc_url = evm_rpc_urls
+        .get(&chain_id)
+        .ok_or(Error::NoEvmRpcUrl { chain_id })?;
+    let evm_client = EvmClient::new(evm_rpc_url)?;
+    let actual = evm_client.evm_chain_id()?;
+    if actual != chain_id {
+        return Err(Error::EvmChainIdMismatch {
+            expected: chain_id,
+            actual,
+        });
+    }
+    Ok(evm_client)
+}
+
+/// Where the reject list of an asset with the given schema and genesis is published, if any.
+///
+/// The reject list is a genesis global, so it can be read off a consignment without a stock.
+#[cfg(feature = "_online")]
+pub(crate) fn genesis_reject_list_source(
+    asset_schema: AssetSchema,
+    genesis: &Genesis,
+) -> Result<Option<RejectListSource>, Error> {
+    let global = |global_type: GlobalStateType| {
+        genesis
+            .globals
+            .get(&global_type)
+            .and_then(|values| values.first())
+            .map(|value| value.to_inner())
+    };
+    let invalid = |e: DeserializeError| Error::Internal {
+        details: format!("invalid reject list in a validated genesis: {e}"),
+    };
+    Ok(match asset_schema {
+        AssetSchema::Bfa => global(GS_REJECT_LIST)
+            .map(|data| RejectListLocation::from_strict_serialized(data).map_err(invalid))
+            .transpose()?
+            .map(RejectListSource::from),
+        AssetSchema::Ifa => global(GS_REJECT_LIST_URL)
+            .map(|data| RejectListUrl::from_strict_serialized(data).map_err(invalid))
+            .transpose()?
+            .map(|url| RejectListSource::Url(url.to_string())),
+        AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => None,
+    })
+}
+
+/// The opouts assigned to the terminals of the given consignment.
+#[cfg(feature = "_online")]
+pub(crate) fn terminal_opouts<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+) -> HashSet<Opout> {
+    let mut opouts = HashSet::new();
+    for witness_bundle in consignment.bundles.iter() {
+        let Some(terminal_seals) = consignment
+            .terminals
+            .get(&witness_bundle.bundle.bundle_id())
+        else {
+            continue;
+        };
+        let terminal_seals: HashSet<SecretSeal> = terminal_seals
+            .into_iter()
+            .map(|s| s.to_secret_seal())
+            .collect();
+        for KnownTransition { opid, transition } in witness_bundle.bundle.known_transitions.iter() {
+            for (ass_type, typed_assigns) in transition.assignments.iter() {
+                for no in 0..typed_assigns.len_u16() {
+                    let seal = typed_assigns.seal_at(no).expect("index in range");
+                    if terminal_seals.contains(&seal.to_secret_seal()) {
+                        opouts.insert(Opout::new(*opid, *ass_type, no));
+                    }
+                }
+            }
+        }
+    }
+    opouts
+}
+
+/// The opouts, among the given `check_opouts`, the given reject list rejects: the ones having a
+/// rejected opout along their history (the opouts DAG built by the validation), unless an allowed
+/// opout shields it.
+#[cfg(feature = "_online")]
+pub(crate) fn rejected_opouts(
+    dag_data: &OpoutsDagData,
+    reject_list: &RejectList,
+    check_opouts: &HashSet<Opout>,
+) -> Result<HashSet<Opout>, Error> {
+    let (dag, index) = dag_data;
+    let mut to_reject = HashSet::new();
+
+    // for each opout we are checking, traverse its ancestor chain
+    for check_opout in check_opouts {
+        let &opout_node = index.get(check_opout).ok_or(Error::Internal {
+            details: s!("opout not found in DAG"),
+        })?;
+
+        // traverse from this node to its ancestors, depth first
+        let mut stack = vec![opout_node];
+        let mut visited = HashSet::new();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            let node_opout = &dag[node];
+            // allow shields this path upward: do not traverse this branch further
+            if reject_list.allows(node_opout) {
+                continue;
+            }
+            // encountering a reject node on an unshielded path: reject
+            if reject_list.rejects(node_opout) {
+                to_reject.insert(*check_opout);
+                break;
+            }
+            for (_edge, parent) in dag.parents(node).iter(dag) {
+                stack.push(parent);
+            }
+        }
+    }
+    Ok(to_reject)
 }
 
 #[cfg(test)]

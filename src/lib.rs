@@ -156,6 +156,7 @@ pub use rgbstd::{
     persistence::{RetrievedSpvProofs, UpdateRes},
     schema::SchemaId,
     txout::CloseMethod,
+    validation::{ResolveWitness, WitnessResolverError, WitnessStatus},
     vm::WitnessOrd,
 };
 
@@ -324,9 +325,7 @@ use rgbstd::{
         RejectListUrl, RicardianContract, Ticker, TokenData,
     },
     txout::{BlindSeal, ExplicitSeal, TxPtr},
-    validation::{
-        ResolveWitness, SchemaDefinition, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
-    },
+    validation::{SchemaDefinition, WitnessOrdProvider},
     vm::WitnessPos,
 };
 use rgbstd::{
@@ -357,7 +356,9 @@ use rgbstd::{
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
 #[cfg(feature = "_online")]
-use schemata::{BfaWrapper, CfaWrapper, NiaWrapper, UdaWrapper};
+use schemata::{
+    BfaWrapper, CfaWrapper, GS_REJECT_LIST, GS_REJECT_LIST_URL, NiaWrapper, UdaWrapper,
+};
 use schemata::{
     BridgedFungibleAsset, CollectibleFungibleAsset, InflatableFungibleAsset, NonInflatableAsset,
     UniqueDigitalAsset,
@@ -436,7 +437,7 @@ use crate::wallet::test::{
 #[cfg(feature = "_online")]
 use crate::{
     api::{
-        evm::{EvmClient, ResumingAnchorResolver},
+        evm::{BoundedAnchorResolver, EvmClient, ResumingAnchorResolver},
         multisig_hub::{
             FileMetadata, FileSource, FileType, InfoResponse, MultisigHubClient,
             OPERATION_TYPES_REQUIRING_SEED, OperationResponse, OperationStatus, OperationType,
@@ -466,11 +467,14 @@ use crate::{
     },
     error::IndexerError,
     utils::{
-        ChainResolver, OffchainResolver, check_proxy, detect_indexer, get_indexer_and_resolver,
-        hash_file, proxy_retention_grace, script_buf_from_recipient_id,
+        ChainResolver, OffchainResolver, check_proxy, checked_evm_client, detect_indexer,
+        genesis_reject_list_source, get_indexer_and_resolver, hash_file, proxy_retention_grace,
+        rejected_opouts, script_buf_from_recipient_id, terminal_opouts,
+        validate_consignment_internal,
     },
     wallet::{
-        AssignmentsCollection, BitcoindAuth, Indexer, IndexerConfig, multisig::RespondToOperation,
+        AssignmentsCollection, BitcoindAuth, Indexer, IndexerConfig, RejectList, RejectListSource,
+        multisig::RespondToOperation,
     },
 };
 #[cfg(feature = "wallet")]
