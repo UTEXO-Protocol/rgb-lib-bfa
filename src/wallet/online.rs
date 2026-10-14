@@ -4042,11 +4042,29 @@ pub trait WalletOnline: WalletOffline {
         )
     }
 
+    /// Check that the operation of the given signed PSBT can still be ended. An operation saved by
+    /// a non-dry-run begin is ended (e.g. again, retried after a crash) only while it's still
+    /// initiated: one that has failed or progressed must not be broadcast again nor have its
+    /// status brought back.
+    fn check_end_initiated(&self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<(), Error> {
+        let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+        if let Some(existing) = txn
+            .get_batch_transfers_by_txid(&txid)?
+            .into_iter()
+            .find(|batch_transfer| !batch_transfer.incoming)
+            && existing.status != TransferStatus::Initiated
+        {
+            return Err(Error::CannotEndTransfer { txid });
+        }
+        Ok(())
+    }
+
     fn inflate_end_impl(
         &mut self,
         txn: &DbTxn,
         signed_psbt: &Psbt,
     ) -> Result<OperationResult, Error> {
+        self.check_end_initiated(txn, signed_psbt)?;
         let (txid, _transfer_dir, info_contents, fascia) =
             self.get_transfer_end_data(signed_psbt)?;
 
@@ -4195,6 +4213,7 @@ pub trait WalletOnline: WalletOffline {
     }
 
     fn burn_end_impl(&mut self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<OperationResult, Error> {
+        self.check_end_initiated(txn, signed_psbt)?;
         let (txid, _transfer_dir, info_contents, fascia) =
             self.get_transfer_end_data(signed_psbt)?;
 
