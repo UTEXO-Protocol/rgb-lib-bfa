@@ -634,10 +634,13 @@ impl Wallet {
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
 
+        let (txid, _, info_contents, _) = self.get_transfer_end_data(&psbt)?;
+        if !info_contents.is_operation(&TypeOfTransition::Transfer) {
+            return Err(Error::WrongOperation { txid });
+        }
+
         // this will also update the DB with the new UTXOs and BDK
         self.broadcast_psbt(&txn, &psbt)?;
-
-        let (txid, _, info_contents, _) = self.get_transfer_end_data(&psbt)?;
 
         let batch_transfer_idx = self.update_or_save_transfers(
             &txn,
