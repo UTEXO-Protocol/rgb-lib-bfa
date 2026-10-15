@@ -23,24 +23,18 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: warp-ubuntu-latest-x64-4x
             lib_name: librgblibuniffi.so
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: warp-ubuntu-latest-arm64-4x
             lib_name: librgblibuniffi.so
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: warp-macos-26-arm64-6x
             lib_name: librgblibuniffi.dylib
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install cross-compilation toolchain
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Setup rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -51,8 +45,6 @@ jobs:
       - name: Build uniffi library
         working-directory: bindings/uniffi
         run: cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -64,7 +56,7 @@ jobs:
   release:
     name: Create Release
     needs: [build-uniffi]
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-latest-x64-4x
     permissions:
       contents: write
 
@@ -118,7 +110,7 @@ jobs:
   trigger-bindings:
     name: Trigger Go bindings rebuild
     needs: release
-    runs-on: ubuntu-latest
+    runs-on: warp-ubuntu-latest-x64-4x
 
     steps:
       - name: Get version
