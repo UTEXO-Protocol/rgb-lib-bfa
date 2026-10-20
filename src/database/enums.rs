@@ -28,7 +28,7 @@ pub enum AssetSchema {
     /// IFA schema
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 4))]
     Ifa = 4,
-    /// BFA schema
+    /// BFA schema. Mainnet use is permitted but not recommended.
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 5))]
     Bfa = 5,
 }
@@ -147,6 +147,15 @@ impl AssetSchema {
                 Self::Nia | Self::Uda | Self::Cfa | Self::Ifa => false,
             },
             Assignment::Any => false,
+        }
+    }
+
+    /// Whether the schema can be used on mainnet.
+    pub(crate) fn allowed_on_mainnet(&self) -> bool {
+        match self {
+            // BFA mainnet use is permitted but not recommended.
+            Self::Nia | Self::Uda | Self::Cfa | Self::Bfa => true,
+            Self::Ifa => false,
         }
     }
 

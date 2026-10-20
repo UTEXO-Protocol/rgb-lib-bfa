@@ -149,7 +149,12 @@ fn mainnet_success_electrum() {
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
                 max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-                supported_schemas: AssetSchema::iter().collect(),
+                supported_schemas: vec![
+                    AssetSchema::Nia,
+                    AssetSchema::Uda,
+                    AssetSchema::Cfa,
+                    AssetSchema::Bfa
+                ],
             },
             SinglesigKeys::from_keys(&keys, None),
         )
@@ -179,7 +184,12 @@ fn mainnet_success_esplora() {
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
                 max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-                supported_schemas: AssetSchema::iter().collect(),
+                supported_schemas: vec![
+                    AssetSchema::Nia,
+                    AssetSchema::Uda,
+                    AssetSchema::Cfa,
+                    AssetSchema::Bfa
+                ],
             },
             SinglesigKeys::from_keys(&keys, None),
         )
@@ -640,11 +650,11 @@ fn supported_schemas() {
     }
 }
 
-// Each supported schema can be initialized on mainnet without an indexer or funding.
+// Check mainnet schema policy without an indexer or funding: BFA is allowed, IFA is rejected.
 // Cover both constructors because they share RGB setup but have separate key validation.
 #[test]
 #[parallel]
-fn mainnet_all_schemas_offline() {
+fn mainnet_schema_policy_offline() {
     let data_dir = PrivateDataDir::new();
     let network = BitcoinNetwork::Mainnet;
     let keys = generate_keys(network, WitnessVersion::Taproot);
@@ -662,9 +672,14 @@ fn mainnet_all_schemas_offline() {
             max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
             supported_schemas: vec![schema],
         };
-        let single = Wallet::new(wallet_data.clone(), SinglesigKeys::from_keys(&keys, None))
-            .unwrap_or_else(|err| panic!("mainnet singlesig {schema:?}: {err}"));
-        assert_eq!(single.get_wallet_data().supported_schemas, vec![schema]);
+        let single = Wallet::new(wallet_data.clone(), SinglesigKeys::from_keys(&keys, None));
+        if schema == AssetSchema::Ifa {
+            let error = single.err();
+            assert_matches!(error, Some(Error::CannotUseSchemaOnMainnet { asset_schema }) if asset_schema == AssetSchema::Ifa);
+        } else {
+            let single = single.unwrap_or_else(|err| panic!("mainnet singlesig {schema:?}: {err}"));
+            assert_eq!(single.get_wallet_data().supported_schemas, vec![schema]);
+        }
         let multi = MultisigWallet::new(
             WalletData {
                 data_dir: multi_dir.to_string_lossy().into_owned(),
@@ -678,9 +693,14 @@ fn mainnet_all_schemas_offline() {
                 2,
                 2,
             ),
-        )
-        .unwrap_or_else(|err| panic!("mainnet multisig {schema:?}: {err}"));
-        assert_eq!(multi.get_wallet_data().supported_schemas, vec![schema]);
+        );
+        if schema == AssetSchema::Ifa {
+            let error = multi.err();
+            assert_matches!(error, Some(Error::CannotUseSchemaOnMainnet { asset_schema }) if asset_schema == AssetSchema::Ifa);
+        } else {
+            let multi = multi.unwrap_or_else(|err| panic!("mainnet multisig {schema:?}: {err}"));
+            assert_eq!(multi.get_wallet_data().supported_schemas, vec![schema]);
+        }
     }
 }
 

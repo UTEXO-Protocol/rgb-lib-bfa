@@ -235,9 +235,17 @@ impl WalletInternals {
 pub(crate) fn setup_rgb(
     database: &RgbLibDatabase,
     supported_schemas: Vec<AssetSchema>,
+    bitcoin_network: BitcoinNetwork,
 ) -> Result<(), Error> {
     if supported_schemas.is_empty() {
         return Err(Error::NoSupportedSchemas);
+    }
+    if bitcoin_network == BitcoinNetwork::Mainnet
+        && let Some(asset_schema) = supported_schemas.iter().find(|s| !s.allowed_on_mainnet())
+    {
+        return Err(Error::CannotUseSchemaOnMainnet {
+            asset_schema: *asset_schema,
+        });
     }
     let txn = database.begin_transaction()?;
     let mut stock = RgbStock::new(&txn);
