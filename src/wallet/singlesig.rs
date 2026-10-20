@@ -250,7 +250,7 @@ impl Wallet {
         };
 
         // setup RGB
-        setup_rgb(&database, wdata.supported_schemas, wdata.bitcoin_network)?;
+        setup_rgb(&database, wdata.supported_schemas)?;
 
         // persist the settings needed to load the wallet back
         WalletManifest::new(&wallet_data, &keys).write(&wallet_dir)?;

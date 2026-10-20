@@ -79,7 +79,7 @@ pub enum Error {
         details: String,
     },
 
-    /// The schema cannot be used on mainnet
+    /// Legacy error retained for API compatibility; wallet setup no longer restricts schemas by network.
     #[error("Cannot use {asset_schema} schema on mainnet")]
     CannotUseSchemaOnMainnet {
         /// Asset schema

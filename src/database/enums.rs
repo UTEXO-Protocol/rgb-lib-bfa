@@ -150,14 +150,6 @@ impl AssetSchema {
         }
     }
 
-    /// Whether the schema can be used on mainnet.
-    pub(crate) fn allowed_on_mainnet(&self) -> bool {
-        match self {
-            Self::Nia | Self::Uda | Self::Cfa => true,
-            Self::Ifa | Self::Bfa => false,
-        }
-    }
-
     /// What a request for [`Assignment::Any`] of the schema refers to: the only kind of state it
     /// can be requested for, or [`Assignment::Any`] itself if there is more than one.
     pub(crate) fn any_assignment(&self) -> Assignment {

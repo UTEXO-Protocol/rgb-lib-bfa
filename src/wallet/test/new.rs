@@ -149,8 +149,7 @@ fn mainnet_success_electrum() {
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
                 max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-                // IFA not supported on mainnet
-                supported_schemas: vec![AssetSchema::Cfa, AssetSchema::Nia, AssetSchema::Uda],
+                supported_schemas: AssetSchema::iter().collect(),
             },
             SinglesigKeys::from_keys(&keys, None),
         )
@@ -180,8 +179,7 @@ fn mainnet_success_esplora() {
                 bitcoin_network,
                 database_type: DatabaseType::Sqlite,
                 max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-                // IFA not supported on mainnet
-                supported_schemas: vec![AssetSchema::Cfa, AssetSchema::Nia, AssetSchema::Uda],
+                supported_schemas: AssetSchema::iter().collect(),
             },
             SinglesigKeys::from_keys(&keys, None),
         )
@@ -640,31 +638,49 @@ fn supported_schemas() {
     if let Err(e) = result {
         assert_matches!(e, Error::NoSupportedSchemas);
     }
+}
 
-    // wallet (mainnet), for each schema
-    let bitcoin_network = BitcoinNetwork::Mainnet;
-    for schema in AssetSchema::iter() {
-        let allowed = match schema {
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => true,
-            AssetSchema::Ifa | AssetSchema::Bfa => false,
+// Each supported schema can be initialized on mainnet without an indexer or funding.
+// Cover both constructors because they share RGB setup but have separate key validation.
+#[test]
+#[parallel]
+fn mainnet_all_schemas_offline() {
+    let data_dir = PrivateDataDir::new();
+    let network = BitcoinNetwork::Mainnet;
+    let keys = generate_keys(network, WitnessVersion::Taproot);
+    let second_keys = generate_keys(network, WitnessVersion::Taproot);
+
+    for (index, schema) in AssetSchema::iter().enumerate() {
+        let single_dir = data_dir.sub_path(format!("single-{index}"));
+        let multi_dir = data_dir.sub_path(format!("multi-{index}"));
+        fs::create_dir_all(&single_dir).unwrap();
+        fs::create_dir_all(&multi_dir).unwrap();
+        let wallet_data = WalletData {
+            data_dir: single_dir.to_string_lossy().into_owned(),
+            bitcoin_network: network,
+            database_type: DatabaseType::Sqlite,
+            max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
+            supported_schemas: vec![schema],
         };
-        let keys_mainnet = generate_keys(bitcoin_network, WitnessVersion::Taproot);
-        let result = Wallet::new(
+        let single = Wallet::new(wallet_data.clone(), SinglesigKeys::from_keys(&keys, None))
+            .unwrap_or_else(|err| panic!("mainnet singlesig {schema:?}: {err}"));
+        assert_eq!(single.get_wallet_data().supported_schemas, vec![schema]);
+        let multi = MultisigWallet::new(
             WalletData {
-                data_dir: get_test_data_dir_string(),
-                bitcoin_network,
-                database_type: DatabaseType::Sqlite,
-                max_allocations_per_utxo: MAX_ALLOCATIONS_PER_UTXO,
-                supported_schemas: vec![AssetSchema::Nia, schema],
+                data_dir: multi_dir.to_string_lossy().into_owned(),
+                ..wallet_data
             },
-            SinglesigKeys::from_keys(&keys_mainnet, None),
-        );
-        if allowed {
-            assert!(result.is_ok());
-        } else {
-            let err = result.err();
-            assert_matches!(err, Some(Error::CannotUseSchemaOnMainnet { asset_schema }) if asset_schema == schema);
-        }
+            MultisigKeys::new(
+                vec![
+                    Cosigner::from_keys(&keys, None),
+                    Cosigner::from_keys(&second_keys, None),
+                ],
+                2,
+                2,
+            ),
+        )
+        .unwrap_or_else(|err| panic!("mainnet multisig {schema:?}: {err}"));
+        assert_eq!(multi.get_wallet_data().supported_schemas, vec![schema]);
     }
 }
 
