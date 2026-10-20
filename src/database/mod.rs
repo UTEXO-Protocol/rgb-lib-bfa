@@ -268,6 +268,25 @@ impl RgbLibDatabase {
         )))?;
         Ok(())
     }
+
+    /// Hash the consistent, private VACUUM copy itself, without migrations or writes.
+    /// This binds the acknowledgement token to the DB actually placed in the archive,
+    /// rather than trusting a before/after observation of the live database.
+    pub(crate) fn snapshot_file_digest(database: &Path, hash: &mut Sha256) -> Result<(), Error> {
+        let path = adjust_canonicalization(database.to_path_buf());
+        let mut options = ConnectOptions::new(format!("sqlite:{path}?mode=ro&immutable=true"));
+        options.max_connections(1).min_connections(0);
+        let database = Self::new(block_on(Database::connect(options))?);
+        let result = (|| {
+            let txn = database.begin_transaction()?;
+            txn.snapshot_digest(hash)?;
+            txn.commit()
+        })();
+        let closed = block_on(database.connection.close());
+        result?;
+        closed?;
+        Ok(())
+    }
 }
 
 pub struct DbTxn {

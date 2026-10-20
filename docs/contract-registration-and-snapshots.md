@@ -51,6 +51,11 @@ RGB stock, proxy operation keys and persisted transfer state. Unexpected SQLite
 REAL values fail closed because the current wallet schema has no floating-point
 columns and text conversion would not provide a lossless content identity.
 
+Preparation hashes the standalone captured database and the exact file bytes
+streamed into the archive. Their identity must match both live observations before
+and after capture. This also rejects an outside writer's A-to-B-to-A change during
+capture; a matching final live state alone cannot acknowledge a different archive.
+
 Acknowledgement recalculates that identity in a database transaction. A changed
 wallet returns `false` without clearing dirty state. Successful acknowledgement
 stores the content digest; subsequent `backup_info()` compares current contents

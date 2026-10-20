@@ -129,23 +129,32 @@ fn framed(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
+fn content_hash() -> Sha256 {
+    let mut hash = Sha256::new();
+    framed(&mut hash, b"rgb-lib-wallet-snapshot-v1");
+    hash
+}
+
+fn entry_header(hash: &mut Sha256, entry: &Entry) {
+    framed(hash, entry.name.as_bytes());
+    framed(
+        hash,
+        if entry.directory {
+            b"directory"
+        } else {
+            b"file"
+        },
+    );
+}
+
 pub(super) fn content_digest<W: WalletCore + ?Sized>(
     wallet: &W,
     txn: &DbTxn,
 ) -> Result<[u8; 32], Error> {
-    let mut hash = Sha256::new();
-    framed(&mut hash, b"rgb-lib-wallet-snapshot-v1");
+    let mut hash = content_hash();
     txn.snapshot_digest(&mut hash)?;
     for entry in entries(wallet.wallet_dir())? {
-        framed(&mut hash, entry.name.as_bytes());
-        framed(
-            &mut hash,
-            if entry.directory {
-                b"directory"
-            } else {
-                b"file"
-            },
-        );
+        entry_header(&mut hash, &entry);
         if entry.directory || entry.path == wallet.wallet_dir().join(RGB_LIB_DB_NAME) {
             continue;
         }
@@ -180,23 +189,64 @@ pub(super) fn prepare<W: WalletCore + ?Sized>(wallet: &mut W) -> Result<WalletSn
     let database = temporary.path().join(RGB_LIB_DB_NAME);
     wallet.database().snapshot_to(&database)?;
     let archive_path = temporary.path().join("snapshot.zip");
-    let mut zip = ZipWriter::new(fs::File::create(&archive_path)?);
+    let captured = capture_archive(wallet, &database, &archive_path)?;
+    finish_snapshot(wallet, token, captured, &archive_path)
+}
+
+/// Digest the standalone database and the exact file bytes streamed into the ZIP.
+/// Keeping this separate from final verification lets tests deterministically exercise
+/// outside-writer A -> B -> A races without a production mutation callback.
+fn capture_archive<W: WalletCore + ?Sized>(
+    wallet: &W,
+    database: &Path,
+    archive_path: &Path,
+) -> Result<WalletSnapshotToken, Error> {
+    let mut hash = content_hash();
+    RgbLibDatabase::snapshot_file_digest(database, &mut hash)?;
+    let mut zip = ZipWriter::new(fs::File::create(archive_path)?);
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Zstd)
         .unix_permissions(0o600);
+    let mut expanded = 0u64;
     for entry in entries(wallet.wallet_dir())? {
+        entry_header(&mut hash, &entry);
         if entry.directory {
             zip.add_directory(format!("{}/", entry.name), options.unix_permissions(0o700))
                 .map_err(InternalError::from)?;
         } else {
-            zip.start_file(entry.name, options)
+            zip.start_file(&entry.name, options)
                 .map_err(InternalError::from)?;
-            let path = if entry.path == wallet.wallet_dir().join(RGB_LIB_DB_NAME) {
-                &database
-            } else {
-                &entry.path
-            };
-            std::io::copy(&mut open_file(path)?, &mut zip)?;
+            let is_database = entry.path == wallet.wallet_dir().join(RGB_LIB_DB_NAME);
+            let path = if is_database { database } else { &entry.path };
+            let mut file = open_file(path)?;
+            let mut file_hash = Sha256::new();
+            let mut prefix = Vec::with_capacity(16);
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                expanded = expanded
+                    .checked_add(count as u64)
+                    .ok_or(Error::SnapshotLimitExceeded)?;
+                if expanded > MAX_EXPANDED_BYTES {
+                    return Err(Error::SnapshotLimitExceeded);
+                }
+                if !is_database {
+                    // Recheck the bytes actually captured, not only the earlier stat/open.
+                    let remaining = 16 - prefix.len();
+                    prefix.extend_from_slice(&buffer[..std::cmp::min(remaining, count)]);
+                    if prefix == b"SQLite format 3\0" {
+                        return Err(Error::InvalidSnapshot);
+                    }
+                    file_hash.update(&buffer[..count]);
+                }
+                zip.write_all(&buffer[..count])?;
+            }
+            if !is_database {
+                framed(&mut hash, &file_hash.finalize());
+            }
         }
     }
     let mut archive = zip.finish().map_err(InternalError::from)?;
@@ -204,7 +254,16 @@ pub(super) fn prepare<W: WalletCore + ?Sized>(wallet: &mut W) -> Result<WalletSn
     if archive.metadata()?.len() > MAX_ARCHIVE_BYTES {
         return Err(Error::SnapshotLimitExceeded);
     }
-    let mut check = ZipArchive::new(fs::File::open(&archive_path)?).map_err(InternalError::from)?;
+    Ok(WalletSnapshotToken(hash.finalize().into()))
+}
+
+fn finish_snapshot<W: WalletCore + ?Sized>(
+    wallet: &W,
+    token: WalletSnapshotToken,
+    captured: WalletSnapshotToken,
+    archive_path: &Path,
+) -> Result<WalletSnapshot, Error> {
+    let mut check = ZipArchive::new(fs::File::open(archive_path)?).map_err(InternalError::from)?;
     let mut expanded = 0u64;
     for index in 0..check.len() {
         let entry = check.by_index(index).map_err(InternalError::from)?;
@@ -217,7 +276,9 @@ pub(super) fn prepare<W: WalletCore + ?Sized>(wallet: &mut W) -> Result<WalletSn
             return Err(Error::SnapshotLimitExceeded);
         }
     }
-    if current_token(wallet)? != token {
+    // Comparing only the two live observations misses A -> B -> A: the archive
+    // could contain B while both observations see A. Require the captured content too.
+    if captured != token || current_token(wallet)? != token {
         return Err(Error::SnapshotStateChanged);
     }
     Ok(WalletSnapshot {
@@ -241,4 +302,91 @@ pub(super) fn acknowledge<W: WalletBackup + ?Sized>(
     txn.update_backup_info(&mut info)?;
     txn.commit()?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod migration_prerequisites {
+    use super::*;
+    use crate::wallet::test::PrivateDataDir;
+    use sea_orm::ConnectionTrait;
+    use serial_test::parallel;
+
+    fn execute_sql(wallet: &Wallet, sql: &str) {
+        let connection = block_on(Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            wallet.get_wallet_dir().join(RGB_LIB_DB_NAME).display()
+        )))
+        .unwrap();
+        block_on(connection.execute_unprepared(sql)).unwrap();
+        block_on(connection.close()).unwrap();
+    }
+
+    #[test]
+    #[parallel]
+    fn snapshot_rejects_database_aba_even_when_live_before_and_after_match() {
+        let directory = PrivateDataDir::new();
+        let mut wallet = directory.wallet(false, None);
+        wallet.get_address().unwrap();
+        execute_sql(
+            &wallet,
+            "CREATE TABLE snapshot_aba (value TEXT NOT NULL); INSERT INTO snapshot_aba VALUES ('A')",
+        );
+        let before = current_token(&wallet).unwrap();
+        let temporary = tempfile::tempdir_in(directory.path()).unwrap();
+        let database = temporary.path().join(RGB_LIB_DB_NAME);
+        let archive = temporary.path().join("snapshot.zip");
+
+        // Orchestrate a prohibited second writer exactly across the real capture
+        // steps, without thread timing, global state or a production test hook.
+        execute_sql(&wallet, "UPDATE snapshot_aba SET value = 'B'");
+        wallet.database().snapshot_to(&database).unwrap();
+        execute_sql(&wallet, "UPDATE snapshot_aba SET value = 'A'");
+        let captured = capture_archive(&wallet, &database, &archive).unwrap();
+        assert_eq!(current_token(&wallet).unwrap(), before);
+        assert_ne!(captured, before);
+        assert!(matches!(
+            finish_snapshot(&wallet, before, captured, &archive),
+            Err(Error::SnapshotStateChanged)
+        ));
+        assert!(wallet.backup_info().unwrap());
+    }
+
+    #[test]
+    #[parallel]
+    fn snapshot_rejects_file_aba_and_hashes_the_bytes_actually_archived() {
+        let directory = PrivateDataDir::new();
+        let mut wallet = directory.wallet(false, None);
+        wallet.get_address().unwrap();
+        let source = wallet.get_wallet_dir().join("consignment.fixture");
+        fs::write(&source, b"A").unwrap();
+        let before = current_token(&wallet).unwrap();
+        let temporary = tempfile::tempdir_in(directory.path()).unwrap();
+        let database = temporary.path().join(RGB_LIB_DB_NAME);
+        let archive = temporary.path().join("snapshot.zip");
+        wallet.database().snapshot_to(&database).unwrap();
+
+        fs::write(&source, b"B").unwrap();
+        let captured = capture_archive(&wallet, &database, &archive).unwrap();
+        fs::write(&source, b"A").unwrap();
+        let mut zip = ZipArchive::new(fs::File::open(&archive).unwrap()).unwrap();
+        let name = format!(
+            "{}/consignment.fixture",
+            wallet
+                .get_wallet_dir()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let mut bytes = Vec::new();
+        zip.by_name(&name).unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"B");
+        assert_eq!(current_token(&wallet).unwrap(), before);
+        assert_ne!(captured, before);
+        assert!(matches!(
+            finish_snapshot(&wallet, before, captured, &archive),
+            Err(Error::SnapshotStateChanged)
+        ));
+        assert!(wallet.backup_info().unwrap());
+    }
 }
