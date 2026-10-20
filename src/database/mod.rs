@@ -3,6 +3,7 @@ pub(crate) mod entities;
 pub(crate) mod rgb;
 
 use super::*;
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 use crate::database::entities::{
     asset, coloring, media, prelude::*, transfer_transport_endpoint, transport_endpoint, txo,
@@ -256,6 +257,17 @@ impl RgbLibDatabase {
             on_commit: Mutex::new(Vec::new()),
         })
     }
+
+    /// SQLite creates a transactionally consistent, standalone database, including data
+    /// currently in its WAL. The destination must be a fresh file outside the wallet.
+    pub(crate) fn snapshot_to(&self, destination: &Path) -> Result<(), Error> {
+        let destination = destination.to_str().ok_or(Error::InvalidSnapshot)?;
+        block_on(self.connection.execute_unprepared(&format!(
+            "VACUUM INTO '{}'",
+            destination.replace('\'', "''")
+        )))?;
+        Ok(())
+    }
 }
 
 pub struct DbTxn {
@@ -284,6 +296,91 @@ impl Drop for DbTxn {
 }
 
 impl DbTxn {
+    /// Hash logical rows, not SQLite page layout or wall-clock backup bookkeeping.
+    /// All DB-backed BDK/RGB/operation/proxy secrets participate. Ordering and type/hex
+    /// encoding avoid row-order, NULL, embedded-NUL and delimiter ambiguities.
+    pub(crate) fn snapshot_digest(&self, hash: &mut Sha256) -> Result<(), Error> {
+        let statement = |sql| Statement::from_string(DbBackend::Sqlite, sql);
+        let objects = block_on(self.inner().query_all_raw(statement(
+            "SELECT type, name, coalesce(sql, '') AS sql FROM sqlite_schema ORDER BY type, name".to_string(),
+        )))?;
+        for object in objects {
+            for column in ["type", "name", "sql"] {
+                let value: String = object.try_get("", column)?;
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+        }
+        let tables = block_on(self.inner().query_all_raw(statement(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'table' ORDER BY name".to_string(),
+        )))?;
+        let framed = |hash: &mut Sha256, data: &[u8]| {
+            hash.update((data.len() as u64).to_be_bytes());
+            hash.update(data);
+        };
+        let quoted = |value: &str| format!("\"{}\"", value.replace('"', "\"\""));
+        for table in tables {
+            let name: String = table.try_get("", "name")?;
+            let schema: Option<String> = table.try_get("", "sql")?;
+            framed(hash, name.as_bytes());
+            framed(hash, schema.as_deref().unwrap_or_default().as_bytes());
+            let columns = block_on(
+                self.inner()
+                    .query_all_raw(statement(format!("PRAGMA table_info({})", quoted(&name)))),
+            )?;
+            let mut names = Vec::new();
+            for column in columns {
+                let column: String = column.try_get("", "name")?;
+                // None of these fields is wallet content. Including them would make
+                // acknowledgement invalidate itself. The processed-operation cursor is
+                // semantic content and is deliberately retained.
+                if name != "backup_info" || column == "last_processed_operation_idx" {
+                    names.push(column);
+                }
+            }
+            if names.is_empty() {
+                continue;
+            }
+            // Current wallet schemas contain integers, text and blobs. SQLite's REAL-to-text
+            // conversion is not an injective f64 encoding, so an unexpected REAL must fail
+            // closed rather than let two different persisted values share a token.
+            let reals = names
+                .iter()
+                .map(|name| format!("typeof({}) = 'real'", quoted(name)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            if block_on(self.inner().query_one_raw(statement(format!(
+                "SELECT 1 FROM {} WHERE {reals} LIMIT 1",
+                quoted(&name)
+            ))))?
+            .is_some()
+            {
+                return Err(Error::InvalidSnapshot);
+            }
+            let values = names.iter().map(|name| {
+                let column = quoted(name);
+                format!("typeof({column}) || ':' || coalesce(length(CAST({column} AS BLOB)), 0) || ':' || hex(CAST({column} AS BLOB))")
+            }).collect::<Vec<_>>().join(" || ';' || ");
+            let filter = if name == "backup_info" {
+                " WHERE last_processed_operation_idx IS NOT NULL"
+            } else if name == "sqlite_sequence" {
+                " WHERE name != 'backup_info'"
+            } else {
+                ""
+            };
+            let rows = block_on(self.inner().query_all_raw(statement(format!(
+                "SELECT {values} AS value FROM {}{filter} ORDER BY value",
+                quoted(&name)
+            ))))?;
+            for row in rows {
+                let value: String = row.try_get("", "value")?;
+                framed(hash, value.as_bytes());
+            }
+            framed(hash, b"end-table");
+        }
+        Ok(())
+    }
+
     fn inner(&self) -> &DatabaseTransaction {
         self.txn.as_ref().expect("txn already consumed")
     }

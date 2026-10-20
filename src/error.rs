@@ -100,6 +100,27 @@ pub enum Error {
         details: String,
     },
 
+    /// A valid standalone contract differs from the asset requested by the caller.
+    #[error("Contract asset ID mismatch: expected {expected}, got {actual}")]
+    ContractIdMismatch {
+        /// Requested asset ID
+        expected: String,
+        /// Validated file asset ID
+        actual: String,
+    },
+
+    /// Wallet files cannot be represented as a safe standalone snapshot.
+    #[error("Invalid wallet snapshot source")]
+    InvalidSnapshot,
+
+    /// Wallet contents changed while a snapshot was being prepared.
+    #[error("Wallet changed during snapshot preparation")]
+    SnapshotStateChanged,
+
+    /// A wallet snapshot exceeds its bounded archive limits.
+    #[error("Wallet snapshot exceeds archive limits")]
+    SnapshotLimitExceeded,
+
     /// A database error has been encountered
     #[error("Database error: {details}")]
     Database {

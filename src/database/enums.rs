@@ -104,7 +104,6 @@ impl AssetSchema {
         Self::from_schema_id(schema_id)
     }
 
-    #[cfg(feature = "_online")]
     pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),

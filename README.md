@@ -46,6 +46,10 @@ error is returned in case discrepancies are detected.
 ## Language bindings
 Bindings for other languages are available. Check the [bindings] directory.
 
+Rust embedders can use [standalone contract registration and acknowledged
+snapshots](docs/contract-registration-and-snapshots.md) without adding cloud
+transport or signer policy to the library.
+
 ## Tests
 In order to run the available tests, execute:
 ```sh

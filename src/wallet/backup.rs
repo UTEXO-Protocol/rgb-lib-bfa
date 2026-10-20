@@ -176,6 +176,9 @@ pub trait WalletBackup: WalletCore {
 
     fn get_backup_info(&self, txn: &DbTxn) -> Result<bool, Error> {
         Ok(if let Some(backup_info) = txn.get_backup_info()? {
+            if let Some(expected) = backup_info.snapshot_digest {
+                return Ok(hex::encode(super::snapshot::content_digest(self, txn)?) != expected);
+            }
             backup_info
                 .last_operation_timestamp
                 .parse::<i128>()
@@ -203,6 +206,9 @@ pub trait WalletBackup: WalletCore {
             let mut backup_info: DbBackupInfoActMod = backup_info.into();
             if doing_backup {
                 backup_info.last_backup_timestamp = now;
+                // Legacy encrypted-file backup retains its existing timestamp contract.
+                // Snapshot acknowledgement installs its content digest in the same transaction.
+                backup_info.snapshot_digest = ActiveValue::Set(None);
             } else {
                 backup_info.last_operation_timestamp = now;
             }

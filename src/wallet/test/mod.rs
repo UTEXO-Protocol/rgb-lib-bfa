@@ -593,6 +593,7 @@ mod list_unspents;
 mod load;
 #[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
 mod migrate;
+mod migration_prerequisites;
 mod mint;
 #[cfg(feature = "electrum")]
 mod multisig;

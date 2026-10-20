@@ -17,6 +17,7 @@ pub struct Model {
     pub last_backup_timestamp: String,
     pub last_operation_timestamp: String,
     pub last_processed_operation_idx: Option<i32>,
+    pub snapshot_digest: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -25,6 +26,7 @@ pub enum Column {
     LastBackupTimestamp,
     LastOperationTimestamp,
     LastProcessedOperationIdx,
+    SnapshotDigest,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -50,6 +52,7 @@ impl ColumnTrait for Column {
             Self::LastBackupTimestamp => ColumnType::String(StringLen::None).def(),
             Self::LastOperationTimestamp => ColumnType::String(StringLen::None).def(),
             Self::LastProcessedOperationIdx => ColumnType::Integer.def().null(),
+            Self::SnapshotDigest => ColumnType::String(StringLen::None).def().null(),
         }
     }
 }

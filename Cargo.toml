@@ -47,6 +47,7 @@ tokio = { version = "1", optional = true, default-features = false }
 hex = { version = "0.4.3", default-features = false, features = [
     "alloc",
 ] }
+libc = { version = "0.2", optional = true, default-features = false }
 rand = { version = "0.10.1", optional = true, default-features = false, features = [
     "thread_rng",
 ] }
@@ -134,6 +135,7 @@ all = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", 
 # the wallet functionality; without it only the APIs that don't need a wallet (e.g. consignment
 # inspection) are available, pulling in just the RGB crates and few other lightweight dependencies
 wallet = [
+    "dep:libc",
     "dep:base64",
     "dep:bdk_wallet",
     "dep:chacha20poly1305",

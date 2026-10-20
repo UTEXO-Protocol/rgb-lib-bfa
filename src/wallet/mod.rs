@@ -13,6 +13,7 @@ pub(crate) mod offline;
 pub(crate) mod online;
 pub mod rust_only;
 pub(crate) mod singlesig;
+mod snapshot;
 
 #[cfg(test)]
 pub(crate) mod test;
@@ -52,6 +53,7 @@ pub use online::{RgbWalletOpsOnline, check_indexer_url, validate_consignment};
 #[cfg(feature = "_online")]
 pub(crate) use rust_only::validate_consignment_with_resolver;
 pub use singlesig::{SinglesigKeys, Wallet};
+pub use snapshot::{WalletSnapshot, WalletSnapshotToken};
 
 pub(crate) use backup::WalletBackup;
 pub(crate) use core::{

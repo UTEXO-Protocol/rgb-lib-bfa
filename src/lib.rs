@@ -300,6 +300,8 @@ use rgbstd::indexers::electrum_blocking::electrum_client::{
     Config as ElectrumConfig, ConfigBuilder,
 };
 #[cfg(feature = "wallet")]
+use rgbstd::validation::SchemaRules;
+#[cfg(feature = "wallet")]
 use rgbstd::{
     Allocation, BundleId, Identity, Layer1, OutputSeal, OwnedFraction, RevealedData, TokenIndex,
     Vout,
@@ -349,7 +351,7 @@ use rgbstd::{
     daggy::Walker,
     indexers::AnyResolver,
     validation::{
-        ExternalAnchor, OpoutsDagData, SchemaRules, Status as ValidationStatus, ValidationConfig,
+        ExternalAnchor, OpoutsDagData, Status as ValidationStatus, ValidationConfig,
         ValidationError, Validity, Warning,
     },
 };
