@@ -15,8 +15,40 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Resolve release source
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate version and resolve immutable source
+        id: source
+        env:
+          VERSION_INPUT: ${{ inputs.version || github.ref_name }}
+        shell: bash
+        run: |
+          VERSION="v${VERSION_INPUT#v}"
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
+            echo 'Expected a release version such as v0.3.0-beta.7' >&2
+            exit 1
+          fi
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          if git show-ref --verify --quiet "refs/tags/$VERSION"; then
+            test "$(git rev-parse "refs/tags/$VERSION^{commit}")" = "$SOURCE_SHA"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
   build-uniffi:
     name: Build uniffi (${{ matrix.target }})
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,6 +67,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
 
       - name: Setup rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -55,7 +89,7 @@ jobs:
 
   release:
     name: Create Release
-    needs: [build-uniffi]
+    needs: [prepare, build-uniffi]
     runs-on: warp-ubuntu-latest-x64-4x
     permissions:
       contents: write
@@ -63,19 +97,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          # Ensure v prefix
-          VERSION="${VERSION#v}"
-          VERSION="v${VERSION}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -98,10 +121,11 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          name: Release ${{ steps.version.outputs.version }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.source_sha }}
+          name: Release ${{ needs.prepare.outputs.version }}
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') }}
+          prerelease: ${{ contains(needs.prepare.outputs.version, 'alpha') || contains(needs.prepare.outputs.version, 'beta') || contains(needs.prepare.outputs.version, 'rc') }}
           generate_release_notes: true
           files: release-assets/*
         env:
@@ -109,22 +133,10 @@ jobs:
 
   trigger-bindings:
     name: Trigger Go bindings rebuild
-    needs: release
+    needs: [prepare, release]
     runs-on: warp-ubuntu-latest-x64-4x
 
     steps:
-      - name: Get version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          VERSION="${VERSION#v}"
-          VERSION="v${VERSION}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
       - name: Trigger rgb-lib-go workflow
         uses: peter-evans/repository-dispatch@v3
         with:
@@ -133,7 +145,32 @@ jobs:
           event-type: rgb-lib-bfa-release
           client-payload: |
             {
-              "version": "${{ steps.version.outputs.version }}",
+              "version": "${{ needs.prepare.outputs.version }}",
               "source_repo": "rgb-lib-bfa",
               "branch": "release/bfa"
+            }
+
+  trigger-mobile-bindings:
+    name: Trigger ${{ matrix.repository }} BFA release
+    needs: [prepare, release]
+    if: vars.BFA_MOBILE_RELEASES_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        repository: [rgb-lib-kotlin, rgb-lib-swift]
+    steps:
+      - name: Dispatch the same source commit to both platforms
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BFA_BINDINGS_DISPATCH_TOKEN }}
+          repository: UTEXO-Protocol/${{ matrix.repository }}
+          event-type: rgb-lib-bfa-release
+          client-payload: |
+            {
+              "version": "${{ needs.prepare.outputs.version }}-bfa",
+              "source_sha": "${{ needs.prepare.outputs.source_sha }}",
+              "source_repository": "UTEXO-Protocol/rgb-lib-bfa"
             }
