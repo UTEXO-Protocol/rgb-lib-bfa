@@ -46,7 +46,6 @@ pub fn load_fascia(path: &Path) -> Result<Fascia, Error> {
     read_fascia(path)
 }
 
-#[cfg(feature = "validation")]
 pub use crate::no_wallet::validate_consignment_with_resolver;
 
 /// Rust-only APIs of the wallet.
@@ -348,7 +347,7 @@ impl Wallet {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            AnchorResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         ) {
             Ok(consignment) => consignment,
@@ -494,7 +493,7 @@ impl Wallet {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            AnchorResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         )?;
         let valid_contract = valid_transfer.clone().into_valid_contract();

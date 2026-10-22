@@ -1192,12 +1192,14 @@ fn inspect_consignment(
 fn validate_consignment(
     consignment_path: String,
     indexer_config: IndexerConfig,
+    evm_rpc_urls: HashMap<u64, String>,
     min_confirmations: Option<u8>,
     options: ValidationOptions,
 ) -> Result<ConsignmentValidation, RgbLibError> {
     rgb_lib::no_wallet::validate_consignment(
         &consignment_path,
         &indexer_config.into(),
+        &evm_rpc_urls,
         min_confirmations,
         &options,
     )

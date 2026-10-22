@@ -41,14 +41,14 @@
 //! ## Features
 //! The wallet functionality requires the `wallet` feature (enabled by default and by all the
 //! indexer features: `bitcoind`, `electrum` and `esplora`). Without it the library only provides
-//! the APIs that don't need a wallet, like [`no_wallet::inspect_consignment`], depending on few
-//! crates other than the RGB ones. The `validation` feature adds the consignment validation with a
-//! witness resolver provided by the caller, `no_wallet::validate_consignment_with_resolver`, and
-//! an HTTP client (to confirm mints and read reject lists). Validating with an indexer, like
-//! `no_wallet::validate_consignment`, requires an indexer validation feature instead
-//! (`bitcoind_validation`, `electrum_validation` or `esplora_validation`, enabled by the
-//! corresponding indexer feature), which also adds the indexer client. None of them enables the
-//! `wallet` feature.
+//! the APIs that don't need a wallet, like [`no_wallet::inspect_consignment`] and
+//! [`no_wallet::validate_consignment_with_resolver`] (consignment validation with resolvers
+//! provided by the caller, for witnesses, mints and reject lists), depending on few crates other
+//! than the RGB ones and on no network client. Validating with an indexer, like
+//! `no_wallet::validate_consignment`, requires an indexer validation feature (`bitcoind_validation`,
+//! `electrum_validation` or `esplora_validation`, enabled by the corresponding indexer feature),
+//! which adds the indexer client and an HTTP client (to confirm mints and read reject lists),
+//! without enabling the `wallet` feature.
 //!
 //! ## Errors
 //! Errors are handled with the crate `thiserror`.
@@ -170,7 +170,7 @@ macro_rules! assert_matches {
     }};
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 pub(crate) mod api;
 #[cfg(feature = "wallet")]
 pub(crate) mod database;
@@ -208,6 +208,12 @@ pub use rgbstd::{
     validation::{ResolveWitness, WitnessResolverError, WitnessStatus},
     vm::WitnessOrd,
 };
+pub use rgbstd::{
+    Opout,
+    containers::{AnchorResolverError, ResolveAnchor},
+    stl::{BridgeLocation, EvmAddress, EvmContract},
+    validation::ExternalAnchor,
+};
 
 pub use crate::{
     database::enums::{AssetSchema, Assignment, TypeOfTransition},
@@ -220,10 +226,11 @@ pub use crate::{
     utils::block_on,
 };
 
+use std::num::NonZeroU32;
 #[cfg(any(feature = "wallet", feature = "bitcoind_validation"))]
 use std::path::PathBuf;
-#[cfg(feature = "validation")]
-use std::{cell::RefCell, cmp::max, num::NonZeroU32};
+#[cfg(feature = "_validation")]
+use std::{cell::RefCell, cmp::max};
 #[cfg(feature = "_online")]
 use std::{cmp::Ordering, cmp::min, collections::hash_map::DefaultHasher, hash::Hasher};
 #[cfg(feature = "wallet")]
@@ -241,10 +248,9 @@ use std::{
     path::Path,
     str::FromStr,
 };
-#[cfg(any(feature = "wallet", feature = "validation"))]
+#[cfg(any(feature = "wallet", feature = "_validation"))]
 use std::{io::Read, time::Duration};
 
-#[cfg(any(feature = "wallet", feature = "validation"))]
 use amplify::s;
 use amplify::{ByteArray, Wrapper};
 #[cfg(feature = "wallet")]
@@ -318,7 +324,7 @@ use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::{RngExt, TryRng, distr::Alphanumeric, rngs::SysRng};
 #[cfg(feature = "_online")]
 use reqwest::blocking::multipart;
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 use reqwest::{
     StatusCode,
     blocking::{Client as RestClient, Response},
@@ -331,7 +337,6 @@ use rgb_lib_migration::{
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
-#[cfg(feature = "validation")]
 use rgbstd::bitcoin::block::Header as BlockHeader;
 #[cfg(feature = "_validation")]
 use rgbstd::indexers::AnyResolver;
@@ -383,8 +388,8 @@ use rgbstd::{
 };
 use rgbstd::{
     Amount, AssignmentType, Assignments, ChainNet, ExposedSeal, Genesis, GlobalStateType,
-    GraphSeal, KnownTransition, OpId, Operation as _, Opout, Precision, Schema, SecretSeal,
-    Transition, TransitionBundle, TransitionType, TypedAssigns,
+    GraphSeal, KnownTransition, OpId, Operation as _, Precision, Schema, SecretSeal, Transition,
+    TransitionBundle, TransitionType, TypedAssigns,
     bitcoin::{OutPoint, Transaction as BdkTransaction, Txid},
     containers::{
         BuilderSeal, Consignment, LoadError, UniversalFile, ValidContract, ValidTransfer,
@@ -395,24 +400,20 @@ use rgbstd::{
     txout::TxoSeal,
     validation::DbcProof,
 };
+use rgbstd::{
+    containers::CheckedAnchorResolver,
+    daggy::Walker,
+    validation::{OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Warning},
+};
 #[cfg(feature = "_online")]
 use rgbstd::{
     containers::PendingConsignment,
     contract::FilterIncludeAll,
     validation::{Status as ValidationStatus, Validity},
 };
-#[cfg(any(feature = "wallet", feature = "validation"))]
 use rgbstd::{
     containers::ValidConsignment,
-    stl::{BridgeLocation, EvmAddress, EvmContract, RejectListLocation, RejectListUrl},
-};
-#[cfg(feature = "validation")]
-use rgbstd::{
-    containers::{AnchorResolverError, CheckedAnchorResolver, ResolveAnchor},
-    daggy::Walker,
-    validation::{
-        ExternalAnchor, OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Warning,
-    },
+    stl::{RejectListLocation, RejectListUrl},
 };
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
@@ -427,7 +428,6 @@ use schemata::{
     GS_NOMINAL, GS_PRECISION, MS_AFTER_BLOCK, MS_ALLOWED_INFLATION, OS_ASSET, OS_INFLATION,
     OS_MINT, TS_BURN, TS_INFLATION, TS_MINT, TS_TRANSFER,
 };
-#[cfg(feature = "validation")]
 use schemata::{GS_REJECT_LIST, GS_REJECT_LIST_URL};
 #[cfg(feature = "wallet")]
 use scrypt::{Params, phc::Salt, scrypt};
@@ -475,7 +475,7 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 #[cfg(feature = "wallet")]
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 use crate::api::{
     evm::{BoundedAnchorResolver, EvmClient},
     reject_list::RejectListClient,
@@ -490,9 +490,9 @@ use crate::no_wallet::validation::electrum_config;
 use crate::no_wallet::validation::esplora_config;
 #[cfg(feature = "_online")]
 use crate::no_wallet::validation::{
-    ChainResolver, OffchainResolver, RejectList, RejectListSource, checked_evm_client,
-    get_resolver, max_mint_scan_blocks, rejected_opouts, unreachable_indexer_details,
-    validate_consignment_internal,
+    AnchorResolution, ChainResolver, OffchainResolver, RejectList, RejectListSource,
+    checked_evm_client, get_resolver, max_mint_scan_blocks, rejected_opouts,
+    unreachable_indexer_details, validate_consignment_internal,
 };
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};

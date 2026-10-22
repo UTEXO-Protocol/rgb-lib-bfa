@@ -90,7 +90,6 @@ impl AssetSchema {
         }
     }
 
-    #[cfg(feature = "validation")]
     pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),
@@ -102,7 +101,6 @@ impl AssetSchema {
     }
 
     /// Whether the schema can carry a reject list.
-    #[cfg(feature = "validation")]
     pub(crate) fn supports_reject_list(&self) -> bool {
         match self {
             Self::Bfa | Self::Ifa => true,
@@ -111,7 +109,6 @@ impl AssetSchema {
     }
 
     /// Whether the schema supports mint operations.
-    #[cfg(feature = "validation")]
     pub(crate) fn supports_mint(&self) -> bool {
         match self {
             Self::Bfa => true,
@@ -724,7 +721,6 @@ mod tests {
             let asset_schema_from_schema_id = AssetSchema::from_schema_id(schema_id).unwrap();
             assert_eq!(asset_schema, asset_schema_from_schema_id);
             // the constants match the compiled schemata
-            #[cfg(feature = "validation")]
             assert_eq!(asset_schema.schema_rules().schema_id(), schema_id);
         }
 

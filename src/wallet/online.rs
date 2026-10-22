@@ -2059,7 +2059,7 @@ pub trait WalletOnline: WalletOffline {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            AnchorResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         )
         .map_err(|e| match e {

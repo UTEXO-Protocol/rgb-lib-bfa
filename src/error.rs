@@ -626,6 +626,12 @@ pub enum Error {
         details: String,
     },
 
+    /// The consignment has external anchors (mint events) to confirm, but no anchor resolver was
+    /// provided (see
+    /// [`validate_consignment_with_resolver`](crate::no_wallet::validate_consignment_with_resolver))
+    #[error("No anchor resolver provided to confirm the consignment's external anchors")]
+    NoAnchorResolver,
+
     /// Cannot burn an asset with zero amount
     #[error("Burn request with zero amount")]
     NoBurnAmount,
@@ -645,12 +651,12 @@ pub enum Error {
     )]
     #[cfg_attr(not(feature = "_online"), doc = "`OnlineOptions::evm_rpc_urls` or")]
     #[cfg_attr(
-        feature = "validation",
-        doc = "[`ValidationOptions::evm_rpc_urls`](crate::no_wallet::ValidationOptions::evm_rpc_urls))"
+        feature = "_validation",
+        doc = "the `evm_rpc_urls` of [`validate_consignment`](crate::no_wallet::validate_consignment))"
     )]
     #[cfg_attr(
-        not(feature = "validation"),
-        doc = "`ValidationOptions::evm_rpc_urls`)"
+        not(feature = "_validation"),
+        doc = "the `evm_rpc_urls` of `validate_consignment`)"
     )]
     #[error("No EVM RPC URL configured for chain ID {chain_id}")]
     NoEvmRpcUrl {
@@ -681,6 +687,11 @@ pub enum Error {
     /// Cannot issue an asset with zero mint rights
     #[error("Issuance request with zero mint rights")]
     NoMintRights,
+
+    /// The asset has a reject list, but no reject list resolver was provided to read it (see
+    /// [`validate_consignment_with_resolver`](crate::no_wallet::validate_consignment_with_resolver))
+    #[error("No reject list resolver provided to read the asset's reject list")]
+    NoRejectListResolver,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]
@@ -914,7 +925,7 @@ pub enum Error {
     WrongPassword,
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
     #[cfg(feature = "bitcoind_validation")]
@@ -1040,7 +1051,7 @@ impl From<bdk_wallet::bitcoin::psbt::PsbtParseError> for Error {
     }
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 impl From<IndexerError> for Error {
     fn from(e: IndexerError) -> Self {
         Error::Indexer {
@@ -1049,7 +1060,7 @@ impl From<IndexerError> for Error {
     }
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::RestClientBuild {
@@ -1093,7 +1104,6 @@ impl From<psrgbt::MpcPsbtError> for InternalError {
     }
 }
 
-#[cfg(feature = "validation")]
 impl From<AnchorResolverError> for Error {
     fn from(e: AnchorResolverError) -> Self {
         match e {

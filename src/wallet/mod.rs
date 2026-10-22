@@ -20,7 +20,6 @@ pub(crate) mod test;
 pub use crate::database::enums::TypeOfTransition;
 #[cfg(feature = "_validation")]
 pub use crate::no_wallet::{BitcoindAuth, IndexerConfig, IndexerProtocol};
-#[cfg(feature = "validation")]
 pub use crate::no_wallet::{
     ConsignmentValidation, ValidatedWitness, ValidationOptions, ValidationWarning,
     WitnessValidationStatus,

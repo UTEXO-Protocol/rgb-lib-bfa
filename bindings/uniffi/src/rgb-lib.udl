@@ -16,7 +16,8 @@ namespace rgb_lib {
 
   [Throws=RgbLibError]
   ConsignmentValidation validate_consignment(string consignment_path,
-    IndexerConfig indexer_config, u8? min_confirmations, ValidationOptions options);
+    IndexerConfig indexer_config, record<u64, string> evm_rpc_urls, u8? min_confirmations,
+    ValidationOptions options);
 };
 
 [Error, Remote]
@@ -120,6 +121,7 @@ interface RgbLibError {
   MultisigUnexpectedData(string details);
   MultisigUserNotCosigner();
   Network(string details);
+  NoAnchorResolver();
   NoBurnAmount();
   NoConsignment();
   NoCosignersSupplied();
@@ -130,6 +132,7 @@ interface RgbLibError {
   NoMaxAllocationsPerUtxo();
   NoMedia();
   NoMintRights();
+  NoRejectListResolver();
   NoSupportedSchemas();
   NoValidTransportEndpoint();
   Offline();
@@ -962,7 +965,6 @@ dictionary RgbGenesisInfo {
 dictionary ValidationOptions {
   BitcoinNetwork bitcoin_network;
   string? offchain_txid;
-  record<u64, string> evm_rpc_urls;
 };
 
 dictionary ConsignmentValidation {

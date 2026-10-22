@@ -1,8 +1,9 @@
 //! Consignment validation.
 //!
-//! This module defines the consignment validation that doesn't require a wallet (available with an
-//! indexer validation feature, without the `wallet` one), the objects it returns and the indexer
-//! support it needs, which is shared with online wallets.
+//! This module defines the consignment validation that doesn't require a wallet (with resolvers
+//! provided by the caller, or with network clients with an indexer validation feature, without the
+//! `wallet` one), the objects it returns and the indexer support it needs, which is shared with
+//! online wallets.
 
 use super::*;
 
@@ -27,9 +28,11 @@ pub(crate) const INDEXER_RETRIES: u8 = 3;
 ///
 /// TODO: the limit will be set by each asset, with a global of the BFA schema (to be added in
 /// rgb-schemas): remove this hardcoded value then.
+#[cfg(feature = "_validation")]
 pub(crate) const MAX_MINT_SCAN_BLOCKS: u64 = 500_000;
 
 /// Maximum number of blocks scanned for a mint event (see [`MAX_MINT_SCAN_BLOCKS`]).
+#[cfg(feature = "_validation")]
 pub(crate) fn max_mint_scan_blocks() -> u64 {
     #[cfg(all(test, feature = "_online"))]
     if let Some(max_scan_blocks) = mock_max_mint_scan_blocks() {
@@ -151,10 +154,6 @@ pub struct ValidationOptions {
     /// chain: it may never be broadcast, or conflict with one that is. Validation fails with an
     /// [`Error::OffchainTxidNotFound`] if the consignment has no witness with this TXID.
     pub offchain_txid: Option<String>,
-    /// EVM JSON-RPC endpoints to confirm external anchors (mint events of a BFA asset) and read
-    /// reject lists kept by EVM contracts with, by the EIP-155 chain ID of the chain they are
-    /// connected to
-    pub evm_rpc_urls: HashMap<u64, String>,
 }
 
 #[cfg_attr(
@@ -325,7 +324,7 @@ impl ConsignmentValidation {
     }
 }
 
-/// Where a contract's reject list is published.
+/// Where a contract's reject list is published, see [`ResolveRejectList`].
 #[derive(Debug, Clone)]
 pub enum RejectListSource {
     /// A list of opouts served at a URL
@@ -354,22 +353,10 @@ pub struct RejectList {
 }
 
 impl RejectList {
-    /// Parse a reject list served at a URL: one opout per line, rejected or, if prefixed by `!`,
-    /// allowed (the last line for an opout wins). Each line is trimmed of leading and trailing
-    /// whitespace, and empty lines are skipped. Invalid lines (e.g. comments) are ignored and
-    /// counted.
-    pub(crate) fn parse(list: &str) -> (Self, usize) {
-        let mut opout_map = HashMap::new();
-        let mut invalid = 0;
-        for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
-            match Opout::from_str(opout_str) {
-                Ok(opout) => {
-                    opout_map.insert(opout, is_allow);
-                }
-                Err(_) => invalid += 1,
-            }
-        }
+    /// Build a reject list from the given decisions, in the order they were taken: each opout
+    /// rejected or, if `true`, allowed (the last decision for an opout wins).
+    pub fn from_decisions(decisions: impl IntoIterator<Item = (Opout, bool)>) -> Self {
+        let opout_map: HashMap<Opout, bool> = decisions.into_iter().collect();
         let (allow_opouts, reject_opouts) = opout_map.into_iter().fold(
             (HashSet::new(), HashSet::new()),
             |(mut allow, mut reject), (o, allowed)| {
@@ -381,16 +368,33 @@ impl RejectList {
                 (allow, reject)
             },
         );
-        (
-            Self {
-                reject_opouts,
-                allow_opouts,
-            },
-            invalid,
-        )
+        Self {
+            reject_opouts,
+            allow_opouts,
+        }
+    }
+
+    /// Parse a reject list served at a URL: one opout per line, rejected or, if prefixed by `!`,
+    /// allowed (the last line for an opout wins). Each line is trimmed of leading and trailing
+    /// whitespace, and empty lines are skipped. Invalid lines (e.g. comments) are ignored and
+    /// counted.
+    ///
+    /// Returns the reject list and the number of invalid lines.
+    pub fn parse(list: &str) -> (Self, usize) {
+        let mut decisions = vec![];
+        let mut invalid = 0;
+        for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (is_allow, opout_str) = line.strip_prefix("!").map_or((false, line), |s| (true, s));
+            match Opout::from_str(opout_str) {
+                Ok(opout) => decisions.push((opout, is_allow)),
+                Err(_) => invalid += 1,
+            }
+        }
+        (Self::from_decisions(decisions), invalid)
     }
 
     /// Read the reject list kept by the `IRgbRejectList` contract at `address`.
+    #[cfg(feature = "_validation")]
     pub(crate) fn from_evm(evm_client: &EvmClient, address: &EvmAddress) -> Result<Self, Error> {
         let (reject_opouts, allow_opouts) = evm_client.reject_list_entries(address)?.decisions();
         Ok(Self {
@@ -628,7 +632,9 @@ pub(crate) fn esplora_config(indexer_url: &str) -> EsploraBuilder {
 /// [`ValidationOptions::offchain_txid`], which is taken from the consignment as it may not have
 /// been broadcast yet. If the consignment has external anchors (mint events of a BFA asset),
 /// they're confirmed on the chain the asset's bridge lives on, through the EVM RPC URL configured
-/// for its chain ID in [`ValidationOptions::evm_rpc_urls`].
+/// for its chain ID in `evm_rpc_urls` (EVM JSON-RPC endpoints by the EIP-155 chain ID of the
+/// chain they are connected to), scanning for each mint event a bounded number of blocks after
+/// the one it commits to.
 ///
 /// When `min_confirmations` is provided, witnesses having less confirmations, and unconfirmed
 /// ones in any case (even with 0), are reported in a warning of the returned
@@ -651,12 +657,12 @@ pub(crate) fn esplora_config(indexer_url: &str) -> EsploraBuilder {
 /// If the asset has a reject list, the consignment terminals are checked against it, as a wallet
 /// receiving them does: an [`Error::ConsignmentRejected`] is returned if any of them has a rejected
 /// opout along its history (unless an allowed one shields it). A reject list kept by an EVM
-/// contract is read through the EVM RPC URL configured for its chain ID in
-/// [`ValidationOptions::evm_rpc_urls`].
+/// contract is read through the EVM RPC URL configured for its chain ID in `evm_rpc_urls`.
 #[cfg(feature = "_validation")]
 pub fn validate_consignment(
     consignment_path: &str,
     indexer_config: &IndexerConfig,
+    evm_rpc_urls: &HashMap<u64, String>,
     min_confirmations: Option<u8>,
     options: &ValidationOptions,
 ) -> Result<ConsignmentValidation, Error> {
@@ -671,9 +677,11 @@ pub fn validate_consignment(
         })
         .transpose()?
         .and_then(NonZeroU32::new);
-    validate_consignment_with_resolver(
+    validate_consignment_file(
         consignment_path,
         &ChainResolver { inner: &resolver },
+        AnchorResolution::Evm(evm_rpc_urls),
+        Some(&RemoteRejectListResolver { evm_rpc_urls }),
         safe_height,
         options,
     )
@@ -681,7 +689,9 @@ pub fn validate_consignment(
 
 /// Validate the RGB consignment (transfer or contract) at the given path, without a wallet,
 /// resolving its witness transactions with the provided resolver, which must be for the
-/// [`ValidationOptions::bitcoin_network`].
+/// [`ValidationOptions::bitcoin_network`], its external anchors (mint events of a BFA asset) with
+/// the provided anchor resolver, which must be for the chain the asset's bridge lives on, and the
+/// asset's reject list with the provided reject list resolver.
 #[doc = ""]
 #[cfg_attr(
     feature = "_validation",
@@ -694,16 +704,44 @@ pub fn validate_consignment(
            feature), which uses an indexer: the witness with"
 )]
 /// the [`ValidationOptions::offchain_txid`] is taken from the consignment, as it may not have been
-/// broadcast yet, external anchors are confirmed through the [`ValidationOptions::evm_rpc_urls`]
-/// and the terminals are checked against the asset's reject list (if any). When `safe_height` is
-/// provided, witnesses mined above it (including unconfirmed ones) are reported in a warning. The
-/// same trust assumptions apply, with the provided resolver trusted in place of the indexer.
+/// broadcast yet, and the terminals are checked against the asset's reject list (if any). When
+/// `safe_height` is provided, witnesses mined above it (including unconfirmed ones) are reported
+/// in a warning. The same trust assumptions apply, with the provided resolvers trusted in place of
+/// the indexer, the EVM RPC endpoints and the reject list server.
+///
+/// The anchor resolver is only needed if the consignment has external anchors, and the reject
+/// list resolver if the asset has a reject list: an [`Error::NoAnchorResolver`] or an
+/// [`Error::NoRejectListResolver`] is returned if a needed one isn't provided. It's up to the
+/// anchor resolver to bound the blocks it scans for each mint event, since its `after_block` is
+/// chosen by whoever created the mint, and a mint it doesn't confirm is reported as an
+/// [`Error::MintEventNotFound`], whether or not it may still be confirmed.
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
 pub fn validate_consignment_with_resolver(
     consignment_path: &str,
     resolver: &dyn ResolveWitness,
+    anchor_resolver: Option<&dyn ResolveAnchor>,
+    reject_list_resolver: Option<&dyn ResolveRejectList>,
+    safe_height: Option<NonZeroU32>,
+    options: &ValidationOptions,
+) -> Result<ConsignmentValidation, Error> {
+    validate_consignment_file(
+        consignment_path,
+        resolver,
+        AnchorResolution::Resolver(anchor_resolver),
+        reject_list_resolver,
+        safe_height,
+        options,
+    )
+}
+
+/// Validate the consignment at the given path, see [`validate_consignment_with_resolver`].
+fn validate_consignment_file(
+    consignment_path: &str,
+    resolver: &dyn ResolveWitness,
+    anchor_resolution: AnchorResolution,
+    reject_list_resolver: Option<&dyn ResolveRejectList>,
     safe_height: Option<NonZeroU32>,
     options: &ValidationOptions,
 ) -> Result<ConsignmentValidation, Error> {
@@ -717,6 +755,8 @@ pub fn validate_consignment_with_resolver(
         Ok(UniversalFile::Transfer(consignment)) => validate_loaded_consignment(
             &consignment,
             resolver,
+            anchor_resolution,
+            reject_list_resolver,
             safe_height,
             offchain_witness_id,
             options,
@@ -724,6 +764,8 @@ pub fn validate_consignment_with_resolver(
         Ok(UniversalFile::Contract(consignment)) => validate_loaded_consignment(
             &consignment,
             resolver,
+            anchor_resolution,
+            reject_list_resolver,
             safe_height,
             offchain_witness_id,
             options,
@@ -737,6 +779,8 @@ pub fn validate_consignment_with_resolver(
 fn validate_loaded_consignment<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     resolver: &dyn ResolveWitness,
+    anchor_resolution: AnchorResolution,
+    reject_list_resolver: Option<&dyn ResolveRejectList>,
     safe_height: Option<NonZeroU32>,
     offchain_witness_id: Option<RgbTxid>,
     options: &ValidationOptions,
@@ -764,21 +808,15 @@ fn validate_loaded_consignment<const TRANSFER: bool>(
         consignment,
         offchain_witness_id,
         resolver,
-        &options.evm_rpc_urls,
+        anchor_resolution,
         &validation_config,
     )?;
 
     // the reject list is a genesis global, so it can be read off the consignment
     if let Some(source) = genesis_reject_list_source(asset_schema, consignment.genesis())? {
-        let reject_list = match &source {
-            RejectListSource::Url(url) => {
-                RejectList::parse(&RejectListClient::new(url)?.get_reject_list()?).0
-            }
-            RejectListSource::Evm(contract) => RejectList::from_evm(
-                &checked_evm_client(&options.evm_rpc_urls, contract.chain_id)?,
-                &contract.address,
-            )?,
-        };
+        let reject_list = reject_list_resolver
+            .ok_or(Error::NoRejectListResolver)?
+            .get_reject_list(&source)?;
         let dag_data = valid_consignment
             .validation_status()
             .dag_data_opt
@@ -797,6 +835,37 @@ fn validate_loaded_consignment<const TRANSFER: bool>(
         safe_height,
         offchain_witness_id,
     ))
+}
+
+/// Trait to read the reject list of an asset, see [`validate_consignment_with_resolver`].
+pub trait ResolveRejectList {
+    /// The reject list published at the given source.
+    ///
+    /// The source is taken from the asset's genesis, so it's chosen by the issuer: it may point
+    /// to a list that never ends, or to a URL on the local network.
+    fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error>;
+}
+
+/// Reject list resolver reading the reject lists served at a URL over HTTP and the ones kept by an
+/// EVM contract through the EVM RPC URL configured for its chain ID.
+#[cfg(feature = "_validation")]
+pub(crate) struct RemoteRejectListResolver<'a> {
+    pub(crate) evm_rpc_urls: &'a HashMap<u64, String>,
+}
+
+#[cfg(feature = "_validation")]
+impl ResolveRejectList for RemoteRejectListResolver<'_> {
+    fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        Ok(match source {
+            RejectListSource::Url(url) => {
+                RejectList::parse(&RejectListClient::new(url)?.get_reject_list()?).0
+            }
+            RejectListSource::Evm(contract) => RejectList::from_evm(
+                &checked_evm_client(self.evm_rpc_urls, contract.chain_id)?,
+                &contract.address,
+            )?,
+        })
+    }
 }
 
 /// The wallet's on-chain witness resolver (the indexer-backed [`AnyResolver`]).
@@ -866,18 +935,45 @@ impl<R: ResolveWitness + ?Sized, const TRANSFER: bool> ResolveWitness
     }
 }
 
+/// How the external anchors (mint events) of a consignment are confirmed.
+pub(crate) enum AnchorResolution<'a> {
+    /// Through the given anchor resolver, if any
+    Resolver(Option<&'a dyn ResolveAnchor>),
+    /// Through the EVM RPC URL configured for the chain the asset's bridge lives on, among the
+    /// given ones, scanning for each mint event at most [`MAX_MINT_SCAN_BLOCKS`] blocks after the
+    /// one it commits to
+    #[cfg(feature = "_validation")]
+    Evm(&'a HashMap<u64, String>),
+}
+
+/// An anchor resolver provided as a trait object, as rgb-ops only implements [`ResolveAnchor`]
+/// for references to sized resolvers.
+struct DynAnchorResolver<'a>(&'a dyn ResolveAnchor);
+
+impl ResolveAnchor for DynAnchorResolver<'_> {
+    fn evm_chain_id(&self) -> Result<u64, AnchorResolverError> {
+        self.0.evm_chain_id()
+    }
+    fn is_confirmed(
+        &self,
+        location: &BridgeLocation,
+        anchor: &ExternalAnchor,
+    ) -> Result<bool, AnchorResolverError> {
+        self.0.is_confirmed(location, anchor)
+    }
+}
+
 /// Validate the given consignment with the given validation config, resolving the witness with
 /// the given ID (if any) from the consignment itself, as it may not have been broadcast yet, and
 /// the other witnesses with the given chain resolver.
 ///
-/// External anchors (mint events) are confirmed on the chain the asset's bridge lives on, through
-/// the EVM RPC URL configured for it in `evm_rpc_urls`, scanning for each mint event at most
-/// [`MAX_MINT_SCAN_BLOCKS`] blocks after the one it commits to.
+/// External anchors (mint events) are confirmed on the chain the asset's bridge lives on, as the
+/// given anchor resolution says.
 pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     offchain_witness_id: Option<RgbTxid>,
     chain_resolver: &(impl ResolveWitness + ?Sized),
-    evm_rpc_urls: &HashMap<u64, String>,
+    anchor_resolution: AnchorResolution,
     validation_config: &ValidationConfig,
 ) -> Result<ValidConsignment<TRANSFER>, Error> {
     let validation_error = |e: ValidationError| match e {
@@ -913,25 +1009,42 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
             .map_err(|e| Error::Internal {
                 details: format!("unexpected bridge location error: {e}"),
             })?;
-        let BridgeLocation::Evm(EvmContract { chain_id, .. }) = &bridge_location;
-        let evm_rpc_url = evm_rpc_urls.get(chain_id).ok_or(Error::NoEvmRpcUrl {
-            chain_id: *chain_id,
-        })?;
-        let evm_client = EvmClient::new(evm_rpc_url)?;
-        let bounded_resolver = BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
-        let anchor_resolver = CheckedAnchorResolver::with(&bounded_resolver, bridge_location)?;
-        for anchor in &anchors {
-            match pending.resolve_anchor(&anchor_resolver, anchor) {
-                // tell a mint that will never be confirmed from one that may still be
-                Err(AnchorResolverError::Unconfirmed(opid))
-                    if bounded_resolver.is_exhausted(&opid) =>
-                {
-                    return Err(Error::MintEventOutOfScanWindow {
-                        opid: opid.to_string(),
-                        max_scan_blocks: max_mint_scan_blocks(),
-                    });
+        match anchor_resolution {
+            AnchorResolution::Resolver(anchor_resolver) => {
+                let anchor_resolver = anchor_resolver.ok_or(Error::NoAnchorResolver)?;
+                let anchor_resolver = CheckedAnchorResolver::with(
+                    DynAnchorResolver(anchor_resolver),
+                    bridge_location,
+                )?;
+                for anchor in &anchors {
+                    pending.resolve_anchor(&anchor_resolver, anchor)?;
                 }
-                res => res?,
+            }
+            #[cfg(feature = "_validation")]
+            AnchorResolution::Evm(evm_rpc_urls) => {
+                let BridgeLocation::Evm(EvmContract { chain_id, .. }) = &bridge_location;
+                let evm_rpc_url = evm_rpc_urls.get(chain_id).ok_or(Error::NoEvmRpcUrl {
+                    chain_id: *chain_id,
+                })?;
+                let evm_client = EvmClient::new(evm_rpc_url)?;
+                let bounded_resolver =
+                    BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
+                let anchor_resolver =
+                    CheckedAnchorResolver::with(&bounded_resolver, bridge_location)?;
+                for anchor in &anchors {
+                    match pending.resolve_anchor(&anchor_resolver, anchor) {
+                        // tell a mint that will never be confirmed from one that may still be
+                        Err(AnchorResolverError::Unconfirmed(opid))
+                            if bounded_resolver.is_exhausted(&opid) =>
+                        {
+                            return Err(Error::MintEventOutOfScanWindow {
+                                opid: opid.to_string(),
+                                max_scan_blocks: max_mint_scan_blocks(),
+                            });
+                        }
+                        res => res?,
+                    }
+                }
             }
         }
     }
@@ -951,6 +1064,7 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
 
 /// The EVM RPC client for the chain with the given `chain_id`, among the given `evm_rpc_urls`,
 /// checked to be connected to it.
+#[cfg(feature = "_validation")]
 pub(crate) fn checked_evm_client(
     evm_rpc_urls: &HashMap<u64, String>,
     chain_id: u64,
@@ -1125,10 +1239,14 @@ mod tests {
         let options = ValidationOptions {
             bitcoin_network: BitcoinNetwork::Regtest,
             offchain_txid: None,
-            evm_rpc_urls: HashMap::new(),
         };
-        let result =
-            validate_consignment("unused", &IndexerConfig::Electrum { url }, None, &options);
+        let result = validate_consignment(
+            "unused",
+            &IndexerConfig::Electrum { url },
+            &HashMap::new(),
+            None,
+            &options,
+        );
         assert_matches!(result, Err(Error::InvalidIndexer { .. }));
     }
 
