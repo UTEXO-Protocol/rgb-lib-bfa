@@ -28,11 +28,9 @@ pub(crate) const INDEXER_RETRIES: u8 = 3;
 ///
 /// TODO: the limit will be set by each asset, with a global of the BFA schema (to be added in
 /// rgb-schemas): remove this hardcoded value then.
-#[cfg(feature = "_validation")]
 pub(crate) const MAX_MINT_SCAN_BLOCKS: u64 = 500_000;
 
 /// Maximum number of blocks scanned for a mint event (see [`MAX_MINT_SCAN_BLOCKS`]).
-#[cfg(feature = "_validation")]
 pub(crate) fn max_mint_scan_blocks() -> u64 {
     #[cfg(all(test, feature = "_online"))]
     if let Some(max_scan_blocks) = mock_max_mint_scan_blocks() {
@@ -812,22 +810,17 @@ fn validate_loaded_consignment<const TRANSFER: bool>(
         &validation_config,
     )?;
 
-    // the reject list is a genesis global, so it can be read off the consignment
-    if let Some(source) = genesis_reject_list_source(asset_schema, consignment.genesis())? {
-        let reject_list = reject_list_resolver
-            .ok_or(Error::NoRejectListResolver)?
-            .get_reject_list(&source)?;
-        let dag_data = valid_consignment
-            .validation_status()
-            .dag_data_opt
-            .as_ref()
-            .expect("build_opouts_dag is set for schemas supporting a reject list");
-        let rejected = rejected_opouts(dag_data, &reject_list, &terminal_opouts(consignment))?;
-        if !rejected.is_empty() {
-            let mut opouts: Vec<String> = rejected.iter().map(|o| o.to_string()).collect();
-            opouts.sort();
-            return Err(Error::ConsignmentRejected { opouts });
-        }
+    let rejected = rejected_by_reject_list(
+        asset_schema,
+        consignment.genesis(),
+        valid_consignment.validation_status().dag_data_opt.as_ref(),
+        reject_list_resolver,
+        &terminal_opouts(consignment),
+    )?;
+    if !rejected.is_empty() {
+        let mut opouts: Vec<String> = rejected.iter().map(|o| o.to_string()).collect();
+        opouts.sort();
+        return Err(Error::ConsignmentRejected { opouts });
     }
 
     Ok(ConsignmentValidation::new(
@@ -854,17 +847,32 @@ pub(crate) struct RemoteRejectListResolver<'a> {
 }
 
 #[cfg(feature = "_validation")]
-impl ResolveRejectList for RemoteRejectListResolver<'_> {
-    fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+impl RemoteRejectListResolver<'_> {
+    /// The reject list published at the given source, along with the number of invalid lines
+    /// ignored when it's served at a URL (see [`RejectList::parse`]).
+    pub(crate) fn get_reject_list_counting(
+        &self,
+        source: &RejectListSource,
+    ) -> Result<(RejectList, usize), Error> {
         Ok(match source {
             RejectListSource::Url(url) => {
-                RejectList::parse(&RejectListClient::new(url)?.get_reject_list()?).0
+                RejectList::parse(&RejectListClient::new(url)?.get_reject_list()?)
             }
-            RejectListSource::Evm(contract) => RejectList::from_evm(
-                &checked_evm_client(self.evm_rpc_urls, contract.chain_id)?,
-                &contract.address,
-            )?,
+            RejectListSource::Evm(contract) => (
+                RejectList::from_evm(
+                    &checked_evm_client(self.evm_rpc_urls, contract.chain_id)?,
+                    &contract.address,
+                )?,
+                0,
+            ),
         })
+    }
+}
+
+#[cfg(feature = "_validation")]
+impl ResolveRejectList for RemoteRejectListResolver<'_> {
+    fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+        Ok(self.get_reject_list_counting(source)?.0)
     }
 }
 
@@ -968,7 +976,7 @@ impl ResolveAnchor for DynAnchorResolver<'_> {
 /// the other witnesses with the given chain resolver.
 ///
 /// External anchors (mint events) are confirmed on the chain the asset's bridge lives on, as the
-/// given anchor resolution says.
+/// given anchor resolution says: one that is not confirmed makes the validation fail.
 pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     offchain_witness_id: Option<RgbTxid>,
@@ -976,49 +984,23 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
     anchor_resolution: AnchorResolution,
     validation_config: &ValidationConfig,
 ) -> Result<ValidConsignment<TRANSFER>, Error> {
-    let validation_error = |e: ValidationError| match e {
-        ValidationError::InvalidConsignment(e) => Error::ConsignmentValidationFailed {
-            details: e.to_string(),
-        },
-        ValidationError::ResolverError(e) => Error::Network {
-            details: e.to_string(),
-        },
-        e => Error::Internal {
-            details: format!("unexpected consignment validation error: {e}"),
-        },
-    };
-
     let asset_schema = AssetSchema::try_from(consignment.schema_id())?;
-    // phase 1: everything that only depends on the consignment itself
-    let mut pending = consignment
-        .clone()
-        .validate_deterministic(&asset_schema.schema_rules(), validation_config)
-        .map_err(validation_error)?;
+    let mut pending = validate_deterministic(consignment, asset_schema, validation_config)?;
 
-    // phase 2: resolve what depends on the chains, then finalize. External anchors (mint events)
-    // live on the chain the asset's bridge contract is deployed on and cannot be resolved by the
-    // witness resolver: confirm them against that chain before resolving the witnesses
-    let anchors: Vec<ExternalAnchor> = pending.pending().unresolved_anchors().cloned().collect();
-    if !anchors.is_empty() {
-        if !asset_schema.supports_mint() {
-            return Err(Error::ConsignmentValidationFailed {
-                details: format!("{asset_schema} schema does not support external anchors"),
-            });
-        }
-        let bridge_location = BridgedFungibleAsset::bridge_location(consignment.genesis())
-            .map_err(|e| Error::Internal {
-                details: format!("unexpected bridge location error: {e}"),
-            })?;
-        match anchor_resolution {
+    if let Some(PendingAnchors {
+        bridge_location,
+        anchors,
+    }) = pending_anchors(&mut pending, asset_schema)?
+    {
+        let unconfirmed = match anchor_resolution {
             AnchorResolution::Resolver(anchor_resolver) => {
                 let anchor_resolver = anchor_resolver.ok_or(Error::NoAnchorResolver)?;
                 let anchor_resolver = CheckedAnchorResolver::with(
                     DynAnchorResolver(anchor_resolver),
                     bridge_location,
                 )?;
-                for anchor in &anchors {
-                    pending.resolve_anchor(&anchor_resolver, anchor)?;
-                }
+                // a custom resolver bounds the scan itself, so it never reports an exhausted one
+                resolve_anchors(&mut pending, &anchor_resolver, &anchors, |_| false)?
             }
             #[cfg(feature = "_validation")]
             AnchorResolution::Evm(evm_rpc_urls) => {
@@ -1031,35 +1013,167 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
                     BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
                 let anchor_resolver =
                     CheckedAnchorResolver::with(&bounded_resolver, bridge_location)?;
-                for anchor in &anchors {
-                    match pending.resolve_anchor(&anchor_resolver, anchor) {
-                        // tell a mint that will never be confirmed from one that may still be
-                        Err(AnchorResolverError::Unconfirmed(opid))
-                            if bounded_resolver.is_exhausted(&opid) =>
-                        {
-                            return Err(Error::MintEventOutOfScanWindow {
-                                opid: opid.to_string(),
-                                max_scan_blocks: max_mint_scan_blocks(),
-                            });
-                        }
-                        res => res?,
-                    }
-                }
+                resolve_anchors(&mut pending, &anchor_resolver, &anchors, |opid| {
+                    bounded_resolver.is_exhausted(opid)
+                })?
             }
+        };
+        if let Some(opid) = unconfirmed.first() {
+            return Err(Error::MintEventNotFound {
+                opid: opid.to_string(),
+            });
         }
     }
 
-    // then resolve the witnesses
-    let resolver = OffchainResolver {
-        witness_id: offchain_witness_id,
-        consignment,
-        fallback: chain_resolver,
-    };
+    resolve_witnesses(
+        pending,
+        &OffchainResolver {
+            witness_id: offchain_witness_id,
+            consignment,
+            fallback: chain_resolver,
+        },
+    )
+}
+
+/// Map an error validating a consignment: an invalid consignment is reported as an
+/// [`Error::ConsignmentValidationFailed`], a resolver failure as an [`Error::Network`].
+fn validation_error(e: ValidationError) -> Error {
+    match e {
+        ValidationError::InvalidConsignment(e) => Error::ConsignmentValidationFailed {
+            details: e.to_string(),
+        },
+        ValidationError::ResolverError(e) => Error::Network {
+            details: e.to_string(),
+        },
+        e => Error::Internal {
+            details: format!("unexpected consignment validation error: {e}"),
+        },
+    }
+}
+
+/// Phase 1 of the validation of the given consignment, of an asset with the given schema:
+/// everything that only depends on the consignment itself.
+///
+/// An [`Error::ConsignmentValidationFailed`] is returned if the consignment is invalid.
+pub(crate) fn validate_deterministic<const TRANSFER: bool>(
+    consignment: &Consignment<TRANSFER>,
+    asset_schema: AssetSchema,
+    validation_config: &ValidationConfig,
+) -> Result<PendingConsignment<TRANSFER>, Error> {
+    consignment
+        .clone()
+        .validate_deterministic(&asset_schema.schema_rules(), validation_config)
+        .map_err(validation_error)
+}
+
+/// The external anchors (mint events) of a consignment left to confirm, see [`pending_anchors`].
+pub(crate) struct PendingAnchors {
+    /// Location of the bridge whose chain the anchors live on
+    pub(crate) bridge_location: BridgeLocation,
+    /// The anchors to confirm
+    pub(crate) anchors: Vec<ExternalAnchor>,
+}
+
+/// The external anchors (mint events) the given pending consignment, of an asset with the given
+/// schema, needs confirmed, if any.
+///
+/// External anchors live on the chain the asset's bridge contract is deployed on and cannot be
+/// resolved by the witness resolver: they need to be confirmed against that chain (see
+/// [`resolve_anchors`]) before the witnesses are resolved. An
+/// [`Error::ConsignmentValidationFailed`] is returned if the schema doesn't support them.
+pub(crate) fn pending_anchors<const TRANSFER: bool>(
+    pending: &mut PendingConsignment<TRANSFER>,
+    asset_schema: AssetSchema,
+) -> Result<Option<PendingAnchors>, Error> {
+    let anchors: Vec<ExternalAnchor> = pending.pending().unresolved_anchors().cloned().collect();
+    if anchors.is_empty() {
+        return Ok(None);
+    }
+    if !asset_schema.supports_mint() {
+        return Err(Error::ConsignmentValidationFailed {
+            details: format!("{asset_schema} schema does not support external anchors"),
+        });
+    }
+    // the bridge location is an immutable genesis global naming the chain the mint events live on
+    let bridge_location = BridgedFungibleAsset::bridge_location(pending.consignment().genesis())
+        .map_err(|e| Error::Internal {
+            details: format!("unexpected bridge location error: {e}"),
+        })?;
+    Ok(Some(PendingAnchors {
+        bridge_location,
+        anchors,
+    }))
+}
+
+/// Confirm the given external anchors of the given pending consignment with the given anchor
+/// resolver, returning the operation IDs of the ones that are not confirmed (yet).
+///
+/// A mint the resolver reports as exhausted (see `is_exhausted`), its event not found in any of
+/// the blocks within the scan limit, will never be confirmed: an
+/// [`Error::MintEventOutOfScanWindow`] is returned for it.
+pub(crate) fn resolve_anchors<const TRANSFER: bool, R: ResolveAnchor>(
+    pending: &mut PendingConsignment<TRANSFER>,
+    anchor_resolver: &CheckedAnchorResolver<R>,
+    anchors: &[ExternalAnchor],
+    is_exhausted: impl Fn(&OpId) -> bool,
+) -> Result<Vec<OpId>, Error> {
+    let mut unconfirmed = vec![];
+    for anchor in anchors {
+        match pending.resolve_anchor(anchor_resolver, anchor) {
+            Ok(()) => {}
+            // tell a mint that will never be confirmed from one that may still be
+            Err(AnchorResolverError::Unconfirmed(opid)) if is_exhausted(&opid) => {
+                return Err(Error::MintEventOutOfScanWindow {
+                    opid: opid.to_string(),
+                    max_scan_blocks: max_mint_scan_blocks(),
+                });
+            }
+            Err(AnchorResolverError::Unconfirmed(opid)) => unconfirmed.push(opid),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(unconfirmed)
+}
+
+/// Phase 2 of the validation of the given pending consignment, whose external anchors must all
+/// be confirmed by now: resolve the witnesses with the given resolver, then finalize.
+///
+/// An [`Error::ConsignmentValidationFailed`] is returned if the consignment is invalid, an
+/// [`Error::Network`] if the resolver fails.
+pub(crate) fn resolve_witnesses<const TRANSFER: bool>(
+    mut pending: PendingConsignment<TRANSFER>,
+    resolver: &impl ResolveWitness,
+) -> Result<ValidConsignment<TRANSFER>, Error> {
     pending
         .pending()
-        .resolve_all(&resolver)
+        .resolve_all(resolver)
         .map_err(validation_error)?;
     Ok(pending.finalize())
+}
+
+/// The opouts among `opouts` rejected by the reject list of the asset with the given schema and
+/// genesis, read with the given resolver: none if the asset has no reject list.
+///
+/// The `dag_data` of the validated operations must be provided if the schema supports a reject
+/// list (see [`AssetSchema::supports_reject_list`]). An [`Error::NoRejectListResolver`] is
+/// returned if the asset has a reject list but no resolver is provided.
+pub(crate) fn rejected_by_reject_list(
+    asset_schema: AssetSchema,
+    genesis: &Genesis,
+    dag_data: Option<&OpoutsDagData>,
+    reject_list_resolver: Option<&dyn ResolveRejectList>,
+    opouts: &HashSet<Opout>,
+) -> Result<HashSet<Opout>, Error> {
+    let Some(source) = genesis_reject_list_source(asset_schema, genesis)? else {
+        return Ok(HashSet::new());
+    };
+    let reject_list = reject_list_resolver
+        .ok_or(Error::NoRejectListResolver)?
+        .get_reject_list(&source)?;
+    let dag_data = dag_data.ok_or_else(|| Error::Internal {
+        details: s!("no opouts DAG to check against the reject list"),
+    })?;
+    rejected_opouts(dag_data, &reject_list, opouts)
 }
 
 /// The EVM RPC client for the chain with the given `chain_id`, among the given `evm_rpc_urls`,

@@ -405,15 +405,14 @@ use rgbstd::{
     daggy::Walker,
     validation::{OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Warning},
 };
+use rgbstd::{
+    containers::{PendingConsignment, ValidConsignment},
+    stl::{RejectListLocation, RejectListUrl},
+};
 #[cfg(feature = "_online")]
 use rgbstd::{
-    containers::PendingConsignment,
     contract::FilterIncludeAll,
     validation::{Status as ValidationStatus, Validity},
-};
-use rgbstd::{
-    containers::ValidConsignment,
-    stl::{RejectListLocation, RejectListUrl},
 };
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
@@ -490,9 +489,11 @@ use crate::no_wallet::validation::electrum_config;
 use crate::no_wallet::validation::esplora_config;
 #[cfg(feature = "_online")]
 use crate::no_wallet::validation::{
-    AnchorResolution, ChainResolver, OffchainResolver, RejectList, RejectListSource,
-    checked_evm_client, get_resolver, max_mint_scan_blocks, rejected_opouts,
-    unreachable_indexer_details, validate_consignment_internal,
+    AnchorResolution, ChainResolver, OffchainResolver, PendingAnchors, RejectList,
+    RejectListSource, RemoteRejectListResolver, ResolveRejectList, checked_evm_client,
+    genesis_reject_list_source, get_resolver, max_mint_scan_blocks, pending_anchors,
+    rejected_by_reject_list, rejected_opouts, resolve_anchors, resolve_witnesses,
+    unreachable_indexer_details, validate_consignment_internal, validate_deterministic,
 };
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
