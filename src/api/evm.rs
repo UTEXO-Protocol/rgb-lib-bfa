@@ -90,9 +90,6 @@ fn parse_block_number(hex_block: &str) -> Result<u64, Error> {
     parse_quantity(hex_block, "block number")
 }
 
-#[derive(Debug, Serialize)]
-struct NullRequest;
-
 /// Decode a hex-encoded ABI word (32 bytes) at the given word index from `data`.
 /// `data` must start with "0x".
 fn abi_word(data: &str, index: usize) -> Result<[u8; 32], Error> {
@@ -563,7 +560,7 @@ impl EvmClient {
 
     /// Number of the latest block (`eth_blockNumber`).
     fn block_number(&self) -> Result<u64, Error> {
-        parse_block_number(&self.rpc::<_, String>("eth_blockNumber", NullRequest)?)
+        parse_block_number(&self.call_no_params("eth_blockNumber")?)
     }
 
     /// Call `contract` with `data` (`eth_call`) as of `block`, returning the raw result.
@@ -649,31 +646,10 @@ impl EvmClient {
 
     /// Call a JSON-RPC method taking no parameters and returning a string.
     fn call_no_params(&self, method: &'static str) -> Result<String, Error> {
-        let body: RpcRequest<NullRequest> = RpcRequest {
-            jsonrpc: "2.0",
-            method,
-            params: NullRequest,
-            id: 1,
-        };
-        let resp: RpcResponse<String> = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json()
-            .map_err(Self::req_err)?;
-
-        if let Some(err) = resp.error {
-            return Err(Error::Network {
-                details: format!("{method} error {}: {}", err.code, err.message),
-            });
-        }
-
-        resp.result.ok_or_else(|| Error::Network {
-            details: format!("{method} returned null result"),
-        })
+        // JSON-RPC parameters must be an array or object when present. A unit value
+        // serializes as null, which strict EVM gateways reject even for no-arg methods.
+        let params: [(); 0] = [];
+        self.rpc(method, params)
     }
 
     /// Number of the latest finalized block (`eth_getBlockByNumber` with the `finalized` tag).
@@ -1058,9 +1034,9 @@ mod tests {
     fn mock_block_number(server: &mut mockito::Server) -> mockito::Mock {
         server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJsonString(
-                r#"{"method":"eth_blockNumber"}"#.to_string(),
-            ))
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1,
+            })))
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x10"}"#)
             .create()
     }
@@ -1348,9 +1324,9 @@ mod tests {
         let mut server = mockito::Server::new();
         let mock = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::PartialJsonString(
-                r#"{"method":"eth_chainId"}"#.to_string(),
-            ))
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1,
+            })))
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x7a69"}"#)
             .expect(2)
             .create();
@@ -1371,6 +1347,60 @@ mod tests {
                 "eth_chainId error -32601: not found"
             )))
         );
+    }
+
+    #[test]
+    fn block_number() {
+        let mut server = mockito::Server::new();
+        let mock = mock_block_number(&mut server);
+        let client = EvmClient::new(&server.url()).unwrap();
+        assert_eq!(client.block_number().unwrap(), 16);
+        mock.assert();
+    }
+
+    #[test]
+    fn no_parameter_methods_report_invalid_or_missing_results() {
+        for method in ["eth_chainId", "eth_blockNumber"] {
+            for (body, expected) in [
+                (
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Invalid Request"}}"#,
+                    format!("{method} error -32600: Invalid Request"),
+                ),
+                (
+                    r#"{"jsonrpc":"2.0","id":1,"result":null}"#,
+                    format!("{method} returned null result"),
+                ),
+                (
+                    r#"{"jsonrpc":"2.0","id":1}"#,
+                    format!("{method} returned null result"),
+                ),
+                (
+                    r#"{"jsonrpc":"2.0","id":1,"result":"not-hex"}"#,
+                    "missing 0x prefix".to_string(),
+                ),
+            ] {
+                let mut server = mockito::Server::new();
+                let mock = server
+                    .mock("POST", "/")
+                    .match_body(mockito::Matcher::Json(serde_json::json!({
+                        "jsonrpc": "2.0", "method": method, "params": [], "id": 1,
+                    })))
+                    .with_body(body)
+                    .expect(1)
+                    .create();
+                let client = EvmClient::new(&server.url()).unwrap();
+                let result = match method {
+                    "eth_chainId" => client.chain_id(),
+                    "eth_blockNumber" => client.block_number(),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    matches!(result, Err(Error::Network { ref details }) if details.contains(&expected)),
+                    "{method}: {result:?}"
+                );
+                mock.assert();
+            }
+        }
     }
 
     #[test]

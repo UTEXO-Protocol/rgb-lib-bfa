@@ -38,4 +38,6 @@ jobs:
           else
             # These tests use the online-capable database but no network service.
             cargo test --locked --no-default-features --features bitcoind --lib migration_prerequisites -- --test-threads=1
+            # EVM request-shape and response tests use only a local mock HTTP server.
+            cargo test --locked --no-default-features --features bitcoind --lib api::evm::tests -- --test-threads=1
           fi
