@@ -11958,6 +11958,32 @@ fn blind_send_and_settle(
     );
 }
 
+// send the given amount of the asset to a blind receive, split into the given number of additional
+// allocations of the given amount, and have the recipient refuse the transfer
+#[cfg(feature = "electrum")]
+fn blind_send_dust_refused(
+    party: &mut SinglesigParty,
+    rcv_party: &mut SinglesigParty,
+    asset_id: &str,
+    receive_data: &ReceiveData,
+    amount: u64,
+    dust: (u16, u64),
+) {
+    MOCK_DUST_RECIPIENT_ASSIGNMENTS.replace(Some(dust));
+    let recipient_map = blind_recipient_map(asset_id, receive_data, amount);
+    let txid = party.send_result(&recipient_map).unwrap().txid;
+    assert!(MOCK_DUST_RECIPIENT_ASSIGNMENTS.take().is_none());
+    rcv_party.wait_for_refresh(None);
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+    party.wait_for_refresh(Some(asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+}
+
 // the allocations held by the only colored UTXO of the given party
 #[cfg(feature = "electrum")]
 fn single_colored_utxo_allocations(party: &mut SinglesigParty) -> Vec<RgbAllocation> {
@@ -11978,8 +12004,6 @@ fn utxo_freeze() {
 
     let amount_legit: u64 = 100;
     let amount_attack: u64 = 70_000;
-    // a bundle spends at most u16::MAX opouts of a contract (input map size)
-    let max_opouts = u16::MAX as usize;
     // the attacker sends all of its allocation, so the attack transition has no change and all of
     // its (at most u16::MAX) assignments of the asset go to the recipient seal
     let dust: (u16, u64) = (u16::MAX - 1, 1);
@@ -12006,7 +12030,8 @@ fn utxo_freeze() {
 
     // malicious send to an invoice on the same UTXO (accepted as the UTXO holds a single
     // allocation): the requested amount is split into u16::MAX allocations to the same blinded
-    // seal, taking the UTXO past the opouts a bundle can spend
+    // seal, which would take the UTXO past the opouts a bundle can spend (MAX_UTXO_ASSET_ALLOCATIONS)
+    // and freeze it, so the victim refuses the transfer
     let receive_data_2 = rcv_party.blind_receive();
     let rcv_transfer_1 = rcv_party.get_test_transfer_recipient(&receive_data_1.recipient_id);
     let rcv_transfer_2 = rcv_party.get_test_transfer_recipient(&receive_data_2.recipient_id);
@@ -12020,33 +12045,103 @@ fn utxo_freeze() {
             .0
             .receive_utxo
     );
-    MOCK_DUST_RECIPIENT_ASSIGNMENTS.replace(Some(dust));
-    blind_send_and_settle(
+    blind_send_dust_refused(
         &mut party,
         &mut rcv_party,
         asset_id,
         &receive_data_2,
         amount_attack,
+        dust,
+    );
+
+    // the attacker gets its allocation back, the victim's UTXO only holds the legit allocation
+    assert_eq!(party.get_asset_balance(asset_id).spendable, amount_attack);
+    assert_eq!(
+        rcv_party.get_asset_balance(asset_id).spendable,
+        amount_legit
+    );
+    assert_eq!(single_colored_utxo_allocations(&mut rcv_party).len(), 1);
+
+    // the victim can spend it
+    let receive_data_3 = rcv_party_2.blind_receive();
+    blind_send_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        &receive_data_3,
+        amount_legit,
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn utxo_freeze_limit() {
+    initialize();
+
+    // a low limit, to check it without u16::MAX allocations
+    let max_allocations: u16 = 10;
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations as usize));
+    let amount_legit: u64 = 100;
+    let amount_attack: u64 = 50;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+    let mut rcv_party_2 = get_funded_party!();
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // legit send to the victim
+    let receive_data_1 = rcv_party.blind_receive();
+    blind_send_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_1,
+        amount_legit,
+    );
+
+    // paying the UTXO one allocation more than it can hold is refused
+    let receive_data_2 = rcv_party.blind_receive();
+    blind_send_dust_refused(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_2,
+        amount_attack,
+        (max_allocations - 1, 1),
+    );
+    assert_eq!(single_colored_utxo_allocations(&mut rcv_party).len(), 1);
+
+    // paying it up to the limit is accepted
+    let receive_data_3 = rcv_party.blind_receive();
+    MOCK_DUST_RECIPIENT_ASSIGNMENTS.replace(Some((max_allocations - 2, 1)));
+    blind_send_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_3,
+        amount_attack,
     );
     assert!(MOCK_DUST_RECIPIENT_ASSIGNMENTS.take().is_none());
-
-    // the victim's only UTXO now holds more allocations of the asset than a bundle can spend
-    let total = amount_legit + amount_attack;
-    let balance = rcv_party.get_asset_balance(asset_id);
-    assert_eq!(balance.settled, total);
-    assert_eq!(balance.spendable, total);
     assert_eq!(
         single_colored_utxo_allocations(&mut rcv_party).len(),
-        max_opouts + 1
+        max_allocations as usize
     );
 
-    // the UTXO is frozen: spending it requires all of its allocations of the asset to be inputs of
-    // its bundle, so no amount can be sent, unless some allocations are omitted (burnt)
-    for amount in [1, total] {
-        let receive_data = rcv_party_2.blind_receive();
-        let recipient_map = blind_recipient_map(asset_id, &receive_data, amount);
-        let result = rcv_party.send_result(&recipient_map);
-        println!("send of {amount} result: {result:?}");
-        assert_matches!(result, Err(Error::Internal { .. }));
-    }
+    // and the UTXO can be spent
+    let total = amount_legit + amount_attack;
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, total);
+    let receive_data_4 = rcv_party_2.blind_receive();
+    blind_send_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        &receive_data_4,
+        total,
+    );
 }
