@@ -27,6 +27,8 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 #[cfg(feature = "electrum")]
 use rgbstd::stl::{EmbeddedMedia as RgbEmbeddedMedia, ProofOfReserves as RgbProofOfReserves};
+#[cfg(feature = "_online")]
+use rgbstd::{Assign, RevealedValue, TypedAssigns};
 use serde_json::Value;
 use serial_test::parallel;
 #[cfg(feature = "_online")]
@@ -234,6 +236,7 @@ thread_local! {
     pub(crate) static MOCK_CHAIN_TXS: RefCell<HashMap<String, (BdkTransaction, u32)>> = RefCell::new(HashMap::new());
     pub(crate) static MOCK_LOCAL_VERSION: RefCell<Option<String>> = const { RefCell::new(None) };
     pub(crate) static MOCK_SEND_END_CRASH: RefCell<Option<()>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_DUST_RECIPIENT_ASSIGNMENTS: RefCell<Option<(u16, u64)>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CLOCK_SKEW_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MIN_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
@@ -513,6 +516,41 @@ pub fn mock_min_retention_grace() -> Option<u32> {
 #[cfg(feature = "_online")]
 pub fn mock_confirmation_margin() -> Option<u32> {
     MOCK_CONFIRMATION_MARGIN.with_borrow(|m| *m)
+}
+
+// add the requested number of assignments of the given amount to the (blinded) recipient seal of
+// a transition, taking their total from the original recipient assignment, to simulate a malicious
+// sender (the transition builder cannot assign more than once to the same seal)
+#[cfg(feature = "_online")]
+pub fn mock_dust_recipient_assignments(mut transition: Transition) -> Transition {
+    let Some((num, amount)) = MOCK_DUST_RECIPIENT_ASSIGNMENTS.take() else {
+        return transition;
+    };
+    println!("mocking {num} additional recipient assignments of amount {amount}");
+    let Some(TypedAssigns::Fungible(assignments)) = transition.assignments.get_mut(&OS_ASSET)
+    else {
+        panic!("transition has no fungible assignments");
+    };
+    let (idx, seal, recipient_amount) = assignments
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| match a.seal {
+            BuilderSeal::Concealed(seal) => Some((i, seal, a.state.as_u64())),
+            BuilderSeal::Revealed(_) => None,
+        })
+        .unwrap();
+    let dust_total = num as u64 * amount;
+    assert!(recipient_amount > dust_total);
+    assignments.get_mut(idx).unwrap().state = RevealedValue::new(recipient_amount - dust_total);
+    for _ in 0..num {
+        assignments
+            .push(Assign {
+                seal: BuilderSeal::Concealed(seal),
+                state: RevealedValue::new(amount),
+            })
+            .unwrap();
+    }
+    transition
 }
 
 #[cfg(feature = "_online")]

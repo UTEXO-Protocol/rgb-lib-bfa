@@ -5045,6 +5045,8 @@ pub trait WalletOnline: WalletOffline {
 
             if main_needed {
                 let transition = asset_transition_builder.complete_transition()?;
+                #[cfg(test)]
+                let transition = mock_dust_recipient_assignments(transition);
                 if transfer_info.main_transition == TypeOfTransition::Mint {
                     opid = Some(transition.id().to_string());
                 }
