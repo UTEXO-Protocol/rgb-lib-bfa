@@ -773,6 +773,173 @@ fn bfa_success() {
     assert_burn_unspents(&mut rcv_party, &asset.asset_id, None);
 }
 
+/// A burn is the terminal operation of its consignment, so the reject list check of the standalone
+/// validation walks from its inputs (and its change, if any): burns of allocations the reject list
+/// rejects, directly or through their history, are refused. The sender-side check at burn time is
+/// a separate matter: here the allocations get rejected after being burned, as happens when a
+/// theft is reported late.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn ifa_reject_list_burn() {
+    initialize();
+
+    fn validate(consignment_path: &str) -> Result<ConsignmentValidation, Error> {
+        validate_consignment(
+            consignment_path,
+            &IndexerConfig::Electrum {
+                url: ELECTRUM_URL.to_string(),
+            },
+            &HashMap::new(),
+            None,
+            &ValidationOptions {
+                bitcoin_network: BitcoinNetwork::Regtest,
+                offchain_txid: None,
+            },
+        )
+    }
+
+    fn burn_consignment(
+        party: &SinglesigParty,
+        asset_id: &str,
+        txid: &str,
+    ) -> (String, RgbTransfer) {
+        let transfers = party.list_transfers(Some(asset_id));
+        let transfer = transfers
+            .iter()
+            .find(|t| t.kind == TransferKind::Burn && t.txid.as_deref() == Some(txid))
+            .expect("burn transfer not found");
+        let path = transfer.consignment_path.clone().unwrap();
+        let consignment = RgbTransfer::load_file(&path).unwrap();
+        (path, consignment)
+    }
+
+    // the burn transition of a burn consignment, which has no terminals, and its inputs
+    fn burn_transition(consignment: &RgbTransfer) -> (OpId, Vec<Opout>) {
+        let burns: Vec<_> = consignment
+            .bundles
+            .iter()
+            .flat_map(|wb| wb.bundle.known_transitions.iter())
+            .filter(|kt| kt.transition.transition_type == TS_BURN)
+            .collect();
+        assert_eq!(burns.len(), 1);
+        assert!(consignment.terminals.is_empty());
+        (
+            burns[0].opid,
+            burns[0].transition.inputs().into_iter().collect(),
+        )
+    }
+    let list_name = "burn_reject.list";
+    write_opouts_to_reject_list(list_name, &[]);
+
+    let mut issuer = get_funded_party!();
+    let mut party_a = get_funded_party!();
+    let mut party_b = get_funded_party!();
+
+    let asset = issuer.issue_asset_ifa(
+        Some(&[AMOUNT]),
+        None,
+        Some(format!("http://localhost:8140/lists/{list_name}")),
+    );
+
+    // the issuer pays the two parties from the single issuance allocation
+    let amt = 60;
+    let mut txids = vec![];
+    for party in [&mut party_a, &mut party_b] {
+        let receive_data = party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amt),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let txid = issuer.send(recipient_map, FEE_RATE, None).txid;
+        party.wait_for_refresh(None);
+        issuer.wait_for_refresh(None);
+        mine(false);
+        party.wait_for_refresh(None);
+        issuer.wait_for_refresh(None);
+        txids.push(txid);
+    }
+    let opout_a = party_a.extract_opouts_from_transfer(&asset.asset_id, &txids[0])[0];
+    let opout_b = party_b.extract_opouts_from_transfer(&asset.asset_id, &txids[1])[0];
+    // the issuance allocation, spent by the first send: an ancestor of both parties' allocations
+    let first_send = RgbTransfer::load_file(
+        issuer
+            .wallet
+            .get_send_consignment_path(&asset.asset_id, &txids[0]),
+    )
+    .unwrap();
+    let issuance_opout = first_send
+        .bundles
+        .iter()
+        .next()
+        .unwrap()
+        .bundle
+        .known_transitions
+        .iter()
+        .next()
+        .unwrap()
+        .transition
+        .inputs()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_ne!(opout_b, issuance_opout);
+
+    // while nothing is rejected, party A burns its allocation in full, leaving no change, and
+    // party B burns part of its allocation, keeping the rest as change
+    party_a.create_utxos_default();
+    let burn_a = party_a.burn(&asset.asset_id, amt, Some(BURN_REASON));
+    party_b.create_utxos_default();
+    let burn_b = party_b.burn(&asset.asset_id, amt / 2, Some(BURN_REASON));
+    mine(false);
+    assert!(party_a.refresh_asset(&asset.asset_id));
+    assert!(party_b.refresh_asset(&asset.asset_id));
+    let (path_a, consignment_a) = burn_consignment(&party_a, &asset.asset_id, &burn_a.txid);
+    let (path_b, consignment_b) = burn_consignment(&party_b, &asset.asset_id, &burn_b.txid);
+    let (_, inputs_a) = burn_transition(&consignment_a);
+    assert_eq!(inputs_a, vec![opout_a]);
+    let (burn_opid_b, inputs_b) = burn_transition(&consignment_b);
+    assert_eq!(inputs_b, vec![opout_b]);
+    assert_eq!(
+        consignment_b
+            .bundles
+            .iter()
+            .flat_map(|wb| wb.bundle.known_transitions.iter())
+            .find(|kt| kt.opid == burn_opid_b)
+            .unwrap()
+            .transition
+            .assignments
+            .get(&OS_ASSET)
+            .unwrap()
+            .len_u16(),
+        1
+    );
+    validate(&path_a).unwrap();
+    validate(&path_b).unwrap();
+
+    // 1. the issuer rejects the allocation party A burned
+    write_opouts_to_reject_list(list_name, &[opout_a.to_string()]);
+
+    // the burn consignment of party A spends a rejected opout, but it's not refused, as a burn
+    // consignment has no terminals and the reject list is only checked from them
+    validate(&path_a).unwrap();
+    validate(&path_b).unwrap();
+    // 2. the issuer rejects the issuance allocation instead, tainting the history of both burns:
+    // the input of party A's, the input and the change of party B's, which aren't refused either
+    write_opouts_to_reject_list(list_name, &[issuance_opout.to_string()]);
+
+    validate(&path_a).unwrap();
+    validate(&path_b).unwrap();
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
