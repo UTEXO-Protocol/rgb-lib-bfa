@@ -570,9 +570,9 @@ fn mint() {
 
     // the minted allocation rejected by the reject list contract, once finalized
     let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
-    let terminals = terminal_opouts(&consignment);
-    assert_eq!(terminals.len(), 1);
-    let terminal = terminals.into_iter().next().unwrap();
+    let terminal_ops = consignment.terminal_ops();
+    assert_eq!(terminal_ops.len(), 1);
+    let terminal = Opout::new(*terminal_ops.iter().next().unwrap(), OS_ASSET, 0);
     reject_list_append(&reject_list_contract.address, &[(terminal, true)]);
     evm_mine(EVM_FINALITY_DEPTH);
     let result = validate_mint(evm_rpc_urls, None);
@@ -616,10 +616,9 @@ fn reject_list() {
         .to_string_lossy()
         .to_string();
     let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
-    let terminals = terminal_opouts(&consignment);
-    assert_eq!(terminals.len(), 1);
-    let terminal = terminals.into_iter().next().unwrap().to_string();
-    let issuance = consignment
+    // the transfer is the terminal operation: its inputs (the issuance) and its outputs (the
+    // blinded terminal and the revealed change) are checked against the reject list
+    let transfer = consignment
         .bundles
         .iter()
         .next()
@@ -628,13 +627,25 @@ fn reject_list() {
         .known_transitions
         .iter()
         .next()
-        .unwrap()
+        .unwrap();
+    assert_eq!(consignment.terminal_ops(), BTreeSet::from([transfer.opid]));
+    let issuance = transfer
         .transition
         .inputs()
         .into_iter()
         .next()
         .unwrap()
         .to_string();
+    let asset_assigns = transfer.transition.assignments.get(&OS_ASSET).unwrap();
+    assert_eq!(asset_assigns.len_u16(), 2);
+    let (concealed, revealed): (Vec<u16>, Vec<u16>) = (0..2)
+        .partition(|no| matches!(asset_assigns.seal_at(*no), Some(BuilderSeal::Concealed(_))));
+    let terminal = Opout::new(transfer.opid, OS_ASSET, concealed[0]).to_string();
+    let change = Opout::new(transfer.opid, OS_ASSET, revealed[0]).to_string();
+    let mut all_checked = vec![terminal.clone(), change.clone(), issuance.clone()];
+    all_checked.sort();
+    let mut inputs_and_change = vec![change.clone(), issuance.clone()];
+    inputs_and_change.sort();
 
     // nothing rejected
     validate(&consignment_path, Some(&txid), None).unwrap();
@@ -648,14 +659,17 @@ fn reject_list() {
     write_opouts_to_reject_list(list_name, &[terminal.clone(), format!("!{terminal}")]);
     validate(&consignment_path, Some(&txid), None).unwrap();
 
-    // a rejected ancestor of the terminal
+    // a rejected ancestor: the issuance itself, the terminal and the change are all tainted
     write_opouts_to_reject_list(list_name, std::slice::from_ref(&issuance));
     let result = validate(&consignment_path, Some(&txid), None);
-    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![terminal.clone()]);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == all_checked);
 
-    // a rejected ancestor shielded by the allowed terminal
+    // an allowed terminal shields itself only: the operation's input and change stay tainted, so
+    // the consignment is refused (a wallet receiving the terminal would accept it, as it checks
+    // the assignments it receives)
     write_opouts_to_reject_list(list_name, &[issuance.clone(), format!("!{terminal}")]);
-    validate(&consignment_path, Some(&txid), None).unwrap();
+    let result = validate(&consignment_path, Some(&txid), None);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == inputs_and_change);
 
     // a custom reject list resolver is trusted in place of the reject list server
     struct MockRejectListResolver(Vec<(Opout, bool)>);
@@ -688,12 +702,12 @@ fn reject_list() {
     let issuance = Opout::from_str(&issuance).unwrap();
     validate_with_resolver(Some(&MockRejectListResolver(vec![]))).unwrap();
     let result = validate_with_resolver(Some(&MockRejectListResolver(vec![(issuance, false)])));
-    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![terminal.to_string()]);
-    validate_with_resolver(Some(&MockRejectListResolver(vec![
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == all_checked);
+    let result = validate_with_resolver(Some(&MockRejectListResolver(vec![
         (issuance, false),
         (terminal, true),
-    ])))
-    .unwrap();
+    ])));
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == inputs_and_change);
     let result = validate_with_resolver(Some(&MockRejectListResolver(vec![
         (terminal, true),
         (terminal, false),

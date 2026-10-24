@@ -825,7 +825,7 @@ impl ResolveAnchor for EvmClient {
         let ExternalAnchor::MintEvent {
             opid,
             amount,
-            after_block,
+            before_block: after_block,
         } = anchor;
 
         let scan = self
@@ -890,7 +890,7 @@ impl ResolveAnchor for BoundedAnchorResolver<'_> {
         let ExternalAnchor::MintEvent {
             opid,
             amount,
-            after_block,
+            before_block: after_block,
         } = anchor;
         let finalized_block = self
             .client
@@ -979,7 +979,7 @@ impl ResolveAnchor for ResumingAnchorResolver<'_> {
         let ExternalAnchor::MintEvent {
             opid,
             amount,
-            after_block,
+            before_block: after_block,
         } = anchor;
 
         // finalized blocks cannot be reorged, so the ones already scanned needn't be again
@@ -1676,7 +1676,7 @@ mod tests {
         let anchor = ExternalAnchor::MintEvent {
             opid: OpId::from([0u8; 32]),
             amount: 7,
-            after_block: 16,
+            before_block: 16,
         };
         assert!(!client.is_confirmed(&location, &anchor).unwrap());
         block_number.assert();
@@ -1692,7 +1692,7 @@ mod tests {
         let anchor = ExternalAnchor::MintEvent {
             opid: OpId::from([0u8; 32]),
             amount: 7,
-            after_block: 16,
+            before_block: 16,
         };
         let log = |amount: u64| funds_in_log(amount, 0x11);
         let is_confirmed = |logs: &[String]| {
@@ -1866,7 +1866,7 @@ mod tests {
         let anchor = ExternalAnchor::MintEvent {
             opid,
             amount: 7,
-            after_block: 16,
+            before_block: 16,
         };
 
         // with nothing scanned yet, the scan starts after the block the anchor commits to and
@@ -1941,7 +1941,7 @@ mod tests {
         let anchor = ExternalAnchor::MintEvent {
             opid,
             amount: 7,
-            after_block: 16,
+            before_block: 16,
         };
 
         // the scan stops at the limit, even if more blocks are finalized: with no event within it,
@@ -1994,7 +1994,7 @@ mod tests {
         let anchor = ExternalAnchor::MintEvent {
             opid,
             amount: 7,
-            after_block: 16,
+            before_block: 16,
         };
 
         // a terminal mint is scanned resuming after the scanned block, up to the finalized one

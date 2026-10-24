@@ -7,9 +7,9 @@ pub(crate) const SCHEMA_ID_UDA: &str =
 pub(crate) const SCHEMA_ID_CFA: &str =
     "rgb:sch:JgqK5hJX9YBT4osCV7VcW_iLTcA5csUCnLzvaKTTrNY#mars-house-friend";
 pub(crate) const SCHEMA_ID_IFA: &str =
-    "rgb:sch:Y2a6SW4rY3gRwLE40OxILhwOyL2FR9ppte790oLbIe0#athena-paul-horizon";
+    "rgb:sch:UzeBrwOrGqUR7NLRReHIBY7OimYpapjnV~NxiIglPPg#package-general-mozart";
 pub(crate) const SCHEMA_ID_BFA: &str =
-    "rgb:sch:Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc#amazon-norway-harris";
+    "rgb:sch:HbLJ6SjvzVw~XTu6e~Iau6wIcxYsVTlSM7dRUn0DDo4#brave-type-culture";
 
 /// The schema of an asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]

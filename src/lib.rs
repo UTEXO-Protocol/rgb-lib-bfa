@@ -337,6 +337,8 @@ use rgb_lib_migration::{
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
+#[cfg(feature = "wallet")]
+use rgbstd::SecretSeal;
 use rgbstd::bitcoin::block::Header as BlockHeader;
 #[cfg(feature = "_validation")]
 use rgbstd::indexers::AnyResolver;
@@ -380,15 +382,15 @@ use rgbstd::{
     },
     stl::{
         Attachment, ContractTerms, EmbeddedMedia as RgbEmbeddedMedia, MediaType,
-        ProofOfReserves as RgbProofOfReserves, RicardianContract, Ticker, TokenData,
+        ProofOfReserves as RgbProofOfReserves, RicardianContract, Ticker, TokenData, UnicodeTicker,
     },
-    txout::{BlindSeal, ExplicitSeal, TxPtr},
+    txout::{BlindSeal, ExplicitSeal},
     validation::{SchemaDefinition, WitnessOrdProvider},
     vm::WitnessPos,
 };
 use rgbstd::{
     Amount, AssignmentType, Assignments, ChainNet, ExposedSeal, Genesis, GlobalStateType,
-    GraphSeal, KnownTransition, OpId, Operation as _, Precision, Schema, SecretSeal, Transition,
+    GraphSeal, KnownTransition, OpId, Operation as _, Precision, Schema, Transition,
     TransitionBundle, TransitionType, TypedAssigns,
     bitcoin::{OutPoint, Transaction as BdkTransaction, Txid},
     containers::{
@@ -397,12 +399,11 @@ use rgbstd::{
     contract::IssuerWrapper,
     rgbcore::{commit_verify::mpc::Commitment, dbc::Proof as _},
     stl::{AssetSpec, BlockNumber, BurnReason, Details, Name},
-    txout::TxoSeal,
+    txout::{TxPtr, TxoSeal},
     validation::DbcProof,
 };
 use rgbstd::{
     containers::CheckedAnchorResolver,
-    daggy::Walker,
     validation::{OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Warning},
 };
 use rgbstd::{
@@ -424,7 +425,7 @@ use schemata::{
 };
 use schemata::{
     GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION, GS_DETAILS, GS_ISSUED_SUPPLY, GS_NAME,
-    GS_NOMINAL, GS_PRECISION, MS_AFTER_BLOCK, MS_ALLOWED_INFLATION, OS_ASSET, OS_INFLATION,
+    GS_NOMINAL, GS_PRECISION, MS_ALLOWED_INFLATION, MS_BEFORE_BLOCK, OS_ASSET, OS_INFLATION,
     OS_MINT, TS_BURN, TS_INFLATION, TS_MINT, TS_TRANSFER,
 };
 use schemata::{GS_REJECT_LIST, GS_REJECT_LIST_URL};
@@ -513,7 +514,7 @@ use crate::wallet::test::{
     mock_chain_tx, mock_clock_skew_margin, mock_confirmation_margin, mock_input_unspents,
     mock_local_version, mock_max_mint_scan_blocks, mock_min_retention_grace,
     mock_mint_after_block_grace, mock_mint_lock_window, mock_retention_grace, mock_send_end_crash,
-    skip_build_dag, skip_check_fee_rate, spv_only, strip_terminals,
+    skip_build_dag, skip_check_fee_rate, spv_only,
 };
 #[cfg(feature = "_online")]
 use crate::{
@@ -626,5 +627,5 @@ pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
 pub(crate) const RGB_GLOBAL_BURNED_INFLATION: &str = "burnedInflation";
 pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
-pub(crate) const RGB_METADATA_AFTER_BLOCK: &str = "afterBlock";
+pub(crate) const RGB_METADATA_BEFORE_BLOCK: &str = "beforeBlock";
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";

@@ -652,10 +652,13 @@ pub(crate) fn esplora_config(indexer_url: &str) -> EsploraBuilder {
 ///   the consignment, without checking it against the chain: it may never be broadcast, or
 ///   conflict with one that is
 ///
-/// If the asset has a reject list, the consignment terminals are checked against it, as a wallet
-/// receiving them does: an [`Error::ConsignmentRejected`] is returned if any of them has a rejected
-/// opout along its history (unless an allowed one shields it). A reject list kept by an EVM
-/// contract is read through the EVM RPC URL configured for its chain ID in `evm_rpc_urls`.
+/// If the asset has a reject list, the operations the consignment proves (its terminal operations,
+/// the ones nothing in the consignment builds on, e.g. the last transfer or a burn) are checked
+/// against it, inputs and outputs: an [`Error::ConsignmentRejected`] is returned if any of them has
+/// a rejected opout along its history, unless an allowed one shields it (an allowed output doesn't
+/// shield the inputs of its own operation, which are checked on their own). A wallet receiving a
+/// transfer checks the assignments it receives instead. A reject list kept by an EVM contract is
+/// read through the EVM RPC URL configured for its chain ID in `evm_rpc_urls`.
 #[cfg(feature = "_validation")]
 pub fn validate_consignment(
     consignment_path: &str,
@@ -702,7 +705,8 @@ pub fn validate_consignment(
            feature), which uses an indexer: the witness with"
 )]
 /// the [`ValidationOptions::offchain_txid`] is taken from the consignment, as it may not have been
-/// broadcast yet, and the terminals are checked against the asset's reject list (if any). When
+/// broadcast yet, and the terminal operations are checked against the asset's reject list (if
+/// any). When
 /// `safe_height` is provided, witnesses mined above it (including unconfirmed ones) are reported
 /// in a warning. The same trust assumptions apply, with the provided resolvers trusted in place of
 /// the indexer, the EVM RPC endpoints and the reject list server.
@@ -773,7 +777,7 @@ fn validate_consignment_file(
 }
 
 /// Validate the given consignment, see [`validate_consignment_with_resolver`], then check its
-/// terminals against the reject list of its asset (if any).
+/// terminal operations against the reject list of its asset (if any).
 fn validate_loaded_consignment<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     resolver: &dyn ResolveWitness,
@@ -815,7 +819,7 @@ fn validate_loaded_consignment<const TRANSFER: bool>(
         consignment.genesis(),
         valid_consignment.validation_status().dag_data_opt.as_ref(),
         reject_list_resolver,
-        &terminal_opouts(consignment),
+        &reject_check_origins(consignment),
     )?;
     if !rejected.is_empty() {
         let mut opouts: Vec<String> = rejected.iter().map(|o| o.to_string()).collect();
@@ -1227,30 +1231,30 @@ pub(crate) fn genesis_reject_list_source(
     })
 }
 
-/// The opouts assigned to the terminals of the given consignment.
-pub(crate) fn terminal_opouts<const TRANSFER: bool>(
+/// The opouts the reject list check of a consignment starts from: the inputs and the outputs of
+/// its terminal operations, the ones nothing in the consignment builds on (for a transfer, the
+/// last transition; for a burn, the burn itself, whose inputs are checked even if it has no
+/// output).
+///
+/// The inputs are checked on their own, so that an allowed output can't shield the history of the
+/// operation producing it: what the consignment proves is the operation as a whole. Unspent
+/// outputs of other operations, e.g. the change of an earlier transfer, are revealed by the
+/// consignment but not proven by it, so they are never checked.
+pub(crate) fn reject_check_origins<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
 ) -> HashSet<Opout> {
+    let terminal_ops = consignment.terminal_ops();
     let mut opouts = HashSet::new();
-    for witness_bundle in consignment.bundles.iter() {
-        let Some(terminal_seals) = consignment
-            .terminals
-            .get(&witness_bundle.bundle.bundle_id())
-        else {
-            continue;
-        };
-        let terminal_seals: HashSet<SecretSeal> = terminal_seals
-            .into_iter()
-            .map(|s| s.to_secret_seal())
-            .collect();
-        for KnownTransition { opid, transition } in witness_bundle.bundle.known_transitions.iter() {
-            for (ass_type, typed_assigns) in transition.assignments.iter() {
-                for no in 0..typed_assigns.len_u16() {
-                    let seal = typed_assigns.seal_at(no).expect("index in range");
-                    if terminal_seals.contains(&seal.to_secret_seal()) {
-                        opouts.insert(Opout::new(*opid, *ass_type, no));
-                    }
-                }
+    for KnownTransition { opid, transition } in consignment
+        .bundles
+        .iter()
+        .flat_map(|wb| wb.bundle.known_transitions.iter())
+        .filter(|kt| terminal_ops.contains(&kt.opid))
+    {
+        opouts.extend(transition.inputs());
+        for (ass_type, typed_assigns) in transition.assignments.iter() {
+            for no in 0..typed_assigns.len_u16() {
+                opouts.insert(Opout::new(*opid, *ass_type, no));
             }
         }
     }
@@ -1265,33 +1269,39 @@ pub(crate) fn rejected_opouts(
     reject_list: &RejectList,
     check_opouts: &HashSet<Opout>,
 ) -> Result<HashSet<Opout>, Error> {
-    let (dag, index) = dag_data;
     let mut to_reject = HashSet::new();
 
     // for each opout we are checking, traverse its ancestor chain
-    for check_opout in check_opouts {
-        let &opout_node = index.get(check_opout).ok_or(Error::Internal {
+    'check: for check_opout in check_opouts {
+        // allow shields this path upward: do not traverse this branch further
+        if reject_list.allows(check_opout) {
+            continue;
+        }
+        // encountering a reject opout on an unshielded path: reject
+        if reject_list.rejects(check_opout) {
+            to_reject.insert(*check_opout);
+            continue;
+        }
+        let op_node = dag_data.op_node(&check_opout.op).ok_or(Error::Internal {
             details: s!("opout not found in DAG"),
         })?;
 
-        // traverse from this node to its ancestors, depth first
-        let mut stack = vec![opout_node];
+        // traverse from the operation creating it to its ancestors, depth first, checking the
+        // opouts each operation spends
+        let mut stack = vec![op_node];
         let mut visited = HashSet::new();
         while let Some(node) = stack.pop() {
             if !visited.insert(node) {
                 continue;
             }
-            let node_opout = &dag[node];
-            // allow shields this path upward: do not traverse this branch further
-            if reject_list.allows(node_opout) {
-                continue;
-            }
-            // encountering a reject node on an unshielded path: reject
-            if reject_list.rejects(node_opout) {
-                to_reject.insert(*check_opout);
-                break;
-            }
-            for (_edge, parent) in dag.parents(node).iter(dag) {
+            for (spent_opout, parent) in dag_data.spent_opouts(node) {
+                if reject_list.allows(&spent_opout) {
+                    continue;
+                }
+                if reject_list.rejects(&spent_opout) {
+                    to_reject.insert(*check_opout);
+                    continue 'check;
+                }
                 stack.push(parent);
             }
         }

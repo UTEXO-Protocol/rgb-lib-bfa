@@ -1001,13 +1001,11 @@ pub trait WalletOffline: WalletBackup {
         #[cfg(test)]
         let details = mock_contract_details(self);
         #[cfg(not(test))]
-        let details = None;
-        let spec = AssetSpec {
-            ticker: self.check_ticker(ticker.clone())?,
-            name: self.check_name(name.clone())?,
-            details,
-            precision: self.check_precision(precision)?,
-        };
+        let details: Option<Details> = None;
+        let bfa_ticker = UnicodeTicker::try_from(self.check_ticker(ticker.clone())?.to_string())
+            .map_err(|e| Error::InvalidTicker {
+                details: e.to_string(),
+            })?;
 
         let contract_address = self.check_contract_address(contract_address)?;
 
@@ -1016,8 +1014,12 @@ pub trait WalletOffline: WalletBackup {
             BridgedFungibleAsset::schema_rules(),
             self.chain_net(),
         )
-        .add_global_state("spec", spec.clone())
-        .expect("invalid spec")
+        .add_global_state("ticker", bfa_ticker)
+        .expect("invalid ticker")
+        .add_global_state("name", self.check_name(name.clone())?)
+        .expect("invalid name")
+        .add_global_state("precision", self.check_precision(precision)?)
+        .expect("invalid precision")
         .add_global_state("terms", terms)
         .expect("invalid terms")
         .add_global_state(
@@ -1028,6 +1030,11 @@ pub trait WalletOffline: WalletBackup {
             }),
         )
         .expect("invalid bridgeLocation");
+        if let Some(details) = &details {
+            builder = builder
+                .add_global_state("details", details.clone())
+                .expect("invalid details");
+        }
         if let Some(reject_list_address) = reject_list_address {
             builder = builder
                 .add_global_state(
@@ -1065,7 +1072,7 @@ pub trait WalletOffline: WalletBackup {
             asset_schema: *asset_schema,
             precision,
             ticker: Some(ticker),
-            details: spec.details().map(|d| d.to_string()),
+            details: details.map(|d| d.to_string()),
             media: None,
             initial_supply: 0,
             max_supply: None,
@@ -1930,11 +1937,10 @@ pub trait WalletOffline: WalletBackup {
             }
             AssetSchema::Bfa => {
                 let contract = stock.contract_wrapper::<BridgedFungibleAsset>(contract_id)?;
-                let spec = contract.spec();
-                let ticker = spec.ticker().to_string();
-                let name = spec.name().to_string();
-                let details = spec.details().map(|d| d.to_string());
-                let precision = spec.precision.into();
+                let ticker = contract.ticker().to_string();
+                let name = contract.name().to_string();
+                let details = contract.details().map(|d| d.to_string());
+                let precision = contract.precision().into();
                 let media = contract
                     .contract_terms()
                     .media
@@ -2900,8 +2906,7 @@ pub trait WalletOffline: WalletBackup {
         let mut stock = self.rgb_stock(txn)?;
         for (asset_id, transfer_info) in transfer_info_map {
             let contract_id = transfer_info.asset_info.contract_id;
-            #[allow(unused_mut)]
-            let (mut consignment, spv_proofs) = stock.transfer_from_fascia(
+            let (consignment, spv_proofs) = stock.transfer_from_fascia(
                 contract_id,
                 transfer_info.beneficiaries_witness.clone(),
                 transfer_info.beneficiaries_blinded.clone(),
@@ -2910,10 +2915,6 @@ pub trait WalletOffline: WalletBackup {
                 self.spv_resolver(),
             )?;
             stock.store_spv_proofs(spv_proofs)?;
-            #[cfg(all(test, feature = "_online"))]
-            if strip_terminals() {
-                consignment.terminals = Default::default();
-            }
             let asset_transfer_dir = self.get_asset_transfer_dir(transfer_dir, asset_id);
             fs::create_dir_all(&asset_transfer_dir)?;
             let consignment_path = self.get_send_consignment_path_impl(asset_transfer_dir);

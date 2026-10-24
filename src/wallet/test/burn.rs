@@ -155,11 +155,10 @@ fn ifa_success() {
     assert!(transfer.consignment_path.is_some());
 
     // check the burn consignment: it carries the burn transition (with the committed reason) and
-    // no terminal, and it validates from the point of view of a third party that doesn't know the
-    // asset
+    // it's the terminal operation, and it validates from the point of view of a third party that
+    // doesn't know the asset
     let consignment_path = transfer.consignment_path.as_ref().unwrap();
     let consignment = RgbTransfer::load_file(consignment_path).unwrap();
-    assert!(consignment.terminals.is_empty());
     let burn_transitions: Vec<_> = consignment
         .bundles
         .iter()
@@ -167,6 +166,10 @@ fn ifa_success() {
         .filter(|kt| kt.transition.transition_type == TS_BURN)
         .collect();
     assert_eq!(burn_transitions.len(), 1);
+    assert_eq!(
+        consignment.terminal_ops(),
+        BTreeSet::from([burn_transitions[0].opid])
+    );
     let burn_reason_type = InflatableFungibleAsset::schema().global_type(RGB_GLOBAL_BURN_REASON);
     let burn_reason = burn_transitions[0]
         .transition
@@ -595,11 +598,10 @@ fn bfa_success() {
     assert!(transfer.consignment_path.is_some());
 
     // check the burn consignment: it carries the burn transition (with the committed reason) and
-    // no terminal, and it validates from the point of view of a third party that doesn't know the
-    // asset
+    // it's the terminal operation, and it validates from the point of view of a third party that
+    // doesn't know the asset
     let consignment_path = transfer.consignment_path.as_ref().unwrap();
     let consignment = RgbTransfer::load_file(consignment_path).unwrap();
-    assert!(consignment.terminals.is_empty());
     let burn_transitions: Vec<_> = consignment
         .bundles
         .iter()
@@ -607,6 +609,10 @@ fn bfa_success() {
         .filter(|kt| kt.transition.transition_type == TS_BURN)
         .collect();
     assert_eq!(burn_transitions.len(), 1);
+    assert_eq!(
+        consignment.terminal_ops(),
+        BTreeSet::from([burn_transitions[0].opid])
+    );
     let burn_reason_type = BridgedFungibleAsset::schema().global_type(RGB_GLOBAL_BURN_REASON);
     let burn_reason = burn_transitions[0]
         .transition
@@ -814,7 +820,7 @@ fn ifa_reject_list_burn() {
         (path, consignment)
     }
 
-    // the burn transition of a burn consignment, which has no terminals, and its inputs
+    // the burn transition of a burn consignment, the terminal operation, and its inputs
     fn burn_transition(consignment: &RgbTransfer) -> (OpId, Vec<Opout>) {
         let burns: Vec<_> = consignment
             .bundles
@@ -823,7 +829,7 @@ fn ifa_reject_list_burn() {
             .filter(|kt| kt.transition.transition_type == TS_BURN)
             .collect();
         assert_eq!(burns.len(), 1);
-        assert!(consignment.terminals.is_empty());
+        assert_eq!(consignment.terminal_ops(), BTreeSet::from([burns[0].opid]));
         (
             burns[0].opid,
             burns[0].transition.inputs().into_iter().collect(),
@@ -894,7 +900,8 @@ fn ifa_reject_list_burn() {
     assert_ne!(opout_b, issuance_opout);
 
     // while nothing is rejected, party A burns its allocation in full, leaving no change, and
-    // party B burns part of its allocation, keeping the rest as change
+    // party B burns part of its allocation, keeping the rest as change: a burn has no outputs, so
+    // its allocation is first split, in the same bundle, into the burned part and the change
     party_a.create_utxos_default();
     let burn_a = party_a.burn(&asset.asset_id, amt, Some(BURN_REASON));
     party_b.create_utxos_default();
@@ -906,21 +913,28 @@ fn ifa_reject_list_burn() {
     let (path_b, consignment_b) = burn_consignment(&party_b, &asset.asset_id, &burn_b.txid);
     let (_, inputs_a) = burn_transition(&consignment_a);
     assert_eq!(inputs_a, vec![opout_a]);
-    let (burn_opid_b, inputs_b) = burn_transition(&consignment_b);
-    assert_eq!(inputs_b, vec![opout_b]);
+    let (_, inputs_b) = burn_transition(&consignment_b);
+    assert_eq!(inputs_b.len(), 1);
+    let burned_b = inputs_b[0];
+    let split_b = consignment_b
+        .bundles
+        .iter()
+        .flat_map(|wb| wb.bundle.known_transitions.iter())
+        .find(|kt| kt.opid == burned_b.op)
+        .unwrap();
+    assert_eq!(split_b.transition.transition_type, TS_TRANSFER);
     assert_eq!(
-        consignment_b
-            .bundles
-            .iter()
-            .flat_map(|wb| wb.bundle.known_transitions.iter())
-            .find(|kt| kt.opid == burn_opid_b)
-            .unwrap()
+        split_b.transition.inputs().into_iter().collect::<Vec<_>>(),
+        vec![opout_b]
+    );
+    assert_eq!(
+        split_b
             .transition
             .assignments
             .get(&OS_ASSET)
             .unwrap()
             .len_u16(),
-        1
+        2
     );
     validate(&path_a).unwrap();
     validate(&path_b).unwrap();
@@ -928,16 +942,19 @@ fn ifa_reject_list_burn() {
     // 1. the issuer rejects the allocation party A burned
     write_opouts_to_reject_list(list_name, &[opout_a.to_string()]);
 
-    // the burn consignment of party A spends a rejected opout, but it's not refused, as a burn
-    // consignment has no terminals and the reject list is only checked from them
-    validate(&path_a).unwrap();
+    // the burn consignment of party A spends a rejected opout, so it's refused
+    let result = validate(&path_a);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![opout_a.to_string()]);
     validate(&path_b).unwrap();
     // 2. the issuer rejects the issuance allocation instead, tainting the history of both burns:
-    // the input of party A's, the input and the change of party B's, which aren't refused either
+    // the input of party A's, the input of party B's (the burned part of its split, whose change
+    // the burn consignment doesn't prove)
     write_opouts_to_reject_list(list_name, &[issuance_opout.to_string()]);
 
-    validate(&path_a).unwrap();
-    validate(&path_b).unwrap();
+    let result = validate(&path_a);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![opout_a.to_string()]);
+    let result = validate(&path_b);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![burned_b.to_string()]);
 }
 
 #[cfg(feature = "electrum")]

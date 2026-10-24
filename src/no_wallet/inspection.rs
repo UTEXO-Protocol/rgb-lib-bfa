@@ -32,8 +32,9 @@ pub struct RgbOutputInfo {
     pub recipient_id: Option<String>,
     /// Whether this output belongs to the wallet (`None` when inspecting without a wallet)
     pub is_ours: Option<bool>,
-    /// Whether this output is a terminal of the consignment, meaning it's allocated to the
-    /// consignment recipient (`None` when not inspecting a consignment)
+    /// Whether this output belongs to a terminal operation of the consignment, one nothing in the
+    /// consignment builds on, so to what the consignment proves rather than to its history (`None`
+    /// when not inspecting a consignment)
     pub is_terminal: Option<bool>,
 }
 
@@ -147,8 +148,8 @@ pub struct ConsignmentInspection {
     pub asset_schema: AssetSchema,
     /// Details of the asset genesis
     pub genesis: RgbGenesisInfo,
-    /// Details of the inspected witness transactions (the ones of the terminals or all of them), in
-    /// consignment order (none for a contract consignment)
+    /// Details of the inspected witness transactions (the ones of the terminal operations or all of
+    /// them), in consignment order (none for a contract consignment)
     pub witnesses: Vec<RgbInspection>,
 }
 
@@ -157,7 +158,8 @@ pub struct ConsignmentInspection {
 pub enum BundleFilter {
     /// All the consignment bundles
     All,
-    /// The bundles containing the consignment terminals
+    /// The bundles holding a terminal operation of the consignment, one nothing in the consignment
+    /// builds on (e.g. the last transfer or a burn)
     Terminals,
     /// The bundle committed by the witness transaction with the given TXID
     Witness(String),
@@ -217,8 +219,8 @@ pub fn inspect_consignment(
 }
 
 /// Build the inspection details of a consignment, inspecting the bundles selected by the given
-/// function (called with their witness TXID and whether they contain terminals) and checking the
-/// witness transactions commit to the inspected transitions.
+/// function (called with their witness TXID and whether they hold a terminal operation) and
+/// checking the witness transactions commit to the inspected transitions.
 fn consignment_inspection<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     selected: impl Fn(Txid, bool) -> bool,
@@ -268,12 +270,17 @@ fn consignment_inspection<const TRANSFER: bool>(
     };
 
     // inspect the selected bundles
+    let terminal_ops = consignment.terminal_ops();
     let mut witnesses = vec![];
     for witness_bundle in consignment.bundles.iter() {
         let bundle_id = witness_bundle.bundle.bundle_id();
         let txid = witness_bundle.witness_id();
-        let terminal_seals = consignment.terminals.get(&bundle_id);
-        if !selected(txid, terminal_seals.is_some()) {
+        let has_terminals = witness_bundle
+            .bundle
+            .known_transitions
+            .iter()
+            .any(|kt| terminal_ops.contains(&kt.opid));
+        if !selected(txid, has_terminals) {
             continue;
         }
         let tx = &witness_bundle.tx;
@@ -288,9 +295,6 @@ fn consignment_inspection<const TRANSFER: bool>(
                 })?;
         verify_witness_commitment(&anchor.dbc_proof, &commitment, tx)?;
 
-        let terminal_seals: HashSet<SecretSeal> = terminal_seals
-            .map(|seals| seals.into_iter().map(|s| s.to_secret_seal()).collect())
-            .unwrap_or_default();
         let operation = bundle_info(
             contract_id,
             asset_schema,
@@ -300,7 +304,7 @@ fn consignment_inspection<const TRANSFER: bool>(
             true,
             resolve_input,
             |_| None,
-            |seal| Some(terminal_seals.contains(&seal.to_secret_seal())),
+            |opid| Some(terminal_ops.contains(opid)),
         )?;
 
         witnesses.push(RgbInspection {
@@ -397,14 +401,14 @@ fn genesis_info(
             genesis.chain_net,
             None,
             |_| None,
-            |_| Some(false),
+            Some(false),
         )?,
     })
 }
 
 /// Build the inspection details of the operation of a bundle, given its witness transaction and
-/// the functions resolving an input to the outpoint it's allocated to and its assignment and telling
-/// if an output seal is ours and if it's a terminal.
+/// the functions resolving an input to the outpoint it's allocated to and its assignment, telling
+/// if an output seal is ours and if a transition is a terminal operation.
 ///
 /// The bundle ID only commits to the bundle input map, which binds each input to the ID of the
 /// transition spending it, so, if requested, transitions whose ID isn't the one committed for their
@@ -418,7 +422,7 @@ pub(crate) fn bundle_info(
     check_commitments: bool,
     mut resolve_input: impl FnMut(Opout) -> Option<(OutPoint, Assignment)>,
     mut is_ours: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
-    mut is_terminal: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
+    mut is_terminal: impl FnMut(&OpId) -> Option<bool>,
 ) -> Result<RgbOperationInfo, Error> {
     let mut transitions = vec![];
     for KnownTransition { opid, transition } in bundle.known_transitions.iter() {
@@ -438,8 +442,9 @@ pub(crate) fn bundle_info(
         }
         let mut inputs_info = vec![];
         for opout in inputs {
-            let (outpoint, assignment) =
-                resolve_input(opout).ok_or_else(|| Error::RgbInspection {
+            let (outpoint, assignment) = bundle_output(bundle, opout)
+                .or_else(|| resolve_input(opout))
+                .ok_or_else(|| Error::RgbInspection {
                     details: format!("bundle for contract {contract_id}: unknown input {opout}"),
                 })?;
             let vin = witness_tx
@@ -465,7 +470,7 @@ pub(crate) fn bundle_info(
             witness_tx.compute_txid(),
             inputs_info,
             &mut is_ours,
-            &mut is_terminal,
+            is_terminal(opid),
         )?);
     }
     Ok(RgbOperationInfo {
@@ -476,8 +481,36 @@ pub(crate) fn bundle_info(
     })
 }
 
+/// The outpoint and assignment of `opout`, if it's assigned by a transition of `bundle` (e.g. the
+/// split a burn spends) to an outpoint the witness transaction spends.
+fn bundle_output(bundle: &TransitionBundle, opout: Opout) -> Option<(OutPoint, Assignment)> {
+    let transition = &bundle
+        .known_transitions
+        .iter()
+        .find(|kt| kt.opid == opout.op)?
+        .transition;
+    let assigns = transition.assignments.get(&opout.ty)?;
+    let seal = assigns.revealed_seal_at(opout.no).ok().flatten()?;
+    let TxPtr::Txid(txid) = seal.txid else {
+        return None;
+    };
+    let assignment = match assigns {
+        TypedAssigns::Fungible(vec) => {
+            let amount = vec.get(opout.no as usize)?.as_revealed()?.1.as_u64();
+            match opout.ty {
+                OS_ASSET => Assignment::Fungible(amount),
+                OS_INFLATION => Assignment::InflationRight(amount),
+                _ => return None,
+            }
+        }
+        TypedAssigns::Declarative(_) if opout.ty == OS_MINT => Assignment::MintRight,
+        _ => return None,
+    };
+    Some((OutPoint::new(txid, seal.vout.into_u32()), assignment))
+}
+
 /// Build the inspection details of a transition, given its witness TXID, its already resolved
-/// inputs and the functions telling if an output seal is ours and if it's a terminal.
+/// inputs, the function telling if an output seal is ours and whether it's a terminal operation.
 fn transition_info(
     contract_id: ContractId,
     asset_schema: AssetSchema,
@@ -486,7 +519,7 @@ fn transition_info(
     witness_txid: Txid,
     inputs: Vec<RgbInputInfo>,
     mut is_ours: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
-    mut is_terminal: impl FnMut(&BuilderSeal<GraphSeal>) -> Option<bool>,
+    is_terminal: Option<bool>,
 ) -> Result<RgbTransitionInfo, Error> {
     let r#type = TypeOfTransition::try_from(transition.transition_type).map_err(|_| {
         Error::RgbInspection {
@@ -504,7 +537,7 @@ fn transition_info(
         chain_net,
         Some(witness_txid),
         &mut is_ours,
-        &mut is_terminal,
+        is_terminal,
     )?;
 
     // collect transition globals
@@ -563,9 +596,9 @@ fn transition_info(
                     .map_err(|e| invalid(RGB_METADATA_ALLOWED_INFLATION, e))?
                     .into(),
             ),
-            MS_AFTER_BLOCK => TransitionMetadata::AfterBlock(
+            MS_BEFORE_BLOCK => TransitionMetadata::AfterBlock(
                 BlockNumber::from_strict_serialized(value.to_inner())
-                    .map_err(|e| invalid(RGB_METADATA_AFTER_BLOCK, e))?
+                    .map_err(|e| invalid(RGB_METADATA_BEFORE_BLOCK, e))?
                     .into_inner(),
             ),
             _ => {
@@ -591,8 +624,8 @@ fn transition_info(
 
 /// Build the inspection details of the outputs of an operation, given the context to report in
 /// errors, the contract schema, chain and network, the TXID its seals pointing to the witness
-/// transaction refer to and the functions telling if an output seal is ours and if it's a
-/// terminal.
+/// transaction refer to, the function telling if an output seal is ours and whether the operation
+/// is a terminal one.
 ///
 /// Assignment types rgb-lib can't represent are rejected, telling apart the ones defined by the
 /// schema but not supported yet (e.g. link rights) from the ones unknown to it.
@@ -603,7 +636,7 @@ fn outputs_info<Seal: ExposedSeal + TxoSeal>(
     chain_net: ChainNet,
     witness_txid: Option<Txid>,
     mut is_ours: impl FnMut(&BuilderSeal<Seal>) -> Option<bool>,
-    mut is_terminal: impl FnMut(&BuilderSeal<Seal>) -> Option<bool>,
+    is_terminal: Option<bool>,
 ) -> Result<Vec<RgbOutputInfo>, Error> {
     let mut outputs = vec![];
     for (ass_type, typed_assigns) in assignments.iter() {
@@ -643,7 +676,7 @@ fn outputs_info<Seal: ExposedSeal + TxoSeal>(
                 is_concealed: recipient_id.is_some(),
                 recipient_id,
                 is_ours: is_ours(seal),
-                is_terminal: is_terminal(seal),
+                is_terminal,
             });
         }
     }
@@ -706,7 +739,7 @@ mod tests {
                 ChainNet::BitcoinRegtest,
                 None,
                 |_| None,
-                |_| None,
+                None,
             )
         };
 

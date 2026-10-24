@@ -216,3 +216,13 @@ overflow-checks = true
 [profile.reldebug]
 inherits = "release"
 debug = 1
+
+[patch.crates-io]
+rgb-consensus = { git = "ssh://git@github.com/rgb-tools-devs/rgb-consensus.git", rev = "4a614b72" }
+rgb-ops = { git = "ssh://git@github.com/rgb-tools-devs/rgb-ops.git", rev = "9d831d2" }
+rgb-invoicing = { git = "ssh://git@github.com/rgb-tools-devs/rgb-ops.git", rev = "9d831d2" }
+rgb-psbt-utils = { git = "ssh://git@github.com/rgb-tools-devs/rgb-api.git", rev = "a3333c8" }
+rgb-schemas = { git = "ssh://git@github.com/rgb-tools-devs/rgb-schemas.git", rev = "aa1e7fd" }
+rgb-strict-encoding = { git = "https://github.com/rgb-protocol/rgb-strict-encoding", rev = "e12b9944b30171950de03778d6666b24bc33d994" }
+rgb-strict-encoding-derive = { git = "https://github.com/rgb-protocol/rgb-strict-encoding", rev = "e12b9944b30171950de03778d6666b24bc33d994" }
+rgb-strict-types = { git = "https://github.com/rgb-protocol/rgb-strict-types", rev = "8714cdcc8af25333c27214cdf9f42a6388d484ff" }

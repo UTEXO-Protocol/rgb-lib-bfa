@@ -86,10 +86,11 @@ pub enum Error {
         asset_schema: AssetSchema,
     },
 
-    /// The consignment has terminals rejected by the reject list of its asset
+    /// The consignment has opouts rejected by the reject list of its asset, among the inputs and
+    /// outputs of its terminal operations (see `validate_consignment`)
     #[error("Consignment rejected by the reject list, rejected opouts: {opouts:?}")]
     ConsignmentRejected {
-        /// The rejected terminal opouts
+        /// The rejected opouts
         opouts: Vec<String>,
     },
 
