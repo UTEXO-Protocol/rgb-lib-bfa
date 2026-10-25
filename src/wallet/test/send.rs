@@ -12542,3 +12542,102 @@ fn broadcast_legacy_signed_psbt() {
         )
     );
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[ignore = "should be executed alone for performance reasons"]
+#[parallel]
+fn change_utxo_allocations_limit_full() {
+    initialize();
+
+    let max_allocations = MAX_UTXO_ASSET_ALLOCATIONS;
+    // S holds as many allocations as can be spent: all but one of 2, so that sending 1 leaves
+    // change, the attacker sending all of its allocation, so that the attack transition has no
+    // change and all of its assignments of the asset go to the recipient seal
+    let dust: (u16, u64) = (max_allocations as u16 - 1, 2);
+    let amount_s: u64 = dust.0 as u64 * dust.1 + 100;
+    // D holds a single allocation, larger than what S holds, so that S is selected first
+    let amount_d: u64 = 1_000_000;
+    // tiny UTXOs, so that sending from S leaves no BTC change and the RGB change goes to D
+    let utxo_size: u32 = 500;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    rcv_party.create_utxos(false, Some(2), Some(utxo_size), FEE_RATE, None);
+    let mut rcv_party_2 = get_funded_party!();
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[amount_d + amount_s]));
+    let asset_id = asset.asset_id.as_str();
+
+    // D gets its allocation, then S (the other UTXO, as D has fewer free slots) gets the dust
+    let receive_data_d = rcv_party.blind_receive();
+    blind_send_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_d,
+        amount_d,
+    );
+    let receive_data_s = rcv_party.blind_receive();
+    MOCK_DUST_RECIPIENT_ASSIGNMENTS.replace(Some(dust));
+    blind_send_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_s,
+        amount_s,
+    );
+    assert!(MOCK_DUST_RECIPIENT_ASSIGNMENTS.take().is_none());
+    let utxo_of = |party: &SinglesigParty, receive_data: &ReceiveData| {
+        let transfer = party.get_test_transfer_recipient(&receive_data.recipient_id);
+        party
+            .get_test_transfer_data(&transfer)
+            .0
+            .receive_utxo
+            .unwrap()
+    };
+    let utxo_d = utxo_of(&rcv_party, &receive_data_d);
+    let utxo_s = utxo_of(&rcv_party, &receive_data_s);
+    assert_ne!(utxo_d, utxo_s);
+    let num_allocations = |party: &mut SinglesigParty, utxo: &Outpoint| {
+        party
+            .list_unspents(true)
+            .iter()
+            .find(|u| u.utxo.outpoint == *utxo)
+            .map(|u| u.rgb_allocations.len())
+    };
+    assert_eq!(num_allocations(&mut rcv_party, &utxo_d), Some(1));
+    assert_eq!(
+        num_allocations(&mut rcv_party, &utxo_s),
+        Some(max_allocations)
+    );
+
+    // sending 1 spends S, moving all of its allocations but the one sent to the RGB change, which
+    // goes to D, as the TX has no BTC change, taking D past the allocations that can be spent
+    let receive_data = rcv_party_2.blind_receive();
+    let recipient_map = blind_recipient_map(asset_id, &receive_data, 1);
+    let txid = rcv_party.send_result(&recipient_map).unwrap().txid;
+    let (transfer, _, _) = rcv_party.get_test_transfer_sender(&txid);
+    let (transfer_data, _) = rcv_party.get_test_transfer_data(&transfer);
+    assert_eq!(transfer_data.change_utxo, Some(utxo_d.clone()));
+    rcv_party_2.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(asset_id));
+    mine(false);
+    rcv_party_2.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(asset_id));
+    assert!(rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert_eq!(
+        num_allocations(&mut rcv_party, &utxo_d),
+        Some(max_allocations + 1)
+    );
+
+    // D is now frozen: coin selection skips it, as it holds more allocations than can be spent, so
+    // no amount can be sent
+    let receive_data = rcv_party_2.blind_receive();
+    let recipient_map = blind_recipient_map(asset_id, &receive_data, 1);
+    let result = rcv_party.send_result(&recipient_map);
+    println!("send from D result: {result:?}");
+    assert_matches!(result, Err(Error::InsufficientAssignments { .. }));
+}
