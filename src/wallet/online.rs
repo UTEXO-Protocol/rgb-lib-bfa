@@ -1933,12 +1933,7 @@ pub trait WalletOnline: WalletOffline {
             .get_rgb_allocations(vec![txo], None, None, None, None)?
             .iter()
             .flat_map(|u| &u.rgb_allocations)
-            .filter(|a| {
-                a.asset_id.as_deref() == Some(asset_id)
-                    && a.incoming
-                    && !a.txo_spent
-                    && !a.status.failed()
-            })
+            .filter(|a| a.asset_id.as_deref() == Some(asset_id) && a.held())
             .count())
     }
 
@@ -4482,11 +4477,17 @@ pub trait WalletOnline: WalletOffline {
         Ok(refresh_result)
     }
 
+    /// Select the UTXOs holding the assignments of the asset needed by an operation, adding them
+    /// to `selected`, which tracks the ones selected for all the assets of the operation: a UTXO
+    /// that would take the allocations of an asset held by them past the number a bundle can spend
+    /// (see [`MAX_UTXO_ASSET_ALLOCATIONS`]) is skipped. If skipping UTXOs leaves too few assignments,
+    /// the selection is retried from the UTXOs with the most, so the fewest are selected.
     fn select_rgb_inputs(
         &self,
         asset_id: String,
         assignments_needed: &AssignmentsCollection,
         unspents: Vec<LocalUnspent>,
+        selected: &mut SelectedInputs,
     ) -> Result<AssetSpend, Error> {
         // sort unspents by the sum of main amounts
         fn cmp_localunspent_allocation_sum(a: &LocalUnspent, b: &LocalUnspent) -> Ordering {
@@ -4521,8 +4522,6 @@ pub trait WalletOnline: WalletOffline {
             self.logger(),
             "Selecting inputs for asset '{}'...", asset_id
         );
-        let mut input_outpoints: Vec<Outpoint> = Vec::new();
-
         let mut mut_unspents = unspents;
 
         // sort unspents first by inflation rights amount, then main amount
@@ -4533,76 +4532,112 @@ pub trait WalletOnline: WalletOffline {
             mut_unspents.sort_by(cmp_localunspent_allocation_sum);
         }
 
-        let mut assignments_collected = AssignmentsCollection::default();
-        let mut input_btc_amt: u64 = 0;
-        for unspent in mut_unspents {
-            // get spendable allocations for the required asset
-            let asset_allocations: Vec<LocalRgbAllocation> = unspent
-                .rgb_allocations
-                .into_iter()
-                .filter(|a| a.asset_id == Some(asset_id.clone()) && a.status.settled())
-                .collect();
-
-            // skip UTXOs with no allocations
-            if asset_allocations.is_empty() {
-                continue;
-            }
-
-            // check if the unspent hosts any needed allocations
-            let mut needed = false;
-            if assignments_collected.fungible < assignments_needed.fungible
-                && asset_allocations
+        // the UTXOs selected for the other assets, to start over from when retrying
+        let selected_before = selected.clone();
+        let mut input_outpoints: Vec<Outpoint>;
+        let mut assignments_collected: AssignmentsCollection;
+        let mut input_btc_amt: u64;
+        let mut retry = false;
+        loop {
+            input_outpoints = Vec::new();
+            assignments_collected = AssignmentsCollection::default();
+            input_btc_amt = 0;
+            let mut skipped = false;
+            for unspent in &mut_unspents {
+                // get spendable allocations for the required asset
+                let asset_allocations: Vec<LocalRgbAllocation> = unspent
+                    .rgb_allocations
                     .iter()
-                    .any(|a| matches!(a.assignment, Assignment::Fungible(_)))
-            {
-                needed = true;
-            }
-            if !assignments_collected.non_fungible & assignments_needed.non_fungible
-                && asset_allocations
+                    .filter(|a| a.asset_id == Some(asset_id.clone()) && a.status.settled())
+                    .cloned()
+                    .collect();
+
+                // skip UTXOs with no allocations
+                if asset_allocations.is_empty() {
+                    continue;
+                }
+
+                // check if the unspent hosts any needed allocations
+                let mut needed = false;
+                if assignments_collected.fungible < assignments_needed.fungible
+                    && asset_allocations
+                        .iter()
+                        .any(|a| matches!(a.assignment, Assignment::Fungible(_)))
+                {
+                    needed = true;
+                }
+                if !assignments_collected.non_fungible & assignments_needed.non_fungible
+                    && asset_allocations
+                        .iter()
+                        .any(|a| matches!(a.assignment, Assignment::NonFungible))
+                {
+                    needed = true;
+                }
+                if assignments_collected.inflation < assignments_needed.inflation
+                    && asset_allocations
+                        .iter()
+                        .any(|a| matches!(a.assignment, Assignment::InflationRight(_)))
+                {
+                    needed = true;
+                }
+                if assignments_collected.mint < assignments_needed.mint
+                    && asset_allocations
+                        .iter()
+                        .any(|a| matches!(a.assignment, Assignment::MintRight))
+                {
+                    needed = true;
+                }
+
+                // skip UTXOs with no needed allocations
+                if !needed {
+                    continue;
+                }
+
+                // skip UTXOs that would make the operation move more allocations of an asset than
+                // a bundle can spend
+                if !selected.select(unspent, max_utxo_asset_allocations()) {
+                    debug!(
+                        self.logger(),
+                        "Skipping UTXO {} as it holds too many allocations",
+                        unspent.utxo.outpoint()
+                    );
+                    skipped = true;
+                    continue;
+                }
+
+                // add selected allocations to collected assignments
+                asset_allocations
                     .iter()
-                    .any(|a| matches!(a.assignment, Assignment::NonFungible))
-            {
-                needed = true;
-            }
-            if assignments_collected.inflation < assignments_needed.inflation
-                && asset_allocations
-                    .iter()
-                    .any(|a| matches!(a.assignment, Assignment::InflationRight(_)))
-            {
-                needed = true;
-            }
-            if assignments_collected.mint < assignments_needed.mint
-                && asset_allocations
-                    .iter()
-                    .any(|a| matches!(a.assignment, Assignment::MintRight))
-            {
-                needed = true;
-            }
+                    .for_each(|a| a.assignment.add_to_assignments(&mut assignments_collected));
+                input_outpoints.push(unspent.utxo.outpoint());
 
-            // skip UTXOs with no needed allocations
-            if !needed {
-                continue;
+                let utxo_btc_amt = unspent
+                    .utxo
+                    .btc_amount
+                    .parse::<u64>()
+                    .expect("DB should contain a valid BTC amount");
+                input_btc_amt = input_btc_amt
+                    .checked_add(utxo_btc_amt)
+                    .expect("total input BTC value cannot exceed u64::MAX");
+
+                // stop as soon as we have the needed assignments
+                if assignments_collected.enough(assignments_needed) {
+                    break;
+                }
             }
 
-            // add selected allocations to collected assignments
-            asset_allocations
-                .iter()
-                .for_each(|a| a.assignment.add_to_assignments(&mut assignments_collected));
-            input_outpoints.push(unspent.utxo.outpoint());
-
-            let utxo_btc_amt = unspent
-                .utxo
-                .btc_amount
-                .parse::<u64>()
-                .expect("DB should contain a valid BTC amount");
-            input_btc_amt = input_btc_amt
-                .checked_add(utxo_btc_amt)
-                .expect("total input BTC value cannot exceed u64::MAX");
-
-            // stop as soon as we have the needed assignments
-            if assignments_collected.enough(assignments_needed) {
+            // the UTXOs selected first (e.g. the ones with the smallest amounts) may have taken
+            // the place of a UTXO with enough assignments: retry from the ones with the most
+            if assignments_collected.enough(assignments_needed) || !skipped || retry {
                 break;
             }
+            debug!(
+                self.logger(),
+                "Retrying input selection for asset '{}' from the largest UTXOs", asset_id
+            );
+            *selected = selected_before.clone();
+            mut_unspents.reverse();
+            retry = true;
         }
         if !assignments_collected.enough(assignments_needed) {
             return Err(Error::InsufficientAssignments {
@@ -6263,6 +6298,7 @@ pub trait WalletOnline: WalletOffline {
                         asset_id.clone(),
                         &assignments_needed,
                         input_unspents.to_vec(),
+                        &mut SelectedInputs::default(),
                     )?;
                     transfer_info_map = BTreeMap::from([(
                         asset_id.clone(),
@@ -6512,6 +6548,8 @@ pub trait WalletOnline: WalletOffline {
         let mut invoices_checked = false;
 
         Ok(loop {
+            // the inputs selected for all the assets, which are spent together
+            let mut selected = SelectedInputs::default();
             for asset_id in recipient_map.keys() {
                 let (asset_info, original_assignments_needed) =
                     assets_data.get(asset_id).unwrap().clone();
@@ -6527,6 +6565,7 @@ pub trait WalletOnline: WalletOffline {
                     asset_id.clone(),
                     &assignments_needed,
                     input_unspents.clone(),
+                    &mut selected,
                 )?;
 
                 let transfer_info = InfoAssetTransfer {
@@ -6992,6 +7031,7 @@ pub trait WalletOnline: WalletOffline {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
         )?;
 
         let chainnet: ChainNet = self.bitcoin_network().into();
@@ -7177,6 +7217,7 @@ pub trait WalletOnline: WalletOffline {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
         )?;
 
         let chainnet: ChainNet = self.bitcoin_network().into();
@@ -7371,6 +7412,7 @@ pub trait WalletOnline: WalletOffline {
             asset_id.clone(),
             &assignments_needed,
             input_unspents.clone(),
+            &mut SelectedInputs::default(),
         )?;
 
         let mut local_recipients = vec![];
