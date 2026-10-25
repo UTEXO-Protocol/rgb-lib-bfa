@@ -132,14 +132,6 @@ pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
 #[cfg(feature = "_online")]
 pub(crate) const MINT_FINALITY_GRACE_SECS: i64 = 24 * 60 * 60;
 
-/// Time, in seconds, the block a received mint commits to (`after_block`, the latest finalized
-/// external chain block when the mint began) may precede the creation of the recipient's invoice.
-/// It covers the finality lag of the external chain (about 13 minutes on Ethereum, longer on some
-/// L2s) and clock skew. An earlier block would only make the recipient scan more of the external
-/// chain for the lock.
-#[cfg(feature = "_online")]
-pub(crate) const MINT_AFTER_BLOCK_GRACE_SECS: i64 = 60 * 60;
-
 /// Maximum proof of work difficulty (leading zero bits) the wallet accepts to compute when posting
 /// a consignment; a proxy requiring more cannot be used to create transfers.
 #[cfg(feature = "_online")]

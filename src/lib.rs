@@ -226,11 +226,11 @@ pub use crate::{
     utils::block_on,
 };
 
+#[cfg(feature = "_validation")]
+use std::cmp::max;
 use std::num::NonZeroU32;
 #[cfg(any(feature = "wallet", feature = "bitcoind_validation"))]
 use std::path::PathBuf;
-#[cfg(feature = "_validation")]
-use std::{cell::RefCell, cmp::max};
 #[cfg(feature = "_online")]
 use std::{cmp::Ordering, cmp::min, collections::hash_map::DefaultHasher, hash::Hasher};
 #[cfg(feature = "wallet")]
@@ -478,10 +478,7 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 #[cfg(feature = "_validation")]
-use crate::api::{
-    evm::{BoundedAnchorResolver, EvmClient},
-    reject_list::RejectListClient,
-};
+use crate::api::{evm::EvmClient, reject_list::RejectListClient};
 #[cfg(feature = "_validation")]
 use crate::error::IndexerError;
 #[cfg(feature = "bitcoind")]
@@ -494,9 +491,9 @@ use crate::no_wallet::validation::esplora_config;
 use crate::no_wallet::validation::{
     AnchorResolution, ChainResolver, OffchainResolver, PendingAnchors, RejectList,
     RejectListSource, RemoteRejectListResolver, ResolveRejectList, checked_evm_client,
-    genesis_reject_list_source, get_resolver, max_mint_scan_blocks, pending_anchors,
-    rejected_by_reject_list, rejected_opouts, resolve_anchors, resolve_witnesses,
-    unreachable_indexer_details, validate_consignment_internal, validate_deterministic,
+    genesis_reject_list_source, get_resolver, pending_anchors, rejected_by_reject_list,
+    rejected_opouts, resolve_anchors, resolve_witnesses, unreachable_indexer_details,
+    validate_consignment_internal, validate_deterministic,
 };
 #[cfg(feature = "wallet")]
 use crate::no_wallet::{bundle_info, check_file_exists, verify_witness_commitment};
@@ -517,14 +514,12 @@ use crate::wallet::BitcoindClient;
 use crate::wallet::test::{
     mock_chain_tx, mock_clock_skew_margin, mock_confirmation_margin,
     mock_dust_recipient_assignments, mock_input_unspents, mock_local_version,
-    mock_max_mint_scan_blocks, mock_max_utxo_asset_allocations, mock_min_retention_grace,
-    mock_mint_after_block_grace, mock_mint_lock_window, mock_retention_grace, mock_send_end_crash,
-    skip_build_dag, skip_check_fee_rate, spv_only,
+    mock_max_utxo_asset_allocations, mock_min_retention_grace, mock_mint_lock_window,
+    mock_retention_grace, mock_send_end_crash, skip_build_dag, skip_check_fee_rate, spv_only,
 };
 #[cfg(feature = "_online")]
 use crate::{
     api::{
-        evm::MintAnchorResolver,
         multisig_hub::{
             FileMetadata, FileSource, FileType, InfoResponse, MultisigHubClient,
             OPERATION_TYPES_REQUIRING_SEED, OperationResponse, OperationStatus, OperationType,

@@ -443,11 +443,8 @@ fn mint() {
         .get_send_consignment_path(&asset.asset_id, &txid)
         .to_string_lossy()
         .to_string();
-    // validate the mint, scanning for its event at most the given number of blocks (if any)
-    // instead of MAX_MINT_SCAN_BLOCKS
-    let validate_mint = |evm_rpc_urls: HashMap<u64, String>, max_scan_blocks: Option<u64>| {
-        MOCK_MAX_MINT_SCAN_BLOCKS.replace(max_scan_blocks);
-        let result = validate_consignment(
+    let validate_mint = |evm_rpc_urls: HashMap<u64, String>| {
+        validate_consignment(
             &consignment_path,
             &IndexerConfig::Electrum {
                 url: ELECTRUM_URL.to_string(),
@@ -455,18 +452,16 @@ fn mint() {
             &evm_rpc_urls,
             None,
             &validation_options(Some(&txid)),
-        );
-        MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-        result
+        )
     };
     let evm_rpc_urls = HashMap::from([(ANVIL_CHAIN_ID, EVM_RPC_URL.to_string())]);
 
     // no EVM RPC URL for the bridge's chain
-    let result = validate_mint(HashMap::new(), None);
+    let result = validate_mint(HashMap::new());
     assert_matches!(result, Err(Error::NoEvmRpcUrl { chain_id }) if chain_id == ANVIL_CHAIN_ID);
 
     // the funds haven't been locked yet
-    let result = validate_mint(evm_rpc_urls.clone(), None);
+    let result = validate_mint(evm_rpc_urls.clone());
     assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
 
     // a custom anchor resolver is trusted in place of the EVM RPC endpoint
@@ -542,12 +537,12 @@ fn mint() {
     // the lock isn't finalized yet
     erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
     bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    let result = validate_mint(evm_rpc_urls.clone(), None);
+    let result = validate_mint(evm_rpc_urls.clone());
     assert_matches!(result, Err(Error::MintEventNotFound { .. }));
 
     // the lock is finalized
     evm_mine(EVM_FINALITY_DEPTH);
-    let validation = validate_mint(evm_rpc_urls.clone(), None).unwrap();
+    let validation = validate_mint(evm_rpc_urls.clone()).unwrap();
     assert!(validation.is_transfer);
     assert_eq!(validation.asset_id, asset.asset_id);
     assert_eq!(validation.asset_schema, AssetSchema::Bfa);
@@ -561,13 +556,6 @@ fn mint() {
     );
     assert!(validation.warnings.is_empty());
 
-    // the lock is outside the scanned blocks: the event follows the block the mint commits to, so
-    // it's never within 0 blocks from it, and the mint will never be confirmed (unlike when it
-    // wasn't found yet above)
-    let result = validate_mint(evm_rpc_urls.clone(), Some(0));
-    assert_matches!(result, Err(Error::MintEventOutOfScanWindow { opid, max_scan_blocks: 0 }) if opid == res.details.opid);
-    validate_mint(evm_rpc_urls.clone(), Some(1000)).unwrap();
-
     // the minted allocation rejected by the reject list contract, once finalized
     let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
     let terminal_ops = consignment.terminal_ops();
@@ -575,7 +563,7 @@ fn mint() {
     let terminal = Opout::new(*terminal_ops.iter().next().unwrap(), OS_ASSET, 0);
     reject_list_append(&reject_list_contract.address, &[(terminal, true)]);
     evm_mine(EVM_FINALITY_DEPTH);
-    let result = validate_mint(evm_rpc_urls, None);
+    let result = validate_mint(evm_rpc_urls);
     assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![terminal.to_string()]);
 }
 

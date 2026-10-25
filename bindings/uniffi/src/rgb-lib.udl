@@ -110,7 +110,6 @@ interface RgbLibError {
   MaxFeeExceeded(string txid);
   MinFeeNotMet(string txid);
   MintEventNotFound(string opid);
-  MintEventOutOfScanWindow(string opid, u64 max_scan_blocks);
   MultisigCannotMarkOperationProcessed(string details);
   MultisigCannotRespondToOperation(string details);
   MultisigHubService(string details);

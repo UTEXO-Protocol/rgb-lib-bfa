@@ -834,7 +834,7 @@ fn evm_rpc_urls() {
     assert!(party.wallet.online_data().is_none());
 
     // endpoints on the right chain not serving what confirming mint events needs
-    let mock_endpoint = |finalized: &str, logs: &str| {
+    let mock_endpoint = |finalized: &str, call: &str| {
         let mut server = mockito::Server::new();
         let rpc_mock = |server: &mut mockito::Server, method: &str, body: &str| {
             server
@@ -852,7 +852,7 @@ fn evm_rpc_urls() {
                 &format!(r#""result":"0x{ANVIL_CHAIN_ID:x}""#),
             ),
             rpc_mock(&mut server, "eth_getBlockByNumber", finalized),
-            rpc_mock(&mut server, "eth_getLogs", logs),
+            rpc_mock(&mut server, "eth_call", call),
         ];
         (server, mocks)
     };
@@ -860,7 +860,7 @@ fn evm_rpc_urls() {
     // no finalized block
     let (server, _mocks) = mock_endpoint(
         r#""error":{"code":-32602,"message":"invalid block tag"}"#,
-        r#""result":[]"#,
+        r#""result":"0x""#,
     );
     let result = party.wallet.go_online(options_with_urls(HashMap::from([(
         ANVIL_CHAIN_ID,
@@ -871,10 +871,10 @@ fn evm_rpc_urls() {
         Err(Error::InvalidEvmRpcUrl { ref details })
             if details.starts_with("cannot get the latest finalized block")
     ));
-    // only the logs of recent blocks
+    // only the state of recent blocks
     let (server, _mocks) = mock_endpoint(
         finalized,
-        r#""error":{"code":-32602,"message":"Archive requests require a personal token"}"#,
+        r#""error":{"code":-32000,"message":"missing trie node"}"#,
     );
     let result = party.wallet.go_online(options_with_urls(HashMap::from([(
         ANVIL_CHAIN_ID,
@@ -883,11 +883,11 @@ fn evm_rpc_urls() {
     assert!(matches!(
         result,
         Err(Error::InvalidEvmRpcUrl { ref details })
-            if details.starts_with("cannot get the logs of the oldest blocks")
-                && details.ends_with("Archive requests require a personal token")
+            if details.starts_with("cannot read the state as of the latest finalized block")
+                && details.ends_with("missing trie node")
     ));
     // serving both
-    let (server, _mocks) = mock_endpoint(finalized, r#""result":[]"#);
+    let (server, _mocks) = mock_endpoint(finalized, r#""result":"0x""#);
     party
         .wallet
         .go_online(options_with_urls(HashMap::from([(

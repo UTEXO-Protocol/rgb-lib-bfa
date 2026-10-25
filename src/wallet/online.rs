@@ -10,9 +10,6 @@ const SIGNED_TX_FILE: &str = "signed.tx";
 const SIGNED_PSBT_FILE: &str = "signed.psbt";
 /// Signed TX released to a recipient, saved to broadcast it again until the broadcast deadline
 const RECEIVED_SIGNED_TX_FILE: &str = "rcv_signed.tx";
-/// Last external chain blocks scanned for the mint events of a received consignment, saved to
-/// resume the scans at the next refresh
-const MINT_SCAN_FILE: &str = "rcv_mint_scan.json";
 
 const MIN_FEE_RATE: u64 = 1;
 
@@ -285,14 +282,6 @@ fn min_operation_lifetime() -> u32 {
 
 /// Minimum time the recipient's invoice must have left when a mint begins (see
 /// [`MIN_MINT_LOCK_WINDOW_SECS`]).
-fn mint_after_block_grace() -> i64 {
-    #[cfg(test)]
-    if let Some(grace) = mock_mint_after_block_grace() {
-        return grace;
-    }
-    MINT_AFTER_BLOCK_GRACE_SECS
-}
-
 fn min_mint_lock_window() -> u32 {
     #[cfg(test)]
     if let Some(window) = mock_mint_lock_window() {
@@ -2844,48 +2833,6 @@ pub trait WalletOnline: WalletOffline {
         )
     }
 
-    fn get_mint_scanned_blocks_path(&self, recipient_id: &str) -> PathBuf {
-        self.get_transfers_dir()
-            .join(self.normalize_recipient_id(recipient_id))
-            .join(MINT_SCAN_FILE)
-    }
-
-    /// The last finalized external chain block scanned without finding each mint event of the
-    /// consignment received on `recipient_id`, by mint operation ID.
-    fn read_mint_scanned_blocks(&self, recipient_id: &str) -> Result<HashMap<OpId, u64>, Error> {
-        let path = self.get_mint_scanned_blocks_path(recipient_id);
-        if !path.exists() {
-            return Ok(HashMap::new());
-        }
-        let scanned_blocks: HashMap<String, u64> =
-            serde_json::from_str(&fs::read_to_string(path)?).map_err(InternalError::from)?;
-        scanned_blocks
-            .into_iter()
-            .map(|(opid, block)| {
-                let opid = OpId::from_str(&opid).map_err(|e| Error::Internal {
-                    details: format!("invalid mint operation ID: {e}"),
-                })?;
-                Ok((opid, block))
-            })
-            .collect()
-    }
-
-    fn save_mint_scanned_blocks(
-        &self,
-        recipient_id: &str,
-        scanned_blocks: HashMap<OpId, u64>,
-    ) -> Result<(), Error> {
-        let scanned_blocks: HashMap<String, u64> = scanned_blocks
-            .into_iter()
-            .map(|(opid, block)| (opid.to_string(), block))
-            .collect();
-        let serialized = serde_json::to_string(&scanned_blocks).map_err(InternalError::from)?;
-        atomic_write(
-            &self.get_mint_scanned_blocks_path(recipient_id),
-            serialized.as_bytes(),
-        )
-    }
-
     fn process_received_consignment(
         &self,
         txn: &DbTxn,
@@ -3125,17 +3072,7 @@ pub trait WalletOnline: WalletOffline {
                 return Ok(None);
             };
             let evm_client = EvmClient::new(evm_rpc_url)?;
-            // the mints are only scanned for within the same number of blocks for everyone, as
-            // their after_block is chosen by whoever created them; the ones in the history of the
-            // paying one must also already be confirmed
-            let mint_resolver = MintAnchorResolver::new(
-                &evm_client,
-                &paying_opids,
-                self.read_mint_scanned_blocks(&recipient_id)?,
-                max_mint_scan_blocks(),
-            );
-            let anchor_resolver = match CheckedAnchorResolver::with(&mint_resolver, bridge_location)
-            {
+            let anchor_resolver = match CheckedAnchorResolver::with(&evm_client, bridge_location) {
                 Ok(anchor_resolver) => anchor_resolver,
                 Err(AnchorResolverError::WrongChainId { expected, actual }) => {
                     warn!(
@@ -3162,30 +3099,6 @@ pub trait WalletOnline: WalletOffline {
                     return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
                 }
             }
-            // the mint follows the invoice, so the block it commits to (the latest finalized one
-            // when it began) cannot be much older: refuse an older one (checked once, before the
-            // mint is saved), which would only make the scan for the lock cover more blocks
-            if let Some(received_mint) = &received_mint
-                && self.read_received_mint(&recipient_id)?.is_none()
-            {
-                let after_block_timestamp =
-                    evm_client.block_timestamp(received_mint.after_block)? as i64;
-                if after_block_timestamp < batch_transfer.created_at - mint_after_block_grace() {
-                    error!(
-                        self.logger(),
-                        "Mint {} commits to block {} which precedes the invoice",
-                        received_mint.opid,
-                        received_mint.after_block
-                    );
-                    return self.refuse_consignment(
-                        txn,
-                        &mode,
-                        &recipient_id,
-                        &recipient_seed,
-                        updated_batch_transfer,
-                    );
-                }
-            }
             debug!(
                 self.logger(),
                 "Resolving external anchors {:?} at bridge location {:?}",
@@ -3193,31 +3106,14 @@ pub trait WalletOnline: WalletOffline {
                 anchor_resolver.location()
             );
 
-            // confirm each pending anchor that has a matching mint event in a finalized block of
-            // the external chain
-            let unconfirmed =
-                match resolve_anchors(&mut pending, &anchor_resolver, &anchors, |opid| {
-                    mint_resolver.is_exhausted(opid)
-                }) {
-                    Ok(unconfirmed) => unconfirmed.len(),
-                    Err(e @ Error::MintEventOutOfScanWindow { .. }) => {
-                        error!(self.logger(), "{e}");
-                        return self.refuse_consignment(
-                            txn,
-                            &mode,
-                            &recipient_id,
-                            &recipient_seed,
-                            updated_batch_transfer,
-                        );
-                    }
-                    Err(e) => return Err(e),
-                };
+            // confirm each pending anchor that has a matching lock recorded by the bridge contract
+            // as of the latest finalized block of the external chain
+            let unconfirmed = resolve_anchors(&mut pending, &anchor_resolver, &anchors)?.len();
 
             // a missing mint event doesn't make the consignment invalid, the event may simply
             // not have happened yet or not be finalized yet: keep the (cached)
             // consignment and try again at the next refresh, until the transfer expires
             if unconfirmed > 0 {
-                self.save_mint_scanned_blocks(&recipient_id, mint_resolver.scanned_blocks())?;
                 // a mint is posted before its lock is made, so that its recipient can check it
                 // first: check it now (once), assuming the lock is there, so the user knows whether
                 // to make it, and what to lock (see get_received_mint)
@@ -7656,7 +7552,7 @@ pub trait WalletOnline: WalletOffline {
             details: format!("invalid mint operation ID: {e}"),
         })?;
         Ok(evm_client
-            .funds_in_inclusion(&address, &opid, mint.amount, mint.after_block)?
+            .funds_in_inclusion(&address, &opid, mint.amount)?
             .filter(|inclusion| inclusion.timestamp as i64 <= expiration)
             .map(|inclusion| inclusion.finalized))
     }

@@ -1559,7 +1559,7 @@ impl Wallet {
     /// corresponding tokens on the external chain contract needs to commit to it. The consignment
     /// is posted right away, so the recipient can check the mint before the lock is made (see
     /// [`get_received_mint`](crate::wallet::RgbWalletOpsOffline::get_received_mint)), while it
-    /// will be able to accept the transfer only once the lock event exists on the external chain.
+    /// will be able to accept the transfer only once the lock exists on the external chain.
     ///
     /// The `min_confirmations` number determines the minimum number of confirmations needed for
     /// the transaction anchoring the transfer for it to be considered final and move (while
@@ -1629,9 +1629,9 @@ impl Wallet {
     ///
     /// Before broadcasting, the wallet checks via the EVM RPC endpoint (which needs to be on the
     /// chain of the asset's bridge contract, erroring with [`Error::EvmChainIdMismatch`]
-    /// otherwise) that a lock event committing to the mint operation (see
-    /// [`MintDetails::opid`]) already exists on the bridge contract in a finalized block, erroring
-    /// with [`Error::MintEventNotFound`] otherwise. This enforces the safe operation order: begin,
+    /// otherwise) that a lock of the minted amount committing to the mint operation (see
+    /// [`MintDetails::opid`]) is already recorded by the bridge contract as of a finalized block,
+    /// erroring with [`Error::MintEventNotFound`] otherwise. This enforces the safe operation order: begin,
     /// lock on the external chain, wait for the lock to be final, then end.
     ///
     /// The TX is not broadcast once the deadline for the lock (the expiration of the recipient's

@@ -12,33 +12,6 @@ pub(crate) const INDEXER_TIMEOUT: u64 = 10;
 #[cfg(any(feature = "electrum_validation", feature = "esplora_validation"))]
 pub(crate) const INDEXER_RETRIES: u8 = 3;
 
-/// Maximum number of blocks, after the one a mint event commits to (its `after_block`), in which
-/// the event confirming it is searched for, when validating a consignment and for the mints in the
-/// history of a consignment received by a wallet. It is about 70 days on Ethereum, 11 on Base or
-/// Optimism and 37 hours on Arbitrum, at most 500 `eth_getLogs` calls per mint.
-///
-/// It is the same for everyone, and cannot be configured: a consignment accepted with a higher
-/// limit could carry mints that others refuse, so assets received with it couldn't be spent to
-/// them.
-///
-/// The `after_block` is chosen by whoever created the mint, so without a limit an untrusted
-/// consignment could make the scan go through the whole EVM chain (e.g. with `after_block` set to
-/// 0). A mint whose event is not found within the limit makes the consignment invalid, so the
-/// limit needs to cover the time a minter may take to lock the funds after beginning the mint.
-///
-/// TODO: the limit will be set by each asset, with a global of the BFA schema (to be added in
-/// rgb-schemas): remove this hardcoded value then.
-pub(crate) const MAX_MINT_SCAN_BLOCKS: u64 = 500_000;
-
-/// Maximum number of blocks scanned for a mint event (see [`MAX_MINT_SCAN_BLOCKS`]).
-pub(crate) fn max_mint_scan_blocks() -> u64 {
-    #[cfg(all(test, feature = "_online"))]
-    if let Some(max_scan_blocks) = mock_max_mint_scan_blocks() {
-        return max_scan_blocks;
-    }
-    MAX_MINT_SCAN_BLOCKS
-}
-
 /// Indexer to connect to, see `OnlineOptions::indexer_config` (with the `wallet` feature) and
 /// [`validate_consignment`].
 ///
@@ -631,8 +604,8 @@ pub(crate) fn esplora_config(indexer_url: &str) -> EsploraBuilder {
 /// been broadcast yet. If the consignment has external anchors (mint events of a BFA asset),
 /// they're confirmed on the chain the asset's bridge lives on, through the EVM RPC URL configured
 /// for its chain ID in `evm_rpc_urls` (EVM JSON-RPC endpoints by the EIP-155 chain ID of the
-/// chain they are connected to), scanning for each mint event a bounded number of blocks after
-/// the one it commits to.
+/// chain they are connected to), reading the lock confirming each mint from the records the
+/// bridge contract keeps, as of the latest finalized block.
 ///
 /// When `min_confirmations` is provided, witnesses having less confirmations, and unconfirmed
 /// ones in any case (even with 0), are reported in a warning of the returned
@@ -645,8 +618,8 @@ pub(crate) fn esplora_config(indexer_url: &str) -> EsploraBuilder {
 /// The validation relies on the following trust assumptions:
 /// - the indexer is trusted to report the witness transactions and their status (including the
 ///   block headers the SPV proofs carried by the consignment are checked against) correctly
-/// - the EVM RPC endpoints are trusted to report the mint events (and the finalized block) and
-///   the reject list entries correctly
+/// - the EVM RPC endpoints are trusted to report the bridge contract records (and the finalized
+///   block) and the reject list entries correctly
 /// - the reject list server is trusted to serve the asset's reject list correctly
 /// - the witness transaction with the [`ValidationOptions::offchain_txid`] is accepted as it is in
 ///   the consignment, without checking it against the chain: it may never be broadcast, or
@@ -714,9 +687,8 @@ pub fn validate_consignment(
 /// The anchor resolver is only needed if the consignment has external anchors, and the reject
 /// list resolver if the asset has a reject list: an [`Error::NoAnchorResolver`] or an
 /// [`Error::NoRejectListResolver`] is returned if a needed one isn't provided. It's up to the
-/// anchor resolver to bound the blocks it scans for each mint event, since its `after_block` is
-/// chosen by whoever created the mint, and a mint it doesn't confirm is reported as an
-/// [`Error::MintEventNotFound`], whether or not it may still be confirmed.
+/// anchor resolver to only confirm a mint once its lock is final, and a mint it doesn't confirm is
+/// reported as an [`Error::MintEventNotFound`], whether or not it may still be confirmed.
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
@@ -952,8 +924,7 @@ pub(crate) enum AnchorResolution<'a> {
     /// Through the given anchor resolver, if any
     Resolver(Option<&'a dyn ResolveAnchor>),
     /// Through the EVM RPC URL configured for the chain the asset's bridge lives on, among the
-    /// given ones, scanning for each mint event at most [`MAX_MINT_SCAN_BLOCKS`] blocks after the
-    /// one it commits to
+    /// given ones
     #[cfg(feature = "_validation")]
     Evm(&'a HashMap<u64, String>),
 }
@@ -1003,8 +974,7 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
                     DynAnchorResolver(anchor_resolver),
                     bridge_location,
                 )?;
-                // a custom resolver bounds the scan itself, so it never reports an exhausted one
-                resolve_anchors(&mut pending, &anchor_resolver, &anchors, |_| false)?
+                resolve_anchors(&mut pending, &anchor_resolver, &anchors)?
             }
             #[cfg(feature = "_validation")]
             AnchorResolution::Evm(evm_rpc_urls) => {
@@ -1013,13 +983,8 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
                     chain_id: *chain_id,
                 })?;
                 let evm_client = EvmClient::new(evm_rpc_url)?;
-                let bounded_resolver =
-                    BoundedAnchorResolver::new(&evm_client, max_mint_scan_blocks());
-                let anchor_resolver =
-                    CheckedAnchorResolver::with(&bounded_resolver, bridge_location)?;
-                resolve_anchors(&mut pending, &anchor_resolver, &anchors, |opid| {
-                    bounded_resolver.is_exhausted(opid)
-                })?
+                let anchor_resolver = CheckedAnchorResolver::with(&evm_client, bridge_location)?;
+                resolve_anchors(&mut pending, &anchor_resolver, &anchors)?
             }
         };
         if let Some(opid) = unconfirmed.first() {
@@ -1111,27 +1076,15 @@ pub(crate) fn pending_anchors<const TRANSFER: bool>(
 
 /// Confirm the given external anchors of the given pending consignment with the given anchor
 /// resolver, returning the operation IDs of the ones that are not confirmed (yet).
-///
-/// A mint the resolver reports as exhausted (see `is_exhausted`), its event not found in any of
-/// the blocks within the scan limit, will never be confirmed: an
-/// [`Error::MintEventOutOfScanWindow`] is returned for it.
 pub(crate) fn resolve_anchors<const TRANSFER: bool, R: ResolveAnchor>(
     pending: &mut PendingConsignment<TRANSFER>,
     anchor_resolver: &CheckedAnchorResolver<R>,
     anchors: &[ExternalAnchor],
-    is_exhausted: impl Fn(&OpId) -> bool,
 ) -> Result<Vec<OpId>, Error> {
     let mut unconfirmed = vec![];
     for anchor in anchors {
         match pending.resolve_anchor(anchor_resolver, anchor) {
             Ok(()) => {}
-            // tell a mint that will never be confirmed from one that may still be
-            Err(AnchorResolverError::Unconfirmed(opid)) if is_exhausted(&opid) => {
-                return Err(Error::MintEventOutOfScanWindow {
-                    opid: opid.to_string(),
-                    max_scan_blocks: max_mint_scan_blocks(),
-                });
-            }
             Err(AnchorResolverError::Unconfirmed(opid)) => unconfirmed.push(opid),
             Err(e) => return Err(e.into()),
         }

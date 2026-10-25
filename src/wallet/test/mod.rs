@@ -243,8 +243,6 @@ thread_local! {
     pub(crate) static MOCK_MIN_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CONFIRMATION_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MINT_LOCK_WINDOW: RefCell<Option<u32>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_MINT_AFTER_BLOCK_GRACE: RefCell<Option<i64>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_MAX_MINT_SCAN_BLOCKS: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "_online")]
@@ -483,20 +481,6 @@ pub fn mock_clock_skew_margin() -> Option<u32> {
 #[cfg(feature = "_online")]
 pub fn mock_mint_lock_window() -> Option<u32> {
     MOCK_MINT_LOCK_WINDOW.with_borrow(|m| *m)
-}
-
-/// Time (seconds) the block a received mint commits to may precede the invoice to use instead of
-/// `MINT_AFTER_BLOCK_GRACE_SECS`, if set.
-#[cfg(feature = "_online")]
-pub fn mock_mint_after_block_grace() -> Option<i64> {
-    MOCK_MINT_AFTER_BLOCK_GRACE.with_borrow(|m| *m)
-}
-
-/// Maximum number of blocks scanned for the event of a received mint to use instead of
-/// `MAX_MINT_SCAN_BLOCKS`, if set.
-#[cfg(feature = "_online")]
-pub fn mock_max_mint_scan_blocks() -> Option<u64> {
-    MOCK_MAX_MINT_SCAN_BLOCKS.with_borrow(|m| *m)
 }
 
 /// Sender proxy retention grace (seconds) to use instead of the one advertised by the proxy, if

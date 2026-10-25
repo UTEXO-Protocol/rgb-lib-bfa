@@ -492,7 +492,7 @@ fn revalidate_received_mint() {
 #[cfg(feature = "electrum")]
 #[test]
 #[serial(evm)]
-fn save_new_asset_mint_scan_window() {
+fn save_new_asset_mint() {
     initialize();
 
     let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
@@ -536,124 +536,11 @@ fn save_new_asset_mint_scan_window() {
     let result = save_new_asset(&rcv_party);
     assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
 
-    // the lock is finalized, but outside the scanned blocks: the event follows the block the mint
-    // commits to, so it's never within 0 blocks from it, and the mint will never be confirmed
+    // the lock isn't finalized yet
     erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
     bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    evm_mine(EVM_FINALITY_DEPTH);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
     let result = save_new_asset(&rcv_party);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-    assert_matches!(result, Err(Error::MintEventOutOfScanWindow { opid, max_scan_blocks: 0 }) if opid == res.details.opid);
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[serial(evm)]
-fn history_mint_scan_limit() {
-    initialize();
-
-    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
-    let bridge_contract = deploy_bridge(&token_contract.address);
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-    let mut rcv_party_2 = get_funded_party!();
-    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
-
-    // mint to a wallet
-    let receive_data = rcv_party.blind_receive();
-    let recipient = Recipient {
-        assignment: Assignment::Fungible(AMOUNT),
-        recipient_id: receive_data.recipient_id.clone(),
-        witness_data: None,
-        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
-        encryption: Encryption::Optional,
-    };
-    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
-    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
-    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    evm_mine(EVM_FINALITY_DEPTH);
-    rcv_party.wait_for_refresh(None);
-    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
-    party.mint_end(party.online, signed_psbt);
-    mine(false);
-    rcv_party.wait_for_refresh(None);
-    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, AMOUNT);
-
-    // send it on, to a wallet scanning no block after the one the mint commits to: the mint in
-    // the history is never found within the limit, so the consignment is refused rather than
-    // waited for
-    let receive_data_2 = rcv_party_2.blind_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(AMOUNT),
-            recipient_id: receive_data_2.recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            public_key: Some(receive_data_2.public_key.clone()),
-            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
-            encryption: Encryption::Optional,
-        }],
-    )]);
-    rcv_party.send_retry(&recipient_map);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
-    rcv_party_2.refresh_all();
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-    assert!(rcv_party_2.check_test_transfer_status_recipient(
-        &receive_data_2.recipient_id,
-        TransferStatus::Failed
-    ));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[serial(evm)]
-fn terminal_mint_scan_limit() {
-    initialize();
-
-    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
-    let bridge_contract = deploy_bridge(&token_contract.address);
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
-
-    // the lock is made and finalized, but the recipient scans no block after the one the mint
-    // commits to: the mint is refused, as whoever the asset is sent to next would refuse it
-    let receive_data = rcv_party.blind_receive();
-    let recipient = Recipient {
-        assignment: Assignment::Fungible(AMOUNT),
-        recipient_id: receive_data.recipient_id.clone(),
-        witness_data: None,
-        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
-        encryption: Encryption::Optional,
-    };
-    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
-    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
-    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    evm_mine(EVM_FINALITY_DEPTH);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
-    rcv_party.refresh_all();
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &receive_data.recipient_id,
-            TransferStatus::Failed
-        )
-    );
-    assert!(
-        rcv_party
-            .wallet
-            .get_received_mint(receive_data.recipient_id.clone())
-            .unwrap()
-            .is_none()
-    );
+    assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
 }
 
 #[cfg(feature = "electrum")]
@@ -892,49 +779,6 @@ fn bdk_changes_persisted() {
     let reloaded = check_persisted(&party);
     let txid: bdk_wallet::bitcoin::Txid = res.txid.parse().unwrap();
     assert!(reloaded.get_tx(txid).is_some());
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[serial(evm)]
-fn old_after_block() {
-    initialize();
-
-    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
-    let bridge_contract = deploy_bridge(&token_contract.address);
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-    let asset = party.issue_asset_bfa(3, bridge_contract.address.clone(), None);
-
-    // the latest finalized block when the mint begins precedes the invoice (by the finality
-    // depth): with no grace, the recipient refuses the mint before scanning for its lock
-    MOCK_MINT_AFTER_BLOCK_GRACE.replace(Some(0));
-    let receive_data = rcv_party.blind_receive();
-    let recipient = Recipient {
-        assignment: Assignment::Fungible(AMOUNT),
-        recipient_id: receive_data.recipient_id.clone(),
-        witness_data: None,
-        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
-        encryption: Encryption::Optional,
-    };
-    party.mint_begin(party.online, &asset.asset_id, recipient);
-    rcv_party.refresh_all();
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &receive_data.recipient_id,
-            TransferStatus::Failed
-        )
-    );
-    assert!(
-        rcv_party
-            .wallet
-            .get_received_mint(receive_data.recipient_id.clone())
-            .unwrap()
-            .is_none()
-    );
 }
 
 #[cfg(feature = "electrum")]
