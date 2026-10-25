@@ -64,7 +64,8 @@ pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, ConsignmentPayment,
     FailTransfersOutcome, LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData,
     PrepareRgbPsbtResult, PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher, ReceiveMode,
-    ReceivedConsignmentMeta, RefreshResultTrait, RejectList, TryFailBatchTransferOutcome,
+    ReceivedConsignmentMeta, RefreshResultTrait, RejectList, SelectedInputs,
+    TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails, LocalAssetData,

@@ -2008,6 +2008,13 @@ impl LocalRgbAllocation {
     pub(crate) fn future(&self) -> bool {
         !self.txo_spent && self.incoming && !self.status.failed() && !self.settled()
     }
+
+    /// Whether the allocation is held by its UTXO, or due to be, so that spending the UTXO moves
+    /// it: an incoming allocation on an unspent TXO, from a transfer that hasn't failed.
+    #[cfg(feature = "_online")]
+    pub(crate) fn held(&self) -> bool {
+        self.incoming && !self.txo_spent && !self.status.failed()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2232,6 +2239,51 @@ pub enum ReceiveMatcher {
     /// the script paid and, when known (proxy exchange), the blinding of the seal
     /// (`v1.0-changes-spec.md` A.11)
     Witness(ScriptBuf, Option<u64>),
+}
+
+/// The UTXOs selected as inputs of an operation, with the number of allocations of each asset they
+/// hold, which spending them moves, as inputs of the bundle of the asset.
+#[cfg(feature = "_online")]
+#[derive(Clone, Debug, Default)]
+pub struct SelectedInputs {
+    outpoints: HashSet<Outpoint>,
+    // map of asset IDs to the number of their allocations
+    allocations: HashMap<String, usize>,
+}
+
+#[cfg(feature = "_online")]
+impl SelectedInputs {
+    /// Select the given UTXO, unless the allocations of an asset it adds to the ones of the UTXOs
+    /// already selected exceed `max_allocations`, returning whether it's selected. A UTXO already
+    /// selected (e.g. for another asset of the same operation) is skipped since it's already been
+    /// accounted for (allocations would otherwise be counted twice).
+    pub(crate) fn select(&mut self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
+        let outpoint = unspent.utxo.outpoint();
+        if self.outpoints.contains(&outpoint) {
+            return true;
+        }
+        let mut added: HashMap<&str, usize> = HashMap::new();
+        for asset_id in unspent
+            .rgb_allocations
+            .iter()
+            .filter(|a| a.held())
+            // an allocation without an asset ID is due from a receive of an asset not known yet,
+            // which makes its UTXO unspendable (see `get_input_unspents`)
+            .filter_map(|a| a.asset_id.as_deref())
+        {
+            *added.entry(asset_id).or_default() += 1;
+        }
+        if added.iter().any(|(asset_id, num)| {
+            self.allocations.get(*asset_id).unwrap_or(&0) + num > max_allocations
+        }) {
+            return false;
+        }
+        for (asset_id, num) in added {
+            *self.allocations.entry(asset_id.to_string()).or_default() += num;
+        }
+        self.outpoints.insert(outpoint);
+        true
+    }
 }
 
 /// A destination at which a consignment pays this recipient, see `find_payments`.
