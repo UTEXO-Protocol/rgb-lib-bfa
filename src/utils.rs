@@ -655,6 +655,17 @@ pub(crate) fn read_fascia(path: &Path) -> Result<Fascia, Error> {
     })
 }
 
+/// Check that the given PSBT, once its RGB data are committed, can be parsed back, which fails if
+/// its global map, holding the RGB data, exceeds MAX_VEC_SIZE bytes, e.g. when spending UTXOs with
+/// too many allocations. Such a PSBT can't be signed by an external signer nor be read back to
+/// broadcast its TX.
+#[cfg(feature = "wallet")]
+pub(crate) fn check_psbt_parsable(psbt: &Psbt) -> Result<(), Error> {
+    Psbt::deserialize(&psbt.serialize())
+        .map(|_| ())
+        .map_err(|_| Error::PsbtTooLarge)
+}
+
 /// Write a fascia file atomically, so a crash mid-write cannot leave a torn one behind.
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
 pub(crate) fn write_fascia(path: &Path, fascia: &Fascia) -> Result<(), Error> {

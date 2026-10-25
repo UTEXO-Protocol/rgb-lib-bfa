@@ -147,6 +147,7 @@ interface RgbLibError {
   ProxyTooManyMedia();
   ProxyTxAlreadyReleased();
   PsbtInspection(string details);
+  PsbtTooLarge();
   RecipientIDAlreadyUsed();
   RecipientIDDuplicated();
   RejectListService(string details);

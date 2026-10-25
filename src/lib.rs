@@ -504,6 +504,8 @@ use crate::utils::INDEXER_BATCH_SIZE;
 use crate::utils::INDEXER_PARALLEL_REQUESTS;
 #[cfg(any(feature = "electrum", feature = "esplora"))]
 use crate::utils::INDEXER_STOP_GAP;
+#[cfg(feature = "wallet")]
+use crate::utils::check_psbt_parsable;
 #[cfg(feature = "_online")]
 use crate::utils::write_fascia;
 #[cfg(feature = "bitcoind")]

@@ -762,6 +762,11 @@ pub enum Error {
         details: String,
     },
 
+    /// The PSBT of the operation would be too large to be parsed back, as it moves too many
+    /// allocations
+    #[error("PSBT too large")]
+    PsbtTooLarge,
+
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]
     RecipientIDAlreadyUsed,
