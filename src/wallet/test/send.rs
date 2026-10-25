@@ -12471,15 +12471,31 @@ fn broadcast_legacy_signed_psbt() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
+fn change_utxo_allocations_limit() {
+    change_utxo_allocations_limit_impl(10);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
 #[ignore = "should be executed alone for performance reasons"]
 #[parallel]
 fn change_utxo_allocations_limit_full() {
+    change_utxo_allocations_limit_impl(MAX_UTXO_ASSET_ALLOCATIONS);
+}
+
+// check an existing UTXO isn't used as change if the allocations moved to the change would take it
+// past `max_allocations`, mocking the limit when lower than the real one
+#[cfg(feature = "electrum")]
+fn change_utxo_allocations_limit_impl(max_allocations: usize) {
     initialize();
 
     // UTXOs are filled by paying invoices many allocations
     MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
 
-    let max_allocations = MAX_UTXO_ASSET_ALLOCATIONS;
+    if max_allocations != MAX_UTXO_ASSET_ALLOCATIONS {
+        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations));
+    }
     // UTXO S (rcv_party) is prepared with the max number of allocations that can be spent: 1 with
     // amount 100, the others with amount 2 (so spending 1 produces a change of 1); the sender pays
     // all of its allocation, as a transition assigns at most u16::MAX allocations of a type, which
@@ -12549,31 +12565,32 @@ fn change_utxo_allocations_limit_full() {
     );
 
     // sending 1 spends S, moving its change plus all other allocations (extra) to the RGB change,
-    // which goes to D since the TX has no BTC change, taking D past the allocations that can be
-    // spent
+    // which can't go to D, as the TX has no BTC change and D would then hold more allocations than
+    // can be spent, and there's no other UTXO for it
     let receive_data = rcv_party_2.blind_receive();
     let recipient_map = blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(1));
+    let result = rcv_party.send_result(&recipient_map);
+    assert_matches!(result, Err(Error::InsufficientAllocationSlots));
+
+    // with another UTXO the RGB change goes there
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
     let txid = rcv_party.send_result(&recipient_map).unwrap().txid;
     let (transfer, _, _) = rcv_party.get_test_transfer_sender(&txid);
     let (transfer_data, _) = rcv_party.get_test_transfer_data(&transfer);
-    assert_eq!(transfer_data.change_utxo, Some(utxo_d.clone()));
+    let utxo_change = transfer_data.change_utxo.unwrap();
+    assert_ne!(utxo_change, utxo_d);
+    assert_ne!(utxo_change, utxo_s);
     rcv_party_2.wait_for_refresh(None);
     rcv_party.wait_for_refresh(Some(asset_id));
     mine(false);
     rcv_party_2.wait_for_refresh(None);
     rcv_party.wait_for_refresh(Some(asset_id));
     assert!(rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert_eq!(num_allocations(&mut rcv_party, &utxo_d), Some(1));
     assert_eq!(
-        num_allocations(&mut rcv_party, &utxo_d),
-        Some(max_allocations + 1)
+        num_allocations(&mut rcv_party, &utxo_change),
+        Some(max_allocations)
     );
-
-    // D is now frozen: coin selection skips it, as it holds more allocations than can be spent, so
-    // no amount can be sent
-    let receive_data = rcv_party_2.blind_receive();
-    let recipient_map = blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(1));
-    let result = rcv_party.send_result(&recipient_map);
-    assert_matches!(result, Err(Error::InsufficientAssignments { .. }));
 }
 
 #[cfg(feature = "electrum")]

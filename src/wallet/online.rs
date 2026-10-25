@@ -4372,15 +4372,14 @@ pub trait WalletOnline: WalletOffline {
         txn: &DbTxn,
         btc_change: &Option<BtcChange>,
         change_utxo_option: &mut Option<DbTxo>,
-        input_outpoints: &[Outpoint],
+        exclude_utxos: &[Outpoint],
         unspents: &[LocalUnspent],
     ) -> Result<BlindSeal<TxPtr>, Error> {
         Ok(if let Some(btc_change) = btc_change {
             GraphSeal::new_random_vout(btc_change.vout)
         } else {
             if change_utxo_option.is_none() {
-                let change_utxo =
-                    self.get_utxo(txn, input_outpoints, Some(unspents), true, None)?;
+                let change_utxo = self.get_utxo(txn, exclude_utxos, Some(unspents), true, None)?;
                 debug!(
                     self.logger(),
                     "Change outpoint '{}'",
@@ -4468,6 +4467,30 @@ pub trait WalletOnline: WalletOffline {
 
         let input_outpoints: Vec<Outpoint> =
             prev_outputs.iter().map(|o| Outpoint::from(*o)).collect();
+
+        // without BTC change, the RGB change goes to an existing UTXO, which receives at most as
+        // many allocations of each asset as the inputs hold: exclude the inputs and the UTXOs
+        // that would then hold more allocations of an asset than a bundle can spend (with BTC
+        // change, no existing UTXO is used, so there's nothing to exclude)
+        let change_exclude: Vec<Outpoint> = if btc_change.is_some() {
+            vec![]
+        } else {
+            let mut inputs = SelectedInputs::default();
+            for unspent in unspents
+                .iter()
+                .filter(|u| input_outpoints.contains(&u.utxo.outpoint()))
+            {
+                inputs.select(unspent, usize::MAX);
+            }
+            unspents
+                .iter()
+                .filter(|u| {
+                    input_outpoints.contains(&u.utxo.outpoint())
+                        || !inputs.fits(u, max_utxo_asset_allocations())
+                })
+                .map(|u| u.utxo.outpoint())
+                .collect()
+        };
 
         let mut asset_beneficiaries = bmap![];
         let mut extra_state = HashMap::<ContractId, Vec<(OutPoint, Opout, AllocatedState)>>::new();
@@ -4608,7 +4631,7 @@ pub trait WalletOnline: WalletOffline {
                     txn,
                     &btc_change,
                     &mut change_utxo_option,
-                    &input_outpoints,
+                    &change_exclude,
                     unspents.as_slice(),
                 )?;
                 let mut change_outputs = vec![];
@@ -4784,7 +4807,7 @@ pub trait WalletOnline: WalletOffline {
                     txn,
                     &btc_change,
                     &mut change_utxo_option,
-                    &input_outpoints,
+                    &change_exclude,
                     unspents.as_slice(),
                 )?;
                 extra_builder = extra_builder

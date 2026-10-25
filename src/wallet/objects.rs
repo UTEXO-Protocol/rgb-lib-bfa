@@ -2253,35 +2253,49 @@ pub struct SelectedInputs {
 
 #[cfg(feature = "_online")]
 impl SelectedInputs {
-    /// Select the given UTXO, unless the allocations of an asset it adds to the ones of the UTXOs
-    /// already selected exceed `max_allocations`, returning whether it's selected. A UTXO already
-    /// selected (e.g. for another asset of the same operation) is skipped since it's already been
-    /// accounted for (allocations would otherwise be counted twice).
-    pub(crate) fn select(&mut self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
-        let outpoint = unspent.utxo.outpoint();
-        if self.outpoints.contains(&outpoint) {
-            return true;
-        }
-        let mut added: HashMap<&str, usize> = HashMap::new();
+    /// The number of allocations of each asset held by the given UTXO.
+    fn held_allocations(unspent: &LocalUnspent) -> HashMap<&str, usize> {
+        let mut held: HashMap<&str, usize> = HashMap::new();
         for asset_id in unspent
             .rgb_allocations
             .iter()
             .filter(|a| a.held())
             // an allocation without an asset ID is due from a receive of an asset not known yet,
-            // which makes its UTXO unspendable (see `get_input_unspents`)
+            // which makes its UTXO unspendable (see `get_input_unspents`); a UTXO used as change
+            // gets checked when the receive gets its asset, counting the change (see
+            // `count_utxo_asset_allocations`)
             .filter_map(|a| a.asset_id.as_deref())
         {
-            *added.entry(asset_id).or_default() += 1;
+            *held.entry(asset_id).or_default() += 1;
         }
-        if added.iter().any(|(asset_id, num)| {
-            self.allocations.get(*asset_id).unwrap_or(&0) + num > max_allocations
-        }) {
+        held
+    }
+
+    /// Whether the allocations of each asset held by the given UTXO, added to the ones of the
+    /// UTXOs selected, don't exceed `max_allocations`. A UTXO already selected (e.g. for another
+    /// asset of the same operation) fits, since its allocations have already been accounted for
+    /// (they would otherwise be counted twice).
+    pub(crate) fn fits(&self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
+        self.outpoints.contains(&unspent.utxo.outpoint())
+            || Self::held_allocations(unspent)
+                .iter()
+                .all(|(asset_id, num)| {
+                    self.allocations.get(*asset_id).unwrap_or(&0) + num <= max_allocations
+                })
+    }
+
+    /// Select the given UTXO, unless it doesn't fit (see [`Self::fits`]), returning whether it's
+    /// selected.
+    pub(crate) fn select(&mut self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
+        if !self.fits(unspent, max_allocations) {
             return false;
         }
-        for (asset_id, num) in added {
-            *self.allocations.entry(asset_id.to_string()).or_default() += num;
+        let outpoint = unspent.utxo.outpoint();
+        if self.outpoints.insert(outpoint) {
+            for (asset_id, num) in Self::held_allocations(unspent) {
+                *self.allocations.entry(asset_id.to_string()).or_default() += num;
+            }
         }
-        self.outpoints.insert(outpoint);
         true
     }
 }
