@@ -12145,3 +12145,94 @@ fn utxo_freeze_limit() {
         total,
     );
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn utxo_freeze_concurrent_receives() {
+    initialize();
+
+    // a low limit, to check it without u16::MAX allocations
+    let max_allocations: u16 = 10;
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations as usize));
+    let amount: u64 = 50;
+    // each transfer pays 6 allocations: either fits on the UTXO, both together don't
+    let dust: (u16, u64) = (5, 1);
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue, on two UTXOs, so that two transfers can be pending at the same time
+    let asset = party.issue_asset_nia(Some(&[AMOUNT, AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // two invoices on the victim's only UTXO
+    let receive_data_1 = rcv_party.blind_receive();
+    let receive_data_2 = rcv_party.blind_receive();
+    let rcv_transfer_1 = rcv_party.get_test_transfer_recipient(&receive_data_1.recipient_id);
+    let rcv_transfer_2 = rcv_party.get_test_transfer_recipient(&receive_data_2.recipient_id);
+    assert_eq!(
+        rcv_party
+            .get_test_transfer_data(&rcv_transfer_1)
+            .0
+            .receive_utxo,
+        rcv_party
+            .get_test_transfer_data(&rcv_transfer_2)
+            .0
+            .receive_utxo
+    );
+
+    // both transfers are sent before the victim refreshes
+    let mut txids = vec![];
+    for receive_data in [&receive_data_1, &receive_data_2] {
+        MOCK_DUST_RECIPIENT_ASSIGNMENTS.replace(Some(dust));
+        let recipient_map = blind_recipient_map(asset_id, receive_data, amount);
+        txids.push(party.send_result(&recipient_map).unwrap().txid);
+        assert!(MOCK_DUST_RECIPIENT_ASSIGNMENTS.take().is_none());
+    }
+    assert_ne!(txids[0], txids[1]);
+
+    // the victim processes both in the same refresh: the allocations of the first one it accepts
+    // count against the second one, which is refused
+    rcv_party.refresh_result(None, &[]).unwrap();
+    let statuses: Vec<TransferStatus> = [&receive_data_1, &receive_data_2]
+        .iter()
+        .map(|rd| {
+            let transfer = rcv_party.get_test_transfer_recipient(&rd.recipient_id);
+            rcv_party.get_test_transfer_data(&transfer).0.status
+        })
+        .collect();
+    println!("receive statuses: {statuses:?}");
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == TransferStatus::WaitingConfirmations)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == TransferStatus::Failed)
+            .count(),
+        1
+    );
+
+    // the accepted transfer settles, the refused one fails for the sender too
+    party.wait_for_refresh(Some(asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(asset_id));
+    let (accepted, refused) = if statuses[0] == TransferStatus::Failed {
+        (1, 0)
+    } else {
+        (0, 1)
+    };
+    assert!(party.check_test_transfer_status_sender(&txids[accepted], TransferStatus::Settled));
+    assert!(party.check_test_transfer_status_sender(&txids[refused], TransferStatus::Failed));
+    let allocations = single_colored_utxo_allocations(&mut rcv_party);
+    assert_eq!(allocations.len(), dust.0 as usize + 1);
+    assert_eq!(rcv_party.get_asset_balance(asset_id).settled, amount);
+}
