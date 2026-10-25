@@ -12450,12 +12450,12 @@ fn utxo_allocations_limit_across_assets() {
 #[test]
 #[ignore = "should be executed alone for performance reasons"]
 #[parallel]
-fn send_psbt_too_large_full() {
+fn send_many_allocations_full() {
     initialize();
 
     // many allocations on a single UTXO, each one moved by its own transition when the UTXO is
-    // spent: with at least 104 bytes (input and consumer entry) for each of them, the RGB data of
-    // the PSBT exceed the MAX_VEC_SIZE bytes its global map can take to be parsed back
+    // spent: with at least 104 bytes (input and consumer entry) for each of them, the RGB data
+    // would exceed the MAX_VEC_SIZE bytes the global map of a PSBT can take to be parsed back
     let dust: (u16, u64) = (40_000, 1);
     let amount: u64 = 50_000;
 
@@ -12479,18 +12479,16 @@ fn send_psbt_too_large_full() {
         dust.0 as usize + 1
     );
 
-    // sending from it fails, as the PSBT would be too large to be parsed back, before anything is
-    // posted to the recipient
+    // sending from it works, as the RGB data are removed from the PSBT once committed: the
+    // allocation sent is the one needed, all the others are moved to the change
     let receive_data = rcv_party_2.blind_receive();
-    let recipient_map = blind_recipient_map(asset_id, &receive_data, 1);
-    let result = rcv_party.send_result(&recipient_map);
-    assert_matches!(result, Err(Error::PsbtTooLarge));
-    rcv_party_2.refresh_result(None, &[]).unwrap();
-    assert!(rcv_party_2.check_test_transfer_status_recipient(
-        &receive_data.recipient_id,
-        TransferStatus::WaitingCounterparty
-    ));
-    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, amount);
+    blind_send_and_settle(&mut rcv_party, &mut rcv_party_2, asset_id, &receive_data, 1);
+    assert_eq!(rcv_party_2.get_asset_balance(asset_id).settled, 1);
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, amount - 1);
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        dust.0 as usize
+    );
 }
 
 #[cfg(feature = "electrum")]
