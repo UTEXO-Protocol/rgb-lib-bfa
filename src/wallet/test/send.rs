@@ -12399,30 +12399,18 @@ fn send_psbt_too_large_full() {
         spam.0 as usize + 1
     );
 
-    // sending from it builds and signs the PSBT, posting the consignment, which is ACKed
+    // sending from it fails, as the PSBT would be too large to be parsed back, before anything is
+    // posted to the recipient
     let receive_data = rcv_party_2.blind_receive();
     let recipient_map = blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(1));
-    let txid = rcv_party.send_result(&recipient_map).unwrap().txid;
-    rcv_party_2.wait_for_refresh(None);
+    let result = rcv_party.send_result(&recipient_map);
+    assert_matches!(result, Err(Error::PsbtTooLarge));
+    rcv_party_2.refresh_result(None, &[]).unwrap();
     assert!(rcv_party_2.check_test_transfer_status_recipient(
         &receive_data.recipient_id,
-        TransferStatus::WaitingConfirmations
+        TransferStatus::WaitingCounterparty
     ));
-
-    // but the signed PSBT saved to broadcast the TX can't be parsed back, so the transfer is stuck
-    let (_, _, batch_transfer) = rcv_party.get_test_transfer_sender(&txid);
-    let refresh_res = rcv_party.refresh_result(None, &[]).unwrap();
-    println!(
-        "refresh failure: {:?}",
-        refresh_res[&batch_transfer.idx].failure
-    );
-    assert_matches!(
-        refresh_res[&batch_transfer.idx].failure,
-        Some(Error::InvalidPsbt { .. })
-    );
-    assert!(
-        rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty)
-    );
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, amount);
 }
 
 #[cfg(feature = "electrum")]

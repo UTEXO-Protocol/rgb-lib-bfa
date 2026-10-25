@@ -4803,6 +4803,7 @@ pub trait WalletOnline: WalletOffline {
 
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+        check_psbt_parsable(psbt)?;
         fs::create_dir_all(&transfer_dir)?;
         write_fascia(&transfer_dir.join(FASCIA_FILE), &fascia)?;
 
