@@ -2155,12 +2155,12 @@ pub trait WalletOffline: WalletBackup {
                 .map(|t| t.outpoint()),
             _ => None,
         };
-        let change_utxo = match kind {
+        let change_utxos = match kind {
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness | TransferKind::Issuance => {
-                None
+                vec![]
             }
             TransferKind::Send | TransferKind::Inflation | TransferKind::Burn => {
-                coloring_info.change_utxo.clone()
+                coloring_info.change_utxos.clone()
             }
         };
 
@@ -2203,7 +2203,7 @@ pub trait WalletOffline: WalletBackup {
             assignments: coloring_info.assignments.clone(),
             txid: batch_transfer.txid.clone(),
             receive_utxo,
-            change_utxo,
+            change_utxos,
             created_at: batch_transfer.created_at,
             updated_at: batch_transfer.updated_at,
             expiration_timestamp: batch_transfer.expiration,
