@@ -12131,6 +12131,92 @@ fn utxo_freeze_concurrent_receives() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[ignore = "should be executed alone for performance reasons"]
+#[parallel]
+fn utxo_allocations_limit_across_inputs_full() {
+    initialize();
+
+    // UTXOs are filled by paying invoices many allocations
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
+
+    // two UTXOs, each holding half of the allocations a bundle can spend plus one, so that each can
+    // be spent alone but not together, and one with a single allocation of a larger amount
+    let spam: (u16, u64) = (u16::MAX / 2, 1);
+    let amount_a: u64 = 33_000;
+    let amount_b: u64 = 34_000;
+    let amount_c: u64 = 50_000;
+    // more than A holds, so that a second UTXO is needed
+    let amount_send: u64 = 40_000;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(3), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[amount_a + amount_b + amount_c + AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // fill the victim's UTXOs, each invoice going to a different one
+    let mut receive_utxos = vec![];
+    for (amount, spam) in [
+        (amount_a, Some(spam)),
+        (amount_b, Some(spam)),
+        (amount_c, None),
+    ] {
+        let receive_data = rcv_party.blind_receive();
+        let transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+        receive_utxos.push(rcv_party.get_test_transfer_data(&transfer).0.receive_utxo);
+        MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(spam);
+        send_to_blind_and_settle(
+            &mut party,
+            &mut rcv_party,
+            asset_id,
+            &receive_data,
+            Assignment::Fungible(amount),
+        );
+        assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+    }
+    assert_eq!(
+        receive_utxos.iter().collect::<HashSet<_>>().len(),
+        receive_utxos.len()
+    );
+    let unspents = rcv_party.list_unspents(true);
+    let mut allocations: Vec<(u64, usize)> = unspents
+        .iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .map(|u| {
+            let sum = u
+                .rgb_allocations
+                .iter()
+                .map(|a| a.assignment.main_amount())
+                .sum();
+            (sum, u.rgb_allocations.len())
+        })
+        .collect();
+    allocations.sort();
+    let num_spam = spam.0 as usize + 1;
+    assert_eq!(
+        allocations,
+        vec![(amount_a, num_spam), (amount_b, num_spam), (amount_c, 1)]
+    );
+    assert!(2 * num_spam > MAX_UTXO_ASSET_ALLOCATIONS);
+
+    // UTXOs are selected by ascending amount, so A and B are selected, together holding more
+    // allocations than a bundle can spend, and the send fails, even though A and C would do
+    let receive_data = rcv_party_2.blind_receive();
+    let recipient_map =
+        blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(amount_send));
+    let result = rcv_party.send_result(&recipient_map);
+    println!("send of {amount_send} result: {result:?}");
+    assert_matches!(result, Err(Error::Internal { .. }));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
 #[parallel]
 fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
     initialize();
