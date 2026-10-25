@@ -12357,6 +12357,76 @@ fn utxo_allocations_limit_across_assets() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[ignore = "should be executed alone for performance reasons"]
+#[parallel]
+fn send_psbt_too_large_full() {
+    initialize();
+
+    // UTXOs are filled by paying invoices many allocations
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
+
+    // many allocations on a single UTXO, each one moved by its own transition when the UTXO is
+    // spent: with at least 104 bytes (input and consumer entry) for each of them, the RGB data of
+    // the PSBT exceed the MAX_VEC_SIZE bytes its global map can take to be parsed back
+    let spam: (u16, u64) = (40_000, 1);
+    let amount: u64 = 50_000;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[AMOUNT + amount]));
+    let asset_id = asset.asset_id.as_str();
+
+    // fill the victim's UTXO
+    let receive_data = rcv_party.blind_receive();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(Some(spam));
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data,
+        Assignment::Fungible(amount),
+    );
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        spam.0 as usize + 1
+    );
+
+    // sending from it builds and signs the PSBT, posting the consignment, which is ACKed
+    let receive_data = rcv_party_2.blind_receive();
+    let recipient_map = blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(1));
+    let txid = rcv_party.send_result(&recipient_map).unwrap().txid;
+    rcv_party_2.wait_for_refresh(None);
+    assert!(rcv_party_2.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+
+    // but the signed PSBT saved to broadcast the TX can't be parsed back, so the transfer is stuck
+    let (_, _, batch_transfer) = rcv_party.get_test_transfer_sender(&txid);
+    let refresh_res = rcv_party.refresh_result(None, &[]).unwrap();
+    println!(
+        "refresh failure: {:?}",
+        refresh_res[&batch_transfer.idx].failure
+    );
+    assert_matches!(
+        refresh_res[&batch_transfer.idx].failure,
+        Some(Error::InvalidPsbt { .. })
+    );
+    assert!(
+        rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingCounterparty)
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
 #[parallel]
 fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
     initialize();
