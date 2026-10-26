@@ -12661,7 +12661,6 @@ fn change_utxo_allocations_limit_impl(max_allocations: usize) {
 
 #[cfg(feature = "electrum")]
 #[test]
-#[ignore = "the allocations of batched assets on inputs selected for another are lost"]
 #[parallel]
 fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
     initialize();

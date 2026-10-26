@@ -4739,11 +4739,13 @@ pub trait WalletOnline: WalletOffline {
         let mut input_opouts: HashMap<ContractId, HashMap<Opout, AllocatedState>> = HashMap::new();
         let mut opid = None;
         for (asset_id, transfer_info) in transfer_info_map.iter_mut() {
-            let asset_utxos = transfer_info.asset_spend.input_outpoints.iter().cloned();
+            // the inputs selected for another asset of the batch are spent too, so the asset
+            // allocations they hold have to be moved as well: take them from all the inputs,
+            // as the blank transitions below skip the assets of the batch
             let mut all_opout_state_vec = Vec::new();
             for (explicit_seal, opout_state_map) in stock.contract_assignments_for(
                 transfer_info.asset_info.contract_id,
-                asset_utxos.clone(),
+                prev_outputs.iter().copied(),
             )? {
                 all_opout_state_vec.extend(
                     opout_state_map
