@@ -2300,6 +2300,36 @@ impl SelectedInputs {
     }
 }
 
+/// The seal at which a consignment pays this recipient: a concealed one (blind receives) or one
+/// revealed on a vout of the bundle witness TX (witness receives), never both.
+#[cfg(feature = "_online")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentSeal {
+    Concealed(SecretSeal),
+    WitnessVout(u32),
+}
+
+#[cfg(feature = "_online")]
+impl PaymentSeal {
+    /// the vout of the bundle witness TX being paid, for witness receives
+    pub(crate) fn vout(&self) -> Option<u32> {
+        match self {
+            Self::Concealed(_) => None,
+            Self::WitnessVout(vout) => Some(*vout),
+        }
+    }
+
+    pub(crate) fn matches(&self, seal: &BuilderSeal<GraphSeal>) -> bool {
+        match (self, seal) {
+            (Self::Concealed(secret_seal), BuilderSeal::Concealed(seal)) => secret_seal == seal,
+            (Self::WitnessVout(vout), BuilderSeal::Revealed(seal)) => {
+                seal.txid == TxPtr::WitnessTx && seal.vout.into_u32() == *vout
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A destination at which a consignment pays this recipient, see `find_payments`.
 #[cfg(feature = "_online")]
 pub struct ConsignmentPayment<'c> {
