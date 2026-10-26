@@ -57,9 +57,9 @@ pub enum TransitionGlobal {
 pub enum TransitionMetadata {
     /// Amount of inflation rights allowed in output, committed in IFA inflate transitions
     AllowedInflation(u64),
-    /// External chain block after which the lock event backing the mint must be searched,
-    /// committed in BFA mint transitions
-    AfterBlock(u64),
+    /// External chain block before which the lock backing the mint has to be included, committed
+    /// in BFA mint transitions
+    BeforeBlock(u64),
 }
 
 /// Information about an RGB transition.
@@ -596,7 +596,7 @@ fn transition_info(
                     .map_err(|e| invalid(RGB_METADATA_ALLOWED_INFLATION, e))?
                     .into(),
             ),
-            MS_BEFORE_BLOCK => TransitionMetadata::AfterBlock(
+            MS_BEFORE_BLOCK => TransitionMetadata::BeforeBlock(
                 BlockNumber::from_strict_serialized(value.to_inner())
                     .map_err(|e| invalid(RGB_METADATA_BEFORE_BLOCK, e))?
                     .into_inner(),

@@ -559,7 +559,7 @@ impl From<BundleFilter> for RgbLibBundleFilter {
 }
 pub enum TransitionMetadata {
     AllowedInflation { amount: u64 },
-    AfterBlock { block: u64 },
+    BeforeBlock { block: u64 },
 }
 impl From<RgbLibTransitionMetadata> for TransitionMetadata {
     fn from(orig: RgbLibTransitionMetadata) -> Self {
@@ -567,7 +567,7 @@ impl From<RgbLibTransitionMetadata> for TransitionMetadata {
             RgbLibTransitionMetadata::AllowedInflation(amount) => {
                 TransitionMetadata::AllowedInflation { amount }
             }
-            RgbLibTransitionMetadata::AfterBlock(block) => TransitionMetadata::AfterBlock { block },
+            RgbLibTransitionMetadata::BeforeBlock(block) => TransitionMetadata::BeforeBlock { block },
         }
     }
 }
@@ -577,7 +577,7 @@ impl From<TransitionMetadata> for RgbLibTransitionMetadata {
             TransitionMetadata::AllowedInflation { amount } => {
                 RgbLibTransitionMetadata::AllowedInflation(amount)
             }
-            TransitionMetadata::AfterBlock { block } => RgbLibTransitionMetadata::AfterBlock(block),
+            TransitionMetadata::BeforeBlock { block } => RgbLibTransitionMetadata::BeforeBlock(block),
         }
     }
 }
@@ -1629,6 +1629,7 @@ impl Wallet {
         online: Online,
         asset_id: String,
         recipient: Recipient,
+        before_block: u64,
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: String,
@@ -1637,6 +1638,7 @@ impl Wallet {
             online,
             asset_id,
             recipient.into(),
+            before_block,
             fee_rate,
             min_confirmations,
             sender_transport_endpoint,

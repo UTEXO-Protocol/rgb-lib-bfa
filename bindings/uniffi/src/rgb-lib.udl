@@ -63,6 +63,7 @@ interface RgbLibError {
   InvalidAmountZero();
   InvalidAssignment();
   InvalidAttachments(string details);
+  InvalidBeforeBlock(string details);
   InvalidBitcoinKeys();
   InvalidBitcoinNetwork(string network);
   InvalidBurnReason(string details);
@@ -109,6 +110,7 @@ interface RgbLibError {
   LastMintRight();
   MaxFeeExceeded(string txid);
   MinFeeNotMet(string txid);
+  MintEventExpired(string opid, u64 before_block);
   MintEventNotFound(string opid);
   MultisigCannotMarkOperationProcessed(string details);
   MultisigCannotRespondToOperation(string details);
@@ -776,7 +778,7 @@ dictionary MintDetails {
 dictionary ReceivedMint {
   string opid;
   u64 amount;
-  u64 after_block;
+  u64 before_block;
   u64 evm_chain_id;
   string bridge_contract;
 };
@@ -928,7 +930,7 @@ interface BundleFilter {
 [Enum]
 interface TransitionMetadata {
   AllowedInflation(u64 amount);
-  AfterBlock(u64 block);
+  BeforeBlock(u64 block);
 };
 
 [Remote]
@@ -1164,8 +1166,8 @@ interface Wallet {
 
   [Throws=RgbLibError]
   MintBeginResult mint_begin(
-    Online online, string asset_id, Recipient recipient, u64 fee_rate,
-    u8 min_confirmations, string sender_transport_endpoint);
+    Online online, string asset_id, Recipient recipient, u64 before_block,
+    u64 fee_rate, u8 min_confirmations, string sender_transport_endpoint);
 
   [Throws=RgbLibError]
   OperationResult mint_end(Online online, string signed_psbt);

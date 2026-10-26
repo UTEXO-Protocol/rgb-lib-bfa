@@ -100,10 +100,10 @@ fn success() {
     let mint = received_mint(&party).unwrap();
     assert_eq!(mint.opid, res.details.opid);
     assert_eq!(mint.amount, AMOUNT);
-    // the inspected mint commits to the external chain block the recipient expects the lock after
+    // the inspected mint commits to the external chain block the lock has to be included before
     assert_eq!(
         mint_metadata,
-        vec![TransitionMetadata::AfterBlock(mint.after_block)]
+        vec![TransitionMetadata::BeforeBlock(mint.before_block)]
     );
     assert_eq!(mint.evm_chain_id, ANVIL_CHAIN_ID);
     assert_eq!(
@@ -546,6 +546,99 @@ fn save_new_asset_mint() {
 #[cfg(feature = "electrum")]
 #[test]
 #[serial(evm)]
+fn lock_before_block() {
+    initialize();
+
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let rcv_party_2 = get_funded_party!();
+    let asset = party.issue_asset_bfa(3, bridge_contract.address.clone(), None);
+    let mint_recipient = |receive_data: &ReceiveData| Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        encryption: Encryption::Optional,
+    };
+
+    // the lock is made, and finalized, but not before the block the mint commits to
+    let receive_data = rcv_party.blind_receive();
+    let before_block = evm_block_number() + 3;
+    let res = party
+        .mint_begin_before_result(
+            party.online,
+            &asset.asset_id,
+            mint_recipient(&receive_data),
+            before_block,
+        )
+        .unwrap();
+    let txid = Psbt::from_str(&res.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let consignment = RgbTransfer::load_file(
+        party
+            .wallet
+            .get_send_consignment_path(&asset.asset_id, &txid),
+    )
+    .unwrap();
+    evm_mine(5);
+    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
+    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
+    evm_mine(EVM_FINALITY_DEPTH);
+    // the mint will never be confirmed, for anyone: its recipient refuses it, it's not valid and
+    // it cannot be ended
+    rcv_party.refresh_all();
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+    let result = rcv_party_2
+        .wallet
+        .save_new_asset(rcv_party_2.online, consignment, txid.clone());
+    assert_matches!(result, Err(Error::MintEventExpired { opid, before_block: b }) if opid == res.details.opid && b == before_block);
+    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
+    let result = party.mint_end_result(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::MintEventExpired { opid, before_block: b }) if opid == res.details.opid && b == before_block);
+
+    // no lock is made and the blocks before the one the mint commits to are all finalized: the
+    // mint is refused right away, without waiting for the invoice to expire
+    let receive_data = rcv_party.blind_receive();
+    let before_block = evm_block_number() + 3;
+    party
+        .mint_begin_before_result(
+            party.online,
+            &asset.asset_id,
+            mint_recipient(&receive_data),
+            before_block,
+        )
+        .unwrap();
+    rcv_party.refresh_all();
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+    evm_mine(3 + EVM_FINALITY_DEPTH);
+    rcv_party.refresh_all();
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[serial(evm)]
 fn concurrent_mints() {
     initialize();
 
@@ -895,6 +988,7 @@ fn lock_deadline() {
                 party.online,
                 asset.asset_id.clone(),
                 recipient,
+                default_before_block(),
                 FEE_RATE,
                 MIN_CONFIRMATIONS,
                 PROXY_ENDPOINT.clone(),
@@ -984,6 +1078,7 @@ fn fail() {
         Online { id: 0 },
         s!(""),
         offline_recipient,
+        0,
         FEE_RATE,
         MIN_CONFIRMATIONS,
         PROXY_ENDPOINT.clone(),
@@ -1036,12 +1131,21 @@ fn fail() {
     zero_recipient.assignment = Assignment::Fungible(0);
     let result = party.mint_begin_result(party.online, &asset_bfa.asset_id, zero_recipient);
     assert_matches!(result, Err(Error::InvalidAmountZero));
+    // - check before_block: it has to leave a block for the lock after the latest one
+    let result = party.mint_begin_before_result(
+        party.online,
+        &asset_bfa.asset_id,
+        recipient.clone(),
+        evm_block_number() + 1,
+    );
+    assert_matches!(result, Err(Error::InvalidBeforeBlock { .. }));
     // - check fee_rate
     //   - low
     let result = party.wallet.mint_begin(
         party.online,
         asset_bfa.asset_id.clone(),
         recipient.clone(),
+        default_before_block(),
         0,
         MIN_CONFIRMATIONS,
         PROXY_ENDPOINT.clone(),
@@ -1052,6 +1156,7 @@ fn fail() {
         party.online,
         asset_bfa.asset_id.clone(),
         recipient.clone(),
+        default_before_block(),
         u64::MAX,
         MIN_CONFIRMATIONS,
         PROXY_ENDPOINT.clone(),
@@ -1206,6 +1311,7 @@ fn fail() {
             party.online,
             asset_bfa.asset_id.clone(),
             recipient,
+            default_before_block(),
             FEE_RATE,
             MIN_CONFIRMATIONS,
             PROXY_ENDPOINT.clone(),

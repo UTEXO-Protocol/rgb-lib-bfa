@@ -3053,12 +3053,12 @@ pub trait WalletOnline: WalletOffline {
                 let ExternalAnchor::MintEvent {
                     opid,
                     amount,
-                    before_block: after_block,
+                    before_block,
                 } = anchor;
                 paying_opids.contains(opid).then(|| ReceivedMint {
                     opid: opid.to_string(),
                     amount: *amount,
-                    after_block: *after_block,
+                    before_block: *before_block,
                     evm_chain_id: chain_id,
                     bridge_contract: address.to_string(),
                 })
@@ -3072,7 +3072,9 @@ pub trait WalletOnline: WalletOffline {
                 return Ok(None);
             };
             let evm_client = EvmClient::new(evm_rpc_url)?;
-            let anchor_resolver = match CheckedAnchorResolver::with(&evm_client, bridge_location) {
+            let mint_resolver = MintAnchorResolver::new(&evm_client);
+            let anchor_resolver = match CheckedAnchorResolver::with(&mint_resolver, bridge_location)
+            {
                 Ok(anchor_resolver) => anchor_resolver,
                 Err(AnchorResolverError::WrongChainId { expected, actual }) => {
                     warn!(
@@ -3107,8 +3109,26 @@ pub trait WalletOnline: WalletOffline {
             );
 
             // confirm each pending anchor that has a matching lock recorded by the bridge contract
-            // as of the latest finalized block of the external chain
-            let unconfirmed = resolve_anchors(&mut pending, &anchor_resolver, &anchors)?.len();
+            // as of the latest finalized block of the external chain, included before the block
+            // it commits to. A mint whose lock wasn't is refused right away, as it will never be
+            // confirmed
+            let unconfirmed =
+                match resolve_anchors(&mut pending, &anchor_resolver, &anchors, |opid| {
+                    mint_resolver.is_expired(opid)
+                }) {
+                    Ok(unconfirmed) => unconfirmed.len(),
+                    Err(e @ Error::MintEventExpired { .. }) => {
+                        error!(self.logger(), "{e}");
+                        return self.refuse_consignment(
+                            txn,
+                            &mode,
+                            &recipient_id,
+                            &recipient_seed,
+                            updated_batch_transfer,
+                        );
+                    }
+                    Err(e) => return Err(e),
+                };
 
             // a missing mint event doesn't make the consignment invalid, the event may simply
             // not have happened yet or not be finalized yet: keep the (cached)
@@ -5065,13 +5085,14 @@ pub trait WalletOnline: WalletOffline {
                         .iter()
                         .map(|r| r.assignment.main_amount())
                         .sum::<u64>();
-                    let after_block = transfer_info.after_block.ok_or_else(|| Error::Internal {
-                        details: s!("mint transfer is missing the external chain block"),
-                    })?;
+                    let before_block =
+                        transfer_info.before_block.ok_or_else(|| Error::Internal {
+                            details: s!("mint transfer is missing the external chain block"),
+                        })?;
                     asset_transition_builder = asset_transition_builder
                         .add_global_state(RGB_GLOBAL_ISSUED_SUPPLY, Amount::from(amount_to_mint))
                         .unwrap()
-                        .add_metadata(RGB_METADATA_BEFORE_BLOCK, BlockNumber::from(after_block))?;
+                        .add_metadata(RGB_METADATA_BEFORE_BLOCK, BlockNumber::from(before_block))?;
                 }
                 _ => {}
             }
@@ -6515,7 +6536,7 @@ pub trait WalletOnline: WalletOffline {
                     beneficiaries_blinded: vec![],
                     beneficiaries_witness: vec![],
                     burn_reason: None,
-                    after_block: None,
+                    before_block: None,
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -7025,7 +7046,7 @@ pub trait WalletOnline: WalletOffline {
             beneficiaries_blinded: vec![],
             beneficiaries_witness: vec![],
             burn_reason: None,
-            after_block: None,
+            before_block: None,
         };
         let receive_ids: Vec<String> = local_recipients
             .iter()
@@ -7204,7 +7225,7 @@ pub trait WalletOnline: WalletOffline {
             beneficiaries_blinded: vec![],
             beneficiaries_witness: vec![],
             burn_reason,
-            after_block: None,
+            before_block: None,
         };
         let receive_ids: Vec<String> = local_recipients
             .iter()
@@ -7305,6 +7326,7 @@ pub trait WalletOnline: WalletOffline {
         txn: &DbTxn,
         asset_id: String,
         recipient: Recipient,
+        before_block: u64,
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: String,
@@ -7386,17 +7408,22 @@ pub trait WalletOnline: WalletOffline {
         }
         local_recipients.push(local_recipient);
 
-        // the mint event can only follow the current external-chain block, since the lock
-        // commits to this operation's ID: commit that block to the transition so validators can
-        // bound their event query to it (see RGB_METADATA_BEFORE_BLOCK). The bound is the latest
-        // finalized block: validators refuse events at or below it, and no reorg can re-include
-        // the lock at or below a finalized block. The block is taken from an RPC endpoint checked
-        // to be on the bridge's chain: one from another chain could bound the query above the
-        // lock, making the mint unconfirmable
+        // the lock commits to this operation's ID, so it can only be included after the latest
+        // external chain block: refuse a block to commit to (see RGB_METADATA_BEFORE_BLOCK)
+        // leaving no block before it for the lock. The latest block is taken from an RPC endpoint
+        // checked to be on the bridge's chain, the block numbers of another chain being unrelated
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
         let (evm_client, _) = self.checked_evm_client(&stock, contract_id)?;
-        let after_block = evm_client.finalized_block_number()?;
-        debug!(self.logger(), "External chain block bound: {after_block}");
+        let latest_block = evm_client.block_number()?;
+        if before_block <= latest_block.saturating_add(1) {
+            return Err(Error::InvalidBeforeBlock {
+                details: format!(
+                    "the lock cannot be included before block {before_block}, the latest \
+                     external chain block being {latest_block}"
+                ),
+            });
+        }
+        debug!(self.logger(), "External chain block bound: {before_block}");
 
         let asset_info = AssetInfo {
             contract_id,
@@ -7415,7 +7442,7 @@ pub trait WalletOnline: WalletOffline {
             beneficiaries_blinded: vec![],
             beneficiaries_witness: vec![],
             burn_reason: None,
-            after_block: Some(after_block),
+            before_block: Some(before_block),
         };
         let receive_ids: Vec<String> = local_recipients
             .iter()
@@ -7498,7 +7525,7 @@ pub trait WalletOnline: WalletOffline {
             .iter()
             .map(|r| r.assignment.main_amount())
             .sum::<u64>();
-        let after_block = transfer_info.after_block.ok_or_else(|| Error::Internal {
+        let before_block = transfer_info.before_block.ok_or_else(|| Error::Internal {
             details: s!("mint transfer is missing the external chain block"),
         })?;
         let contract_id = transfer_info.asset_info.contract_id;
@@ -7518,7 +7545,7 @@ pub trait WalletOnline: WalletOffline {
         Ok(ReceivedMint {
             opid: opid.to_string(),
             amount,
-            after_block,
+            before_block,
             evm_chain_id: chain_id,
             bridge_contract: address.to_string(),
         })
@@ -7552,7 +7579,7 @@ pub trait WalletOnline: WalletOffline {
             details: format!("invalid mint operation ID: {e}"),
         })?;
         Ok(evm_client
-            .funds_in_inclusion(&address, &opid, mint.amount)?
+            .funds_in_inclusion(&address, &opid, mint.amount, mint.before_block)?
             .filter(|inclusion| inclusion.timestamp as i64 <= expiration)
             .map(|inclusion| inclusion.finalized))
     }
@@ -7641,8 +7668,9 @@ pub trait WalletOnline: WalletOffline {
         )
     }
 
-    // check the external chain carries a finalized lock event matching the mint in the given
-    // fascia, erroring with MintEventNotFound otherwise
+    // check the bridge contract records a finalized lock matching the mint in the given fascia,
+    // included before the block the mint commits to, erroring with MintEventNotFound if there's
+    // none yet and with MintEventExpired if there never will be
     fn check_mint_event(
         &self,
         txn: &DbTxn,
@@ -7665,15 +7693,16 @@ pub trait WalletOnline: WalletOffline {
             mint.opid,
             bridge_location
         );
-        let anchor = ExternalAnchor::MintEvent {
-            opid: OpId::from_str(&mint.opid).expect("valid opid"),
-            amount: mint.amount,
-            before_block: mint.after_block,
-        };
-        if !evm_client.is_confirmed(&bridge_location, &anchor)? {
-            return Err(Error::MintEventNotFound { opid: mint.opid });
+        let BridgeLocation::Evm(EvmContract { address, .. }) = bridge_location;
+        let opid = OpId::from_str(&mint.opid).expect("valid opid");
+        match evm_client.mint_lock_status(&address, &opid, mint.amount, mint.before_block)? {
+            MintLockStatus::Confirmed => Ok(()),
+            MintLockStatus::Pending => Err(Error::MintEventNotFound { opid: mint.opid }),
+            MintLockStatus::Expired => Err(Error::MintEventExpired {
+                opid: mint.opid,
+                before_block: mint.before_block,
+            }),
         }
-        Ok(())
     }
 
     fn mint_end_impl(&mut self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<OperationResult, Error> {

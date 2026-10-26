@@ -1565,7 +1565,13 @@ impl Wallet {
     /// the transaction anchoring the transfer for it to be considered final and move (while
     /// refreshing) to the [`TransferStatus::Settled`] status.
     ///
-    /// The deadline for the lock is the expiration of the recipient's invoice, which is also the
+    /// The lock has to be included on the external chain before the provided `before_block`, a
+    /// block of the external chain chosen by the caller (e.g. the bridge operator), which the mint
+    /// commits to: a lock included at or after it never confirms the mint, for anyone. It needs to
+    /// leave at least a block for the lock after the latest one, erroring with
+    /// [`Error::InvalidBeforeBlock`] otherwise.
+    ///
+    /// The deadline for the lock is also the expiration of the recipient's invoice, which is the
     /// expiration of the transfer: the lock has to be included on the external chain by then. If
     /// it is, the transfer is waited for past it, for the lock to be finalized, for up to 24
     /// hours; otherwise, once the deadline passes, the recipient is allowed to fail the transfer
@@ -1580,11 +1586,13 @@ impl Wallet {
     /// This doesn't require the wallet to have private keys.
     ///
     /// Returns a PSBT ready to be signed and operation details.
+    #[allow(clippy::too_many_arguments)]
     pub fn mint_begin(
         &mut self,
         online: Online,
         asset_id: String,
         recipient: Recipient,
+        before_block: u64,
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: String,
@@ -1596,6 +1604,7 @@ impl Wallet {
             &txn,
             asset_id,
             recipient,
+            before_block,
             fee_rate,
             min_confirmations,
             sender_transport_endpoint,
@@ -1631,7 +1640,9 @@ impl Wallet {
     /// chain of the asset's bridge contract, erroring with [`Error::EvmChainIdMismatch`]
     /// otherwise) that a lock of the minted amount committing to the mint operation (see
     /// [`MintDetails::opid`]) is already recorded by the bridge contract as of a finalized block,
-    /// erroring with [`Error::MintEventNotFound`] otherwise. This enforces the safe operation order: begin,
+    /// included before the block the mint commits to (see [`mint_begin`](Wallet::mint_begin)),
+    /// erroring with [`Error::MintEventNotFound`] otherwise, or with [`Error::MintEventExpired`]
+    /// if it never will be. This enforces the safe operation order: begin,
     /// lock on the external chain, wait for the lock to be final, then end.
     ///
     /// The TX is not broadcast once the deadline for the lock (the expiration of the recipient's

@@ -226,11 +226,11 @@ pub use crate::{
     utils::block_on,
 };
 
-#[cfg(feature = "_validation")]
-use std::cmp::max;
 use std::num::NonZeroU32;
 #[cfg(any(feature = "wallet", feature = "bitcoind_validation"))]
 use std::path::PathBuf;
+#[cfg(feature = "_validation")]
+use std::{cell::RefCell, cmp::max};
 #[cfg(feature = "_online")]
 use std::{cmp::Ordering, cmp::min, collections::hash_map::DefaultHasher, hash::Hasher};
 #[cfg(feature = "wallet")]
@@ -478,7 +478,10 @@ use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 #[cfg(feature = "_validation")]
-use crate::api::{evm::EvmClient, reject_list::RejectListClient};
+use crate::api::{
+    evm::{EvmClient, MintAnchorResolver, MintLockStatus},
+    reject_list::RejectListClient,
+};
 #[cfg(feature = "_validation")]
 use crate::error::IndexerError;
 #[cfg(feature = "bitcoind")]

@@ -1904,8 +1904,8 @@ pub struct ReceivedMint {
     pub opid: String,
     /// Amount minted, which the lock has to match
     pub amount: u64,
-    /// External chain block the lock has to follow
-    pub after_block: u64,
+    /// External chain block the lock has to be included before
+    pub before_block: u64,
     /// EIP-155 chain ID of the EVM chain the asset's bridge contract lives on
     pub evm_chain_id: u64,
     /// Address of the asset's bridge contract, where the lock has to be made
@@ -2151,7 +2151,7 @@ pub struct InfoAssetTransfer {
     pub beneficiaries_blinded: Vec<SecretSeal>,
     pub beneficiaries_witness: Vec<ExplicitSeal<RgbTxid>>,
     pub burn_reason: Option<BurnReason>,
-    pub after_block: Option<u64>,
+    pub before_block: Option<u64>,
 }
 
 impl InfoAssetTransfer {

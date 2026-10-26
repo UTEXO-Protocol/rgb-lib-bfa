@@ -20,6 +20,20 @@ const RPC_RETRY_PAUSE: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const RPC_RETRY_PAUSE: Duration = Duration::from_millis(10);
 
+/// The status of the lock confirming a mint, which has to be included on the external chain
+/// before the block the mint commits to (`before_block`), as recorded by the bridge contract as of
+/// the latest finalized block (see [`EvmClient::mint_lock_status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MintLockStatus {
+    /// The lock is recorded, included before `before_block`
+    Confirmed,
+    /// No lock is recorded yet, but one may still be included before `before_block`
+    Pending,
+    /// The lock is recorded, but not included before `before_block`, or none is and the blocks
+    /// before `before_block` are all finalized: the mint will never be confirmed
+    Expired,
+}
+
 /// JSON-RPC client for an EVM node.
 pub struct EvmClient {
     client: RestClient,
@@ -311,33 +325,48 @@ impl EvmClient {
         Ok(block_plus_one.checked_sub(1))
     }
 
-    /// Whether the lock of the mint of `amount` with operation `opid` is recorded by the bridge
-    /// contract at `contract` as of the latest finalized block.
-    fn funds_in_finalized(
+    /// The status of the lock of the mint of `amount` with operation `opid`, which has to be
+    /// included before `before_block`, as recorded by the bridge contract at `contract` as of the
+    /// latest finalized block.
+    pub(crate) fn mint_lock_status(
         &self,
         contract: &EvmAddress,
         opid: &OpId,
         amount: u64,
-    ) -> Result<bool, Error> {
+        before_block: u64,
+    ) -> Result<MintLockStatus, Error> {
         let finalized_block = self.finalized_block_number()?;
-        Ok(self
-            .funds_in_block(contract, opid, amount, finalized_block)?
-            .is_some())
+        Ok(
+            match self.funds_in_block(contract, opid, amount, finalized_block)? {
+                Some(block) if block < before_block => MintLockStatus::Confirmed,
+                Some(_) => MintLockStatus::Expired,
+                // a lock not recorded as of the finalized block can only be included after it
+                None if finalized_block.saturating_add(1) >= before_block => {
+                    MintLockStatus::Expired
+                }
+                None => MintLockStatus::Pending,
+            },
+        )
     }
 
-    /// Where the lock of the mint of `amount` with operation `opid` was included, finalized or
-    /// not, if any.
+    /// Where the lock of the mint of `amount` with operation `opid` was included before
+    /// `before_block`, finalized or not, if it was: a lock included at or after it doesn't confirm
+    /// the mint.
     #[cfg(feature = "_online")]
     pub(crate) fn funds_in_inclusion(
         &self,
         contract: &EvmAddress,
         opid: &OpId,
         amount: u64,
+        before_block: u64,
     ) -> Result<Option<FundsInInclusion>, Error> {
         // the finalized block is read first, so it cannot be past the latest one read after it
         let finalized_block = self.finalized_block_number()?;
         let latest_block = self.block_number()?;
-        let Some(block) = self.funds_in_block(contract, opid, amount, latest_block)? else {
+        let Some(block) = self
+            .funds_in_block(contract, opid, amount, latest_block)?
+            .filter(|block| *block < before_block)
+        else {
             return Ok(None);
         };
         Ok(Some(FundsInInclusion {
@@ -393,7 +422,7 @@ impl EvmClient {
     }
 
     /// Number of the latest block (`eth_blockNumber`).
-    fn block_number(&self) -> Result<u64, Error> {
+    pub(crate) fn block_number(&self) -> Result<u64, Error> {
         parse_block_number(&self.rpc::<_, String>("eth_blockNumber", NullRequest)?)
     }
 
@@ -604,16 +633,76 @@ impl ResolveAnchor for EvmClient {
     }
 
     /// Whether the bridge contract at `location` recorded a lock confirming `anchor`, as of the
-    /// latest finalized block: one of the anchor's amount committing to its operation ID.
+    /// latest finalized block: one of the anchor's amount committing to its operation ID, included
+    /// before the block the anchor commits to.
     fn is_confirmed(
         &self,
         location: &BridgeLocation,
         anchor: &ExternalAnchor,
     ) -> Result<bool, AnchorResolverError> {
         let BridgeLocation::Evm(EvmContract { address, .. }) = location;
-        let ExternalAnchor::MintEvent { opid, amount, .. } = anchor;
-        self.funds_in_finalized(address, opid, *amount)
-            .map_err(resolver_issue)
+        let ExternalAnchor::MintEvent {
+            opid,
+            amount,
+            before_block,
+        } = anchor;
+        let status = self
+            .mint_lock_status(address, opid, *amount, *before_block)
+            .map_err(resolver_issue)?;
+        Ok(status == MintLockStatus::Confirmed)
+    }
+}
+
+/// An anchor resolver over an [`EvmClient`] recording the mints that will never be confirmed,
+/// their lock not included before the block they commit to (see [`MintLockStatus::Expired`]).
+pub(crate) struct MintAnchorResolver<'a> {
+    client: &'a EvmClient,
+    /// Operation IDs of the mints that will never be confirmed
+    expired: RefCell<HashSet<OpId>>,
+}
+
+impl<'a> MintAnchorResolver<'a> {
+    pub(crate) fn new(client: &'a EvmClient) -> Self {
+        Self {
+            client,
+            expired: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Whether the mint with the given operation ID was found to never be confirmed.
+    ///
+    /// A mint that is not confirmed but not expired may still be, once its lock is made or
+    /// finalized.
+    pub(crate) fn is_expired(&self, opid: &OpId) -> bool {
+        self.expired.borrow().contains(opid)
+    }
+}
+
+impl ResolveAnchor for MintAnchorResolver<'_> {
+    fn evm_chain_id(&self) -> Result<u64, AnchorResolverError> {
+        self.client.evm_chain_id()
+    }
+
+    /// Whether `anchor` is confirmed, as [`EvmClient`] resolves it, recording it if it expired.
+    fn is_confirmed(
+        &self,
+        location: &BridgeLocation,
+        anchor: &ExternalAnchor,
+    ) -> Result<bool, AnchorResolverError> {
+        let BridgeLocation::Evm(EvmContract { address, .. }) = location;
+        let ExternalAnchor::MintEvent {
+            opid,
+            amount,
+            before_block,
+        } = anchor;
+        let status = self
+            .client
+            .mint_lock_status(address, opid, *amount, *before_block)
+            .map_err(resolver_issue)?;
+        if status == MintLockStatus::Expired {
+            self.expired.borrow_mut().insert(*opid);
+        }
+        Ok(status == MintLockStatus::Confirmed)
     }
 }
 
@@ -766,13 +855,25 @@ mod tests {
         data: &str,
         result: &str,
     ) -> mockito::Mock {
+        mock_eth_call_hits(server, block, data, result, 1)
+    }
+
+    /// Mock an `eth_call` at `block` with the given call `data`, expected `hits` times, returning
+    /// `result`.
+    fn mock_eth_call_hits(
+        server: &mut mockito::Server,
+        block: u64,
+        data: &str,
+        result: &str,
+        hits: usize,
+    ) -> mockito::Mock {
         server
             .mock("POST", "/")
             .match_body(mockito::Matcher::PartialJsonString(format!(
                 r#"{{"method":"eth_call","params":[{{"data":"{data}"}},"0x{block:x}"]}}"#
             )))
             .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,"result":"{result}"}}"#))
-            .expect(1)
+            .expect(hits)
             .create()
     }
 
@@ -1257,24 +1358,56 @@ mod tests {
     }
 
     #[test]
+    fn mint_lock_status() {
+        let contract = EvmAddress::default();
+        let opid = OpId::from([0u8; 32]);
+        // the status of the lock, with the given record as of the finalized block 0x20
+        let status = |record: u64, before_block: u64| {
+            let mut server = mockito::Server::new();
+            let _finalized = mock_finalized_block(&mut server, 0x20);
+            let call = mock_eth_call_at(
+                &mut server,
+                0x20,
+                &funds_in_call(0, 7),
+                &format!("0x{record:064x}"),
+            );
+            let status = EvmClient::new(&server.url())
+                .unwrap()
+                .mint_lock_status(&contract, &opid, 7, before_block)
+                .unwrap();
+            call.assert();
+            status
+        };
+
+        // a lock included in block 0x11 confirms the mint only if that's before the block
+        assert_eq!(status(0x12, 0x12), MintLockStatus::Confirmed);
+        assert_eq!(status(0x12, 0x11), MintLockStatus::Expired);
+        // with no lock recorded as of block 0x20, one may only be included from block 0x21
+        assert_eq!(status(0, 0x22), MintLockStatus::Pending);
+        assert_eq!(status(0, 0x21), MintLockStatus::Expired);
+        assert_eq!(status(0, 0x10), MintLockStatus::Expired);
+    }
+
+    #[test]
     fn is_confirmed_reads_finalized_record() {
         let location = BridgeLocation::Evm(EvmContract {
             chain_id: 31337,
             address: EvmAddress::default(),
         });
-        let anchor = |amount: u64| ExternalAnchor::MintEvent {
+        let anchor = |amount: u64, before_block: u64| ExternalAnchor::MintEvent {
             opid: OpId::from([0u8; 32]),
             amount,
-            before_block: 0x30,
+            before_block,
         };
         // the lock of 7 recorded in block 0x11, read as of the finalized block 0x20
         let mut server = mockito::Server::new();
         let _finalized = mock_finalized_block(&mut server, 0x20);
-        let record = mock_eth_call_at(
+        let record = mock_eth_call_hits(
             &mut server,
             0x20,
             &funds_in_call(0, 7),
             &format!("0x{:064x}", 0x12),
+            2,
         );
         let no_record = mock_eth_call_at(
             &mut server,
@@ -1283,9 +1416,11 @@ mod tests {
             &format!("0x{:064x}", 0),
         );
         let client = EvmClient::new(&server.url()).unwrap();
-        assert!(client.is_confirmed(&location, &anchor(7)).unwrap());
+        assert!(client.is_confirmed(&location, &anchor(7, 0x30)).unwrap());
         // the record is keyed by the amount too: another amount isn't confirmed
-        assert!(!client.is_confirmed(&location, &anchor(8)).unwrap());
+        assert!(!client.is_confirmed(&location, &anchor(8, 0x30)).unwrap());
+        // the lock has to be included before the block the anchor commits to
+        assert!(!client.is_confirmed(&location, &anchor(7, 0x11)).unwrap());
         record.assert();
         no_record.assert();
     }
@@ -1295,8 +1430,9 @@ mod tests {
     fn funds_in_inclusion() {
         let contract = EvmAddress::default();
         let opid = OpId::from([0u8; 32]);
-        // the record as of the latest block (0x10), with the finalized block 0x0c
-        let inclusion = |record: u64| {
+        // the record as of the latest block (0x10), with the finalized block 0x0c, for a mint
+        // committing to `before_block`
+        let inclusion = |record: u64, before_block: u64| {
             let mut server = mockito::Server::new();
             let _finalized = mock_finalized_block(&mut server, 0x0c);
             let _latest = mock_block_number(&mut server);
@@ -1325,16 +1461,16 @@ mod tests {
             );
             let inclusion = EvmClient::new(&server.url())
                 .unwrap()
-                .funds_in_inclusion(&contract, &opid, 7)
+                .funds_in_inclusion(&contract, &opid, 7, before_block)
                 .unwrap();
             call.assert();
             inclusion
         };
 
-        assert_eq!(inclusion(0), None);
+        assert_eq!(inclusion(0, 0x20), None);
         // included in the finalized block
         assert_eq!(
-            inclusion(0x0d),
+            inclusion(0x0d, 0x20),
             Some(FundsInInclusion {
                 timestamp: 0x64,
                 finalized: true,
@@ -1342,11 +1478,13 @@ mod tests {
         );
         // included after it
         assert_eq!(
-            inclusion(0x0e),
+            inclusion(0x0e, 0x20),
             Some(FundsInInclusion {
                 timestamp: 0x65,
                 finalized: false,
             })
         );
+        // included, but not before the block the mint commits to
+        assert_eq!(inclusion(0x0e, 0x0d), None);
     }
 }

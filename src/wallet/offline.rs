@@ -3126,10 +3126,11 @@ pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
     /// it, assuming the lock will be made, and refuses it unless it's valid, pays the invoice (the
     /// requested amount, if the invoice requests one) and none of its history is rejected. The
     /// returned details are what the lock has to match, for the mint to complete: its operation
-    /// ID and amount, the external chain block it has to follow and the bridge contract where to
-    /// make it. The lock has to be included on the external chain by the expiration of the invoice:
-    /// if it is, the transfer is waited for past the expiration, until the lock is finalized, for
-    /// up to 24 hours.
+    /// ID and amount, the external chain block it has to be included before and the bridge
+    /// contract where to make it. The lock also has to be included on the external chain by the
+    /// expiration of the invoice: if it is, the transfer is waited for past the expiration, until
+    /// the lock is finalized, for up to 24 hours. A mint whose lock wasn't included before the
+    /// block will never complete, so it's refused once that's known.
     ///
     /// Returns `None` if no mint checked by the wallet pays `recipient_id` (e.g. it hasn't been
     /// received or checked yet, or it has been refused or failed).

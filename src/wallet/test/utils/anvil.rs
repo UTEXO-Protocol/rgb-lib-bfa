@@ -387,3 +387,17 @@ pub(crate) fn evm_mine(blocks: u64) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Number of the latest block on anvil.
+pub(crate) fn evm_block_number() -> u64 {
+    let block = cast(&[s!("block-number")]);
+    block
+        .parse()
+        .unwrap_or_else(|e| panic!("could not parse block number from {block:?}: {e}"))
+}
+
+/// A block for a mint to commit to, leaving its lock [`MINT_LOCK_BLOCKS`] blocks after the latest
+/// one.
+pub(crate) fn default_before_block() -> u64 {
+    evm_block_number() + MINT_LOCK_BLOCKS
+}

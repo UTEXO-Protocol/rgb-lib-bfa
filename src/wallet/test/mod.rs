@@ -82,6 +82,10 @@ const ANVIL_CHAIN_ID: u64 = 31337;
 /// 32 slots
 #[cfg(feature = "electrum")]
 const EVM_FINALITY_DEPTH: u64 = 64;
+/// Blocks a mint leaves for its lock by default, after the latest one when it begins: more than any
+/// test mines
+#[cfg(feature = "electrum")]
+const MINT_LOCK_BLOCKS: u64 = 100_000;
 #[cfg(feature = "_online")]
 const TEST_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_srv"];
 const NOSRV_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_nosrv"];

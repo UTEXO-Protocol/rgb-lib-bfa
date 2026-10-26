@@ -260,6 +260,14 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided external chain block, before which the lock of a mint has to be included,
+    /// leaves no block for it
+    #[error("Invalid before block: {details}")]
+    InvalidBeforeBlock {
+        /// Error details
+        details: String,
+    },
+
     /// Keys derived from the provided data do not match
     #[error("Invalid bitcoin keys")]
     InvalidBitcoinKeys,
@@ -540,6 +548,16 @@ pub enum Error {
     MinFeeNotMet {
         /// TXID of the transfer having fee issues
         txid: String,
+    },
+
+    /// The lock of the mint operation was not included on the external chain before the block the
+    /// mint commits to, and never will be: the mint will never be confirmed
+    #[error("Mint event for operation {opid} not included before block {before_block}")]
+    MintEventExpired {
+        /// ID of the mint operation
+        opid: String,
+        /// External chain block the lock had to be included before
+        before_block: u64,
     },
 
     /// No confirmed mint event committing to the mint operation was found on the external chain

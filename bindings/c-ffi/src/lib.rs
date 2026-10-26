@@ -510,11 +510,13 @@ pub extern "C" fn rgblib_load_wallet(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn rgblib_mint_begin(
     wallet: &COpaqueStruct,
     online: *const c_char,
     asset_id: *const c_char,
     recipient: *const c_char,
+    before_block: *const c_char,
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
     sender_transport_endpoint: *const c_char,
@@ -524,6 +526,7 @@ pub extern "C" fn rgblib_mint_begin(
         online,
         asset_id,
         recipient,
+        before_block,
         fee_rate,
         min_confirmations,
         sender_transport_endpoint,

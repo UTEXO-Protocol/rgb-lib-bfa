@@ -605,7 +605,9 @@ pub(crate) fn esplora_config(indexer_url: &str) -> EsploraBuilder {
 /// they're confirmed on the chain the asset's bridge lives on, through the EVM RPC URL configured
 /// for its chain ID in `evm_rpc_urls` (EVM JSON-RPC endpoints by the EIP-155 chain ID of the
 /// chain they are connected to), reading the lock confirming each mint from the records the
-/// bridge contract keeps, as of the latest finalized block.
+/// bridge contract keeps, as of the latest finalized block. A mint whose lock wasn't included
+/// before the block it commits to will never be confirmed, and is reported as an
+/// [`Error::MintEventExpired`].
 ///
 /// When `min_confirmations` is provided, witnesses having less confirmations, and unconfirmed
 /// ones in any case (even with 0), are reported in a warning of the returned
@@ -687,8 +689,9 @@ pub fn validate_consignment(
 /// The anchor resolver is only needed if the consignment has external anchors, and the reject
 /// list resolver if the asset has a reject list: an [`Error::NoAnchorResolver`] or an
 /// [`Error::NoRejectListResolver`] is returned if a needed one isn't provided. It's up to the
-/// anchor resolver to only confirm a mint once its lock is final, and a mint it doesn't confirm is
-/// reported as an [`Error::MintEventNotFound`], whether or not it may still be confirmed.
+/// anchor resolver to only confirm a mint once its lock, included before the block the mint commits
+/// to, is final, and a mint it doesn't confirm is reported as an [`Error::MintEventNotFound`],
+/// whether or not it may still be confirmed.
 ///
 /// <div class="warning">This method is meant for special usage and is normally not needed, use
 /// it only if you know what you're doing</div>
@@ -974,7 +977,8 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
                     DynAnchorResolver(anchor_resolver),
                     bridge_location,
                 )?;
-                resolve_anchors(&mut pending, &anchor_resolver, &anchors)?
+                // a custom resolver doesn't tell an expired mint from one that may still be confirmed
+                resolve_anchors(&mut pending, &anchor_resolver, &anchors, |_| false)?
             }
             #[cfg(feature = "_validation")]
             AnchorResolution::Evm(evm_rpc_urls) => {
@@ -983,8 +987,11 @@ pub(crate) fn validate_consignment_internal<const TRANSFER: bool>(
                     chain_id: *chain_id,
                 })?;
                 let evm_client = EvmClient::new(evm_rpc_url)?;
-                let anchor_resolver = CheckedAnchorResolver::with(&evm_client, bridge_location)?;
-                resolve_anchors(&mut pending, &anchor_resolver, &anchors)?
+                let mint_resolver = MintAnchorResolver::new(&evm_client);
+                let anchor_resolver = CheckedAnchorResolver::with(&mint_resolver, bridge_location)?;
+                resolve_anchors(&mut pending, &anchor_resolver, &anchors, |opid| {
+                    mint_resolver.is_expired(opid)
+                })?
             }
         };
         if let Some(opid) = unconfirmed.first() {
@@ -1076,15 +1083,28 @@ pub(crate) fn pending_anchors<const TRANSFER: bool>(
 
 /// Confirm the given external anchors of the given pending consignment with the given anchor
 /// resolver, returning the operation IDs of the ones that are not confirmed (yet).
+///
+/// A mint the resolver reports as expired (see `is_expired`), its lock not included before the
+/// block it commits to, will never be confirmed: an [`Error::MintEventExpired`] is returned for
+/// it.
 pub(crate) fn resolve_anchors<const TRANSFER: bool, R: ResolveAnchor>(
     pending: &mut PendingConsignment<TRANSFER>,
     anchor_resolver: &CheckedAnchorResolver<R>,
     anchors: &[ExternalAnchor],
+    is_expired: impl Fn(&OpId) -> bool,
 ) -> Result<Vec<OpId>, Error> {
     let mut unconfirmed = vec![];
     for anchor in anchors {
+        let ExternalAnchor::MintEvent { before_block, .. } = anchor;
         match pending.resolve_anchor(anchor_resolver, anchor) {
             Ok(()) => {}
+            // tell a mint that will never be confirmed from one that may still be
+            Err(AnchorResolverError::Unconfirmed(opid)) if is_expired(&opid) => {
+                return Err(Error::MintEventExpired {
+                    opid: opid.to_string(),
+                    before_block: *before_block,
+                });
+            }
             Err(AnchorResolverError::Unconfirmed(opid)) => unconfirmed.push(opid),
             Err(e) => return Err(e.into()),
         }

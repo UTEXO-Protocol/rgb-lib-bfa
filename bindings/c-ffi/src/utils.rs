@@ -743,11 +743,13 @@ pub(crate) fn load_wallet(
     Ok(Wallet::load(&data_dir, &master_fingerprint, mnemonic)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mint_begin(
     wallet: &COpaqueStruct,
     online: *const c_char,
     asset_id: *const c_char,
     recipient: *const c_char,
+    before_block: *const c_char,
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
     sender_transport_endpoint: *const c_char,
@@ -756,6 +758,7 @@ pub(crate) fn mint_begin(
     let online = convert_online(online)?;
     let asset_id = ptr_to_string(asset_id);
     let recipient: Recipient = serde_json::from_str(&ptr_to_string(recipient))?;
+    let before_block = ptr_to_num(before_block)?;
     let fee_rate = ptr_to_num(fee_rate)?;
     let min_confirmations = ptr_to_num(min_confirmations)?;
     let sender_transport_endpoint = ptr_to_string(sender_transport_endpoint);
@@ -763,6 +766,7 @@ pub(crate) fn mint_begin(
         online,
         asset_id,
         recipient,
+        before_block,
         fee_rate,
         min_confirmations,
         sender_transport_endpoint,
