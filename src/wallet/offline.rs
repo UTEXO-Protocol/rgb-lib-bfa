@@ -1450,6 +1450,9 @@ pub trait WalletOffline: WalletBackup {
         colorings: &[DbColoring],
         txos: &[DbTxo],
     ) -> Result<(), Error> {
+        if txn.is_protected_sweep_batch(batch_transfer)? {
+            return Err(Error::CannotDeleteBatchTransfer);
+        }
         let mut txos_to_delete = HashSet::new();
         for asset_transfer in asset_transfers {
             txn.del_coloring(asset_transfer.idx)?;
@@ -1793,10 +1796,8 @@ pub trait WalletOffline: WalletBackup {
         let mut vanilla = self.get_btc_balance_for_keychain(KeychainKind::Internal)?;
         let colored = self.get_btc_balance_for_keychain(KeychainKind::External)?;
 
-        let reserved: HashSet<BdkOutPoint> = self
-            .get_reserved_vanilla_outpoints(txn)?
-            .into_iter()
-            .collect();
+        let reserved: HashSet<BdkOutPoint> =
+            self.get_reserved_bdk_outpoints(txn)?.into_iter().collect();
         if !reserved.is_empty() {
             let reserved_sum: u64 = self
                 .internal_unspents()
@@ -1999,11 +2000,10 @@ pub trait WalletOffline: WalletBackup {
         Ok(local_asset_data)
     }
 
-    fn get_reserved_vanilla_outpoints(&self, txn: &DbTxn) -> Result<Vec<BdkOutPoint>, Error> {
+    fn get_reserved_bdk_outpoints(&self, txn: &DbTxn) -> Result<Vec<BdkOutPoint>, Error> {
         Ok(txn
             .iter_reserved_txos()?
             .into_iter()
-            .filter(|r| r.reserved_for_vanilla.is_some())
             .map(BdkOutPoint::from)
             .collect())
     }
@@ -2023,7 +2023,7 @@ pub trait WalletOffline: WalletBackup {
             .into_iter()
             .map(BdkOutPoint::from)
             .collect();
-        outpoints.extend(self.get_reserved_vanilla_outpoints(txn)?);
+        outpoints.extend(self.get_reserved_bdk_outpoints(txn)?);
         Ok(outpoints)
     }
 
