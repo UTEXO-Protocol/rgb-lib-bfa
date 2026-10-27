@@ -57,62 +57,6 @@ pub fn check_indexer_url(
     Ok(indexer_config.protocol())
 }
 
-/// Validate the RGB consignment (transfer or contract) at the given path, without a wallet.
-///
-/// The witness transactions are resolved with the indexer described by `indexer_config`, which
-/// must be for the [`ValidationOptions::bitcoin_network`], except for the one with the
-/// [`ValidationOptions::offchain_txid`], which is taken from the consignment as it may not have
-/// been broadcast yet. If the consignment has external anchors (mint events of a BFA asset),
-/// they're confirmed on the chain the asset's bridge lives on, through the EVM RPC URL configured
-/// for its chain ID in [`ValidationOptions::evm_rpc_urls`].
-///
-/// When `min_confirmations` is provided, witnesses having less confirmations, and unconfirmed
-/// ones in any case (even with 0), are reported in a warning of the returned
-/// [`ConsignmentValidation`].
-/// Without it no witness is reported, whatever its status, see
-/// [`ConsignmentValidation::witnesses`].
-///
-/// An [`Error::ConsignmentValidationFailed`] is returned if the consignment is invalid.
-///
-/// The validation relies on the following trust assumptions:
-/// - the indexer is trusted to report the witness transactions and their status (including the
-///   block headers the SPV proofs carried by the consignment are checked against) correctly
-/// - the EVM RPC endpoints are trusted to report the mint events (and the finalized block) and
-///   the reject list entries correctly
-/// - the reject list server is trusted to serve the asset's reject list correctly
-/// - the witness transaction with the [`ValidationOptions::offchain_txid`] is accepted as it is in
-///   the consignment, without checking it against the chain: it may never be broadcast, or
-///   conflict with one that is
-///
-/// If the asset has a reject list, the consignment terminals are checked against it, as a wallet
-/// receiving them does: an [`Error::ConsignmentRejected`] is returned if any of them has a rejected
-/// opout along its history (unless an allowed one shields it). A reject list kept by an EVM
-/// contract is read through the EVM RPC URL configured for its chain ID in
-/// [`ValidationOptions::evm_rpc_urls`].
-pub fn validate_consignment(
-    consignment_path: &str,
-    indexer_config: &IndexerConfig,
-    min_confirmations: Option<u8>,
-    options: &ValidationOptions,
-) -> Result<ConsignmentValidation, Error> {
-    let (indexer, resolver) = get_indexer_and_resolver(indexer_config, options.bitcoin_network)?;
-    let safe_height = min_confirmations
-        .map(|min_confirmations| -> Result<_, Error> {
-            Ok(indexer
-                .get_latest_block_height()?
-                .saturating_sub(min_confirmations as u32)
-                + 1)
-        })
-        .transpose()?
-        .and_then(NonZeroU32::new);
-    validate_consignment_with_resolver(
-        consignment_path,
-        &ChainResolver { inner: &resolver },
-        safe_height,
-        options,
-    )
-}
-
 /// Parse and validate the [`OnlineOptions::proxy_auth_keys`], keying them by proxy URL.
 fn parse_proxy_auth_keys(
     proxy_auth_keys: &HashMap<String, String>,
@@ -1279,7 +1223,8 @@ pub trait WalletOnline: WalletOffline {
     ///
     /// Each endpoint is checked to be a working EVM JSON-RPC server on the chain it is
     /// configured for: one on another chain would report meaningless block numbers and events
-    /// for the bridges living on the configured one.
+    /// for the bridges living on the configured one. It is also checked to serve what confirming
+    /// mint events needs (see [`EvmClient::check_mint_support`]).
     fn check_evm_rpc_urls(
         &self,
         online_options: &OnlineOptions,
@@ -1298,6 +1243,7 @@ pub trait WalletOnline: WalletOffline {
                     actual,
                 });
             }
+            evm_client.check_mint_support()?;
             debug!(
                 self.logger(),
                 "EVM RPC endpoint for chain ID {chain_id}: {evm_rpc_url}"
@@ -1999,11 +1945,12 @@ pub trait WalletOnline: WalletOffline {
 
     fn get_url_reject_list(&self, reject_list_url: &str) -> Result<RejectList, Error> {
         let reject_list_client = RejectListClient::new(reject_list_url)?;
+        // invalid lines are counted and reported once, as a list can be made of them
         let (reject_list, invalid) = RejectList::parse(&reject_list_client.get_reject_list()?);
-        for line in invalid {
+        if invalid > 0 {
             warn!(
                 self.logger(),
-                "Ignoring invalid opout in reject list: {line}"
+                "Ignoring {invalid} invalid opout(s) in reject list"
             );
         }
         Ok(reject_list)
@@ -2113,7 +2060,6 @@ pub trait WalletOnline: WalletOffline {
             Some(witness_id),
             &self.blockchain_resolver(),
             self.evm_rpc_urls(),
-            None,
             &validation_config,
         )
         .map_err(|e| match e {
@@ -3127,23 +3073,28 @@ pub trait WalletOnline: WalletOffline {
                 return Ok(None);
             };
             let evm_client = EvmClient::new(evm_rpc_url)?;
-            let resuming_resolver = ResumingAnchorResolver::new(
+            // the mints are only scanned for within the same number of blocks for everyone, as
+            // their after_block is chosen by whoever created them; the ones in the history of the
+            // terminal one must also already be confirmed
+            let mint_resolver = MintAnchorResolver::new(
                 &evm_client,
+                &terminal_opids,
                 self.read_mint_scanned_blocks(&recipient_id)?,
+                max_mint_scan_blocks(),
             );
-            let anchor_resolver =
-                match CheckedAnchorResolver::with(&resuming_resolver, bridge_location) {
-                    Ok(anchor_resolver) => anchor_resolver,
-                    Err(AnchorResolverError::WrongChainId { expected, actual }) => {
-                        warn!(
-                            self.logger(),
-                            "Cannot resolve mint events: the EVM RPC endpoint configured for chain \
+            let anchor_resolver = match CheckedAnchorResolver::with(&mint_resolver, bridge_location)
+            {
+                Ok(anchor_resolver) => anchor_resolver,
+                Err(AnchorResolverError::WrongChainId { expected, actual }) => {
+                    warn!(
+                        self.logger(),
+                        "Cannot resolve mint events: the EVM RPC endpoint configured for chain \
                          ID {expected} is on chain ID {actual}, will retry"
-                        );
-                        return Ok(None);
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                    );
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            };
             // past its deadline (the invoice expiration), a mint is only waited for, and accepted,
             // if its lock was included by then (see mint_in_finality_grace)
             if let (Some(received_mint), Some(deadline)) =
@@ -3196,7 +3147,25 @@ pub trait WalletOnline: WalletOffline {
             for anchor in &anchors {
                 match pending.resolve_anchor(&anchor_resolver, anchor) {
                     Ok(()) => {}
-                    Err(AnchorResolverError::Unconfirmed(_)) => unconfirmed += 1,
+                    Err(AnchorResolverError::Unconfirmed(_)) => {
+                        let ExternalAnchor::MintEvent { opid, .. } = anchor;
+                        if mint_resolver.is_exhausted(opid) {
+                            error!(
+                                self.logger(),
+                                "Mint {opid} has no event within {} blocks from the one it \
+                                 commits to",
+                                max_mint_scan_blocks()
+                            );
+                            return self.refuse_consignment(
+                                txn,
+                                &mode,
+                                &recipient_id,
+                                &recipient_seed,
+                                updated_batch_transfer,
+                            );
+                        }
+                        unconfirmed += 1
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -3205,7 +3174,7 @@ pub trait WalletOnline: WalletOffline {
             // not have happened yet or not be finalized yet: keep the (cached)
             // consignment and try again at the next refresh, until the transfer expires
             if unconfirmed > 0 {
-                self.save_mint_scanned_blocks(&recipient_id, resuming_resolver.scanned_blocks())?;
+                self.save_mint_scanned_blocks(&recipient_id, mint_resolver.scanned_blocks())?;
                 // a mint is posted before its lock is made, so that its recipient can check it
                 // first: check it now (once), assuming the lock is there, so the user knows whether
                 // to make it, and what to lock (see get_received_mint)
@@ -5208,6 +5177,13 @@ pub trait WalletOnline: WalletOffline {
         batch: bool,
     ) -> Result<(), Error> {
         let consignment_path = self.get_send_consignment_path_impl(&asset_transfer_dir);
+        // media are identified per transfer by media_id, signing and encryption are deterministic,
+        // so the same digest yields idempotent media.post calls within a transfer.
+        let media_count = medias
+            .iter()
+            .map(|m| m.get_digest())
+            .collect::<HashSet<_>>()
+            .len();
         for recipient in recipients {
             let recipient_id = &recipient.recipient_id;
             if recipient.transport_endpoints.is_empty() {
@@ -5278,6 +5254,29 @@ pub trait WalletOnline: WalletOffline {
                 );
                 let proxy_client = ProxyClient::new(&proxy_url)?;
 
+                // skip a proxy that would refuse some of the media after the consignment is posted,
+                // or that doesn't tell how many it accepts (unreachable or invalid max_media)
+                if media_count > 0 {
+                    let max_media = proxy_client
+                        .get_info()
+                        .ok()
+                        .and_then(|res| res.result)
+                        .as_ref()
+                        .and_then(proxy_max_media);
+                    let Some(max_media) = max_media else {
+                        debug!(self.logger(), "Proxy {proxy_url} doesn't report max media");
+                        continue;
+                    };
+                    if media_count > max_media {
+                        debug!(
+                            self.logger(),
+                            "Proxy {proxy_url} accepts {max_media} media, {media_count} needed"
+                        );
+                        refusal = Some(Error::ProxyTooManyMedia);
+                        continue;
+                    }
+                }
+
                 match self.post_consignment_with_pow(&proxy_client, &consignment_data, post_path)? {
                     Ok(()) => {}
                     // the transfer cannot be created on this transport endpoint
@@ -5285,7 +5284,8 @@ pub trait WalletOnline: WalletOffline {
                         e @ (Error::InvoiceNotReserved
                         | Error::InvoiceExpired
                         | Error::InvoiceQuotaExceeded
-                        | Error::TransferIDDeleted),
+                        | Error::TransferIDDeleted
+                        | Error::ProxyDraining),
                     ) => {
                         refusal = Some(e);
                         continue;
@@ -7577,6 +7577,10 @@ pub trait WalletOnline: WalletOffline {
     }
 
     fn mint_end_impl(&mut self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<OperationResult, Error> {
+        // a mint ended again (e.g. retried after a crash) is completed only while it's still
+        // initiated: one that has failed (which released its inputs) or progressed must not be
+        // broadcast or brought back to waiting for confirmations
+        self.check_end_initiated(txn, signed_psbt)?;
         let (txid, transfer_dir, info_contents, fascia) =
             self.get_transfer_end_data(signed_psbt)?;
 
@@ -7584,18 +7588,6 @@ pub trait WalletOnline: WalletOffline {
         // and steps
         if !info_contents.is_operation(&TypeOfTransition::Mint) {
             return Err(Error::WrongOperation { txid });
-        }
-
-        // a mint ended again (e.g. retried after a crash) is completed only while it's still
-        // initiated: one that has failed (which released its inputs) or progressed must not be
-        // broadcast or brought back to waiting for confirmations
-        if let Some(existing) = txn
-            .get_batch_transfers_by_txid(&txid)?
-            .into_iter()
-            .find(|batch_transfer| !batch_transfer.incoming)
-            && existing.status != TransferStatus::Initiated
-        {
-            return Err(Error::CannotEndTransfer { txid });
         }
 
         // don't broadcast a mint that has expired: past its expiration the recipient is allowed

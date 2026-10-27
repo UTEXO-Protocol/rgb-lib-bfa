@@ -5171,12 +5171,13 @@ fn send_to_oneself_crash_no_dry_run() {
     );
 }
 
-/// A failed send, whose signed TX has been revoked on the sender proxy, cannot be ended again, as
-/// that would bring it back to waiting for the counterparty.
+/// A send ended again (e.g. retried after a crash) is completed only while it's still in progress:
+/// one that has failed (which revoked its signed TX on the sender proxy) or already progressed must
+/// not be brought back to waiting for the counterparty nor have its status changed.
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn send_end_after_fail() {
+fn send_end_after_fail_or_end() {
     initialize();
 
     let amount: u64 = 66;
@@ -5186,46 +5187,66 @@ fn send_end_after_fail() {
 
     let asset = party.issue_asset_nia(None);
 
-    let receive_data = rcv_party.blind_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: receive_data.recipient_id.clone(),
-            public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
-            encryption: Encryption::Optional,
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let begin = party
-        .wallet
-        .send_begin(
-            party.online,
-            recipient_map,
-            false,
-            FEE_RATE,
-            MIN_CONFIRMATIONS,
-            default_send_expiration(),
-            Some(PROXY_ENDPOINT.clone()),
-            false,
-        )
-        .unwrap();
-    let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    // begin a send and sign its PSBT
+    let begin = |party: &mut SinglesigParty, rcv_party: &mut SinglesigParty, donation: bool| {
+        let receive_data = rcv_party.blind_receive();
+        let recipient_map = HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            }],
+        )]);
+        let res = party
+            .wallet
+            .send_begin(
+                party.online,
+                recipient_map,
+                donation,
+                FEE_RATE,
+                MIN_CONFIRMATIONS,
+                default_send_expiration(),
+                Some(PROXY_ENDPOINT.clone()),
+                false,
+            )
+            .unwrap();
+        party.wallet.sign_psbt(res.psbt, None).unwrap()
+    };
+
+    // a failed send, whose signed TX has been revoked on the sender proxy, is not ended again
+    let signed_psbt = begin(&mut party, &mut rcv_party, false);
     let res = party
         .wallet
         .send_end(party.online, signed_psbt.clone())
         .unwrap();
-
-    // fail the send, revoking its signed TX on the sender proxy
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingCounterparty)
+    );
     assert!(party.fail_transfers_single(res.batch_transfer_idx));
     assert!(party.check_test_transfer_status_sender(&res.txid, TransferStatus::Failed));
-
-    // ending it again is refused and the send stays failed
     let result = party.wallet.send_end(party.online, signed_psbt);
     assert_matches!(result, Err(Error::CannotEndTransfer { txid }) if txid == res.txid);
     assert!(party.check_test_transfer_status_sender(&res.txid, TransferStatus::Failed));
+
+    // an ended donation (which has progressed to waiting for confirmations) is not ended again
+    let signed_psbt = begin(&mut party, &mut rcv_party, true);
+    let res = party
+        .wallet
+        .send_end(party.online, signed_psbt.clone())
+        .unwrap();
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingConfirmations)
+    );
+    let result = party.wallet.send_end(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::CannotEndTransfer { txid }) if txid == res.txid);
+    assert!(
+        party.check_test_transfer_status_sender(&res.txid, TransferStatus::WaitingConfirmations)
+    );
 }
 
 /// A send ended again after its operation has expired (e.g. retried after a crash, or completed
@@ -11675,4 +11696,186 @@ fn recipient_fails_unconfirmed_past_deadline() {
     let refreshed = &refresh_res[&receive_data.batch_transfer_idx];
     assert!(refreshed.failure.is_none());
     assert_eq!(refreshed.updated_status, Some(TransferStatus::Failed));
+}
+
+/// A draining proxy refuses the calls starting a new transfer (`-115`): the consignment is posted
+/// to another transport endpoint of the invoice if there is one, while an operation cannot start on
+/// a draining sender proxy.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_draining() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_nia(None);
+
+    let draining = Arc::new(AtomicBool::new(false));
+    let (server, _mock) = draining_proxy(draining.clone());
+    let draining_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    // invoices reserved before the proxy starts draining
+    let receive_data_1 =
+        rcv_party.blind_receive_with_endpoints(None, vec![draining_endpoint.clone()]);
+    let receive_data_2 = rcv_party.blind_receive_with_endpoints(
+        None,
+        vec![draining_endpoint.clone(), PROXY_ENDPOINT.clone()],
+    );
+    draining.store(true, Ordering::Relaxed);
+
+    let recipient_map = |receive_data: &ReceiveData, transport_endpoints: Vec<String>| {
+        HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::Fungible(amount),
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints,
+            }],
+        )])
+    };
+
+    // the only recipient proxy is draining: the consignment cannot be posted
+    let result = party.send_result(&recipient_map(
+        &receive_data_1,
+        vec![draining_endpoint.clone()],
+    ));
+    assert_matches!(result, Err(Error::ProxyDraining));
+
+    // the sender proxy is draining: the operation cannot start
+    let recipient_map_2 = recipient_map(
+        &receive_data_2,
+        vec![draining_endpoint.clone(), PROXY_ENDPOINT.clone()],
+    );
+    let result = party.wallet.send(
+        party.online,
+        recipient_map_2.clone(),
+        false,
+        FEE_RATE,
+        MIN_CONFIRMATIONS,
+        default_send_expiration(),
+        Some(draining_endpoint),
+    );
+    assert_matches!(result, Err(Error::ProxyDraining));
+
+    // the draining recipient proxy is skipped, the consignment is posted to the other one
+    let send_result = party.send_result(&recipient_map_2).unwrap();
+    let (transfer, _, _) = party.get_test_transfer_sender(&send_result.txid);
+    let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    assert_eq!(used_tte[0].1.endpoint, PROXY_URL);
+
+    // the transfer completes through it
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+    assert!(party.check_test_transfer_status_sender(
+        &send_result.txid,
+        TransferStatus::WaitingConfirmations
+    ));
+}
+
+/// A proxy accepting fewer media per transfer than the transfer has (`max_media`) is skipped before
+/// posting the consignment, trying the other transport endpoints of the invoice, as is one not
+/// advertising it; media with the same digest count once.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_max_media() {
+    initialize();
+
+    let image_str = ["tests", "qrcode.png"].join(MAIN_SEPARATOR_STR);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // UDA with 3 media but 2 distinct digests (the 2nd attachment is the same file as the media)
+    let asset = party.issue_asset_uda(Some(DETAILS), Some(FILE_STR), vec![&image_str, FILE_STR]);
+
+    let max_media = Arc::new(AtomicUsize::new(1));
+    let (server, _mock) = max_media_proxy(max_media.clone());
+    let mock_url = format!("http://{}/json-rpc", server.host_with_port());
+    let mock_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    let recipient_map = |receive_data: &ReceiveData, transport_endpoints: Vec<String>| {
+        HashMap::from([(
+            asset.asset_id.clone(),
+            vec![Recipient {
+                assignment: Assignment::NonFungible,
+                recipient_id: receive_data.recipient_id.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Encryption::Optional,
+                witness_data: None,
+                transport_endpoints,
+            }],
+        )])
+    };
+
+    // the only recipient proxy accepts too few media: the consignment cannot be posted
+    let receive_data_1 = rcv_party.blind_receive_with_endpoints(None, vec![mock_endpoint.clone()]);
+    let result = party.send_result(&recipient_map(&receive_data_1, vec![mock_endpoint.clone()]));
+    assert_matches!(result, Err(Error::ProxyTooManyMedia));
+
+    // the only recipient proxy doesn't advertise max_media: it's skipped as well
+    max_media.store(0, Ordering::Relaxed);
+    let result = party.send_result(&recipient_map(&receive_data_1, vec![mock_endpoint.clone()]));
+    assert_matches!(result, Err(Error::NoValidTransportEndpoint));
+    max_media.store(1, Ordering::Relaxed);
+
+    // the proxy accepting too few media is skipped, the consignment is posted to the other one
+    let endpoints = vec![mock_endpoint.clone(), PROXY_ENDPOINT.clone()];
+    let receive_data_2 = rcv_party.blind_receive_with_endpoints(None, endpoints.clone());
+    let send_result = party
+        .send_result(&recipient_map(&receive_data_2, endpoints))
+        .unwrap();
+    let (transfer, _, _) = party.get_test_transfer_sender(&send_result.txid);
+    let tte_data = party.db_transfer_transport_endpoints_data(transfer.idx);
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    assert_eq!(used_tte[0].1.endpoint, PROXY_URL);
+
+    // the transfer completes through it, with all the media
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::Settled
+    ));
+    let uda_assets = rcv_party.list_assets(&[AssetSchema::Uda]).uda.unwrap();
+    let token = uda_assets[0].token.as_ref().unwrap();
+    assert!(token.media.is_some());
+    assert_eq!(token.attachments.len(), 2);
+
+    // a proxy accepting exactly the distinct media of the transfer is used
+    max_media.store(2, Ordering::Relaxed);
+    let receive_data_3 = party.blind_receive_with_endpoints(None, vec![mock_endpoint.clone()]);
+    let send_result = rcv_party
+        .send_result(&recipient_map(&receive_data_3, vec![mock_endpoint]))
+        .unwrap();
+    let (transfer, _, _) = rcv_party.get_test_transfer_sender(&send_result.txid);
+    let tte_data = rcv_party.db_transfer_transport_endpoints_data(transfer.idx);
+    let used_tte: Vec<_> = tte_data.iter().filter(|(t, _)| t.used).collect();
+    assert_eq!(used_tte.len(), 1);
+    assert_eq!(used_tte[0].1.endpoint, mock_url);
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_recipient(
+        &receive_data_3.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
 }

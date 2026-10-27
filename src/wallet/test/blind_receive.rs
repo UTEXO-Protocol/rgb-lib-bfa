@@ -1237,3 +1237,35 @@ fn invoice_new() {
         ])
     );
 }
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn proxy_draining() {
+    initialize();
+
+    let mut rcv_party = get_funded_party!();
+
+    let (server, _mock) = draining_proxy(Arc::new(AtomicBool::new(true)));
+    let draining_endpoint = format!("rpc://{}/json-rpc", server.host_with_port());
+
+    // the invoice cannot be reserved on a draining proxy
+    let result = rcv_party.wallet.blind_receive(
+        Some(rcv_party.online),
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        vec![draining_endpoint.clone()],
+        MIN_CONFIRMATIONS,
+        None,
+    );
+    assert_matches!(result, Err(Error::ProxyDraining));
+
+    // a draining proxy is skipped, the invoice is reserved on the other ones
+    let receive_data = rcv_party
+        .blind_receive_with_endpoints(None, vec![draining_endpoint, PROXY_ENDPOINT.clone()]);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+}

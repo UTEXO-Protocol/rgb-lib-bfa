@@ -109,6 +109,7 @@ interface RgbLibError {
   MaxFeeExceeded(string txid);
   MinFeeNotMet(string txid);
   MintEventNotFound(string opid);
+  MintEventOutOfScanWindow(string opid, u64 max_scan_blocks);
   MultisigCannotMarkOperationProcessed(string details);
   MultisigCannotRespondToOperation(string details);
   MultisigHubService(string details);
@@ -139,6 +140,8 @@ interface RgbLibError {
   OutputBelowDustLimit();
   Proxy(string details);
   ProxyCannotChange(string details);
+  ProxyDraining();
+  ProxyTooManyMedia();
   ProxyTxAlreadyReleased();
   PsbtInspection(string details);
   RecipientIDAlreadyUsed();
@@ -416,7 +419,7 @@ dictionary AssignmentsCollection {
   u64 fungible;
   boolean non_fungible;
   u64 inflation;
-  u8 mint;
+  u64 mint;
 };
 
 dictionary InvoiceData {
@@ -960,7 +963,6 @@ dictionary ValidationOptions {
   BitcoinNetwork bitcoin_network;
   string? offchain_txid;
   record<u64, string> evm_rpc_urls;
-  u64? max_mint_scan_blocks;
 };
 
 dictionary ConsignmentValidation {

@@ -16,6 +16,14 @@ const REJECT_LIST_PAGE_SIZE: u64 = 1000;
 /// Providers bound the block range (or the number of results) of a single call, each with its
 /// own limit: a range the node refuses is halved and requested again.
 const LOGS_BLOCK_RANGE: u64 = 1000;
+/// Number of times a JSON-RPC request is sent again when it fails for a temporary reason (see
+/// [`EvmClient::post`])
+const RPC_RETRIES: u32 = 2;
+/// Pause before sending a JSON-RPC request again, multiplied by the number of the retry
+#[cfg(not(test))]
+const RPC_RETRY_PAUSE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const RPC_RETRY_PAUSE: Duration = Duration::from_millis(10);
 
 /// The outcome of a scan for the `FundsIn` event confirming a mint (see
 /// [`EvmClient::find_funds_in`]).
@@ -306,11 +314,13 @@ struct BlockHeader {
     /// Block number (hex).
     number: String,
     /// Block timestamp (hex, seconds since the Unix epoch).
+    #[cfg(feature = "_online")]
     #[serde(default)]
     timestamp: Option<String>,
 }
 
 /// Where a FundsIn event matching a mint was included on the external chain.
+#[cfg(feature = "_online")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FundsInInclusion {
     /// Timestamp of the block the event was included in.
@@ -352,6 +362,38 @@ impl EvmClient {
         }
     }
 
+    /// Post a JSON-RPC request, sending it again (up to [`RPC_RETRIES`] times, after a pause)
+    /// when it fails for a temporary reason: it cannot be sent (e.g. for a dropped connection or a
+    /// failed DNS lookup) or the node answering it is temporarily unavailable (HTTP 502, 503 or
+    /// 504). The requests of this client only read the chain, so they can be repeated.
+    ///
+    /// A timed out request is not sent again, as it already took long.
+    fn post(&self, body: &impl Serialize) -> Result<Response, Error> {
+        let mut retries = 0;
+        loop {
+            let res = self
+                .client
+                .post(&self.rpc_url)
+                .header(CONTENT_TYPE, JSON)
+                .json(body)
+                .send();
+            let temporary = match &res {
+                Ok(resp) => matches!(
+                    resp.status(),
+                    StatusCode::BAD_GATEWAY
+                        | StatusCode::SERVICE_UNAVAILABLE
+                        | StatusCode::GATEWAY_TIMEOUT
+                ),
+                Err(e) => !e.is_timeout() && !e.is_builder(),
+            };
+            if !temporary || retries == RPC_RETRIES {
+                return res.map_err(Self::req_err);
+            }
+            retries += 1;
+            std::thread::sleep(RPC_RETRY_PAUSE * retries);
+        }
+    }
+
     /// Fetch the `FundsIn` logs for `opid` emitted by `contract` from `from_block` to `to_block`
     /// (both included).
     ///
@@ -359,6 +401,11 @@ impl EvmClient {
     ///
     /// An error reported by the node (e.g. for a range exceeding the provider's limits) is
     /// returned apart from the other failures, so that the caller can retry with a smaller range.
+    /// Not when the HTTP status tells that the request is refused whatever its range (rate limited,
+    /// or not authorized, e.g. for blocks the provider plan doesn't cover): a smaller range would
+    /// only make more requests, so that's reported as a failure instead. An HTTP 413 (Payload Too
+    /// Large) is instead always returned as a refused range, whatever its body, which some
+    /// providers don't send as a JSON-RPC response.
     fn get_logs(
         &self,
         contract: &EvmAddress,
@@ -382,17 +429,33 @@ impl EvmClient {
             id: 1,
         };
 
-        let resp: RpcResponse<Vec<EvmLog>> = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json()
-            .map_err(Self::req_err)?;
+        let resp = self.post(&body)?;
+        let status = resp.status();
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            let text = resp.text().unwrap_or_default();
+            let details: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Ok(Err(RpcError {
+                code: status.as_u16().into(),
+                message: format!(
+                    "(HTTP {status}) {}",
+                    details.chars().take(200).collect::<String>()
+                ),
+            }));
+        }
+        let resp: RpcResponse<Vec<EvmLog>> = resp.json().map_err(Self::req_err)?;
 
         if let Some(err) = resp.error {
+            if matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ) {
+                return Err(Error::Network {
+                    details: format!(
+                        "eth_getLogs error {} (HTTP {status}): {}",
+                        err.code, err.message
+                    ),
+                });
+            }
             return Ok(Err(err));
         }
 
@@ -487,6 +550,7 @@ impl EvmClient {
 
     /// Where a FundsIn event confirming the mint of `amount` with operation `opid`, committing
     /// to `after_block`, was included, finalized or not, if any.
+    #[cfg(feature = "_online")]
     pub(crate) fn funds_in_inclusion(
         &self,
         contract: &EvmAddress,
@@ -516,6 +580,7 @@ impl EvmClient {
     }
 
     /// Timestamp of the block with the given number (`eth_getBlockByNumber`).
+    #[cfg(feature = "_online")]
     pub(crate) fn block_timestamp(&self, block: u64) -> Result<u64, Error> {
         let header: BlockHeader =
             self.rpc("eth_getBlockByNumber", (format!("0x{block:x}"), false))?;
@@ -537,15 +602,7 @@ impl EvmClient {
             params,
             id: 1,
         };
-        let resp: RpcResponse<R> = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json()
-            .map_err(Self::req_err)?;
+        let resp: RpcResponse<R> = self.post(&body)?.json().map_err(Self::req_err)?;
 
         if let Some(err) = resp.error {
             return Err(Error::Network {
@@ -622,6 +679,13 @@ impl EvmClient {
                 details: s!("reject list shorter at the latest block than at the finalized one"),
             });
         }
+        if len > MAX_REJECT_LIST_ENTRIES {
+            return Err(Error::Network {
+                details: format!(
+                    "reject list too long: {len} entries, at most {MAX_REJECT_LIST_ENTRIES} supported"
+                ),
+            });
+        }
         let mut entries = vec![];
         let mut start = 0;
         while start < len {
@@ -666,15 +730,8 @@ impl EvmClient {
             params: ("finalized", false),
             id: 1,
         };
-        let resp: RpcResponse<Option<BlockHeader>> = self
-            .client
-            .post(&self.rpc_url)
-            .header(CONTENT_TYPE, JSON)
-            .json(&body)
-            .send()
-            .map_err(Self::req_err)?
-            .json()
-            .map_err(Self::req_err)?;
+        let resp: RpcResponse<Option<BlockHeader>> =
+            self.post(&body)?.json().map_err(Self::req_err)?;
 
         if let Some(err) = resp.error {
             return Err(Error::Network {
@@ -686,6 +743,36 @@ impl EvmClient {
             details: s!("the node reports no finalized block"),
         })?;
         parse_block_number(&header.number)
+    }
+
+    /// Check that the node serves what confirming mint events needs, failing with an
+    /// [`Error::InvalidEvmRpcUrl`] if it doesn't: the latest finalized block, since events are
+    /// only accepted once finalized, and the logs of any block, since a mint in the history of a
+    /// received asset can have its event in any block after its bridge was deployed.
+    ///
+    /// The logs of the genesis block are requested to check the latter: some nodes (e.g. on the
+    /// free plans of some providers) only serve the logs of recent blocks, which would make the
+    /// confirmation of an older mint fail later, when receiving an asset.
+    #[cfg(feature = "_online")]
+    pub(crate) fn check_mint_support(&self) -> Result<(), Error> {
+        self.finalized_block_number()
+            .map_err(|e| Error::InvalidEvmRpcUrl {
+                details: format!("cannot get the latest finalized block: {e}"),
+            })?;
+        let logs_error = |details: String| Error::InvalidEvmRpcUrl {
+            details: format!(
+                "cannot get the logs of the oldest blocks, an endpoint serving the whole log \
+                 history is needed: {details}"
+            ),
+        };
+        match self.get_logs(&EvmAddress::default(), &OpId::from([0u8; 32]), 0, 0) {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(logs_error(format!(
+                "eth_getLogs error {}: {}",
+                err.code, err.message
+            ))),
+            Err(e) => Err(logs_error(e.to_string())),
+        }
     }
 
     /// EIP-155 chain ID of the chain the node is connected to (`eth_chainId`).
@@ -740,22 +827,35 @@ impl ResolveAnchor for EvmClient {
 }
 
 /// An anchor resolver over an [`EvmClient`] scanning for each mint event only the given number of
-/// blocks after the one the anchor commits to (`after_block`), if a limit is given.
+/// blocks after the one the anchor commits to (`after_block`).
 ///
 /// The `after_block` of an anchor is chosen by whoever created the mint, so without a limit a
 /// consignment can make the scan go through the whole chain (e.g. with `after_block` set to 0).
 pub(crate) struct BoundedAnchorResolver<'a> {
     client: &'a EvmClient,
-    /// Maximum number of blocks to scan after `after_block`, if any
-    max_scan_blocks: Option<u64>,
+    /// Maximum number of blocks to scan after `after_block`
+    max_scan_blocks: u64,
+    /// Operation IDs of the mints whose event was not found in any of the blocks within the
+    /// limit, all of them finalized
+    exhausted: RefCell<HashSet<OpId>>,
 }
 
 impl<'a> BoundedAnchorResolver<'a> {
-    pub(crate) fn new(client: &'a EvmClient, max_scan_blocks: Option<u64>) -> Self {
+    pub(crate) fn new(client: &'a EvmClient, max_scan_blocks: u64) -> Self {
         Self {
             client,
             max_scan_blocks,
+            exhausted: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Whether the event confirming the mint with the given operation ID was not found in any of
+    /// the blocks within the limit, all of them finalized, so it will never be found within it.
+    ///
+    /// A mint that is not confirmed but not exhausted may still be, once more blocks within the
+    /// limit get finalized.
+    pub(crate) fn is_exhausted(&self, opid: &OpId) -> bool {
+        self.exhausted.borrow().contains(opid)
     }
 }
 
@@ -770,9 +870,6 @@ impl ResolveAnchor for BoundedAnchorResolver<'_> {
         location: &BridgeLocation,
         anchor: &ExternalAnchor,
     ) -> Result<bool, AnchorResolverError> {
-        let Some(max_scan_blocks) = self.max_scan_blocks else {
-            return self.client.is_confirmed(location, anchor);
-        };
         let BridgeLocation::Evm(EvmContract { address, .. }) = location;
         let ExternalAnchor::MintEvent {
             opid,
@@ -783,8 +880,8 @@ impl ResolveAnchor for BoundedAnchorResolver<'_> {
             .client
             .finalized_block_number()
             .map_err(resolver_issue)?;
-        let last_block =
-            std::cmp::min(finalized_block, after_block.saturating_add(max_scan_blocks));
+        let limit_block = after_block.saturating_add(self.max_scan_blocks);
+        let last_block = std::cmp::min(finalized_block, limit_block);
         let confirming_block = self
             .client
             .find_funds_in_block(
@@ -797,6 +894,9 @@ impl ResolveAnchor for BoundedAnchorResolver<'_> {
                 LOGS_BLOCK_RANGE,
             )
             .map_err(resolver_issue)?;
+        if confirming_block.is_none() && last_block == limit_block {
+            self.exhausted.borrow_mut().insert(*opid);
+        }
         Ok(confirming_block.is_some())
     }
 }
@@ -804,17 +904,33 @@ impl ResolveAnchor for BoundedAnchorResolver<'_> {
 /// An anchor resolver over an [`EvmClient`] resuming the scan for each mint event after the last
 /// finalized block a previous scan covered without finding it, and recording how far each scan
 /// got, so that a mint waited for across refreshes doesn't have its blocks scanned again.
+///
+/// As with a [`BoundedAnchorResolver`], each mint event is only scanned for the given number of
+/// blocks after the one the anchor commits to (`after_block`).
+#[cfg(feature = "_online")]
 pub(crate) struct ResumingAnchorResolver<'a> {
     client: &'a EvmClient,
     /// Last finalized block scanned without finding the event, by mint operation ID
     scanned_blocks: RefCell<HashMap<OpId, u64>>,
+    /// Maximum number of blocks to scan after `after_block`
+    max_scan_blocks: u64,
+    /// Operation IDs of the mints whose event was not found in any of the blocks within the
+    /// limit, all of them finalized
+    exhausted: RefCell<HashSet<OpId>>,
 }
 
+#[cfg(feature = "_online")]
 impl<'a> ResumingAnchorResolver<'a> {
-    pub(crate) fn new(client: &'a EvmClient, scanned_blocks: HashMap<OpId, u64>) -> Self {
+    pub(crate) fn new(
+        client: &'a EvmClient,
+        scanned_blocks: HashMap<OpId, u64>,
+        max_scan_blocks: u64,
+    ) -> Self {
         Self {
             client,
             scanned_blocks: RefCell::new(scanned_blocks),
+            max_scan_blocks,
+            exhausted: RefCell::new(HashSet::new()),
         }
     }
 
@@ -822,14 +938,22 @@ impl<'a> ResumingAnchorResolver<'a> {
     pub(crate) fn scanned_blocks(&self) -> HashMap<OpId, u64> {
         self.scanned_blocks.borrow().clone()
     }
+
+    /// Whether the event confirming the mint with the given operation ID was not found in any of
+    /// the blocks within the limit, all of them finalized, so it will never be found within it.
+    pub(crate) fn is_exhausted(&self, opid: &OpId) -> bool {
+        self.exhausted.borrow().contains(opid)
+    }
 }
 
+#[cfg(feature = "_online")]
 impl ResolveAnchor for ResumingAnchorResolver<'_> {
     fn evm_chain_id(&self) -> Result<u64, AnchorResolverError> {
         self.client.evm_chain_id()
     }
 
-    /// Whether `anchor` is confirmed, as [`EvmClient`] resolves it, resuming its scan.
+    /// Whether `anchor` is confirmed, as [`EvmClient`] resolves it, resuming its scan, within the
+    /// scan limit.
     fn is_confirmed(
         &self,
         location: &BridgeLocation,
@@ -849,26 +973,102 @@ impl ResolveAnchor for ResumingAnchorResolver<'_> {
             .get(opid)
             .copied()
             .unwrap_or(*after_block);
-        let scan = self
+        let finalized_block = self
             .client
-            .find_funds_in(
+            .finalized_block_number()
+            .map_err(resolver_issue)?;
+        let limit_block = after_block.saturating_add(self.max_scan_blocks);
+        let last_block = std::cmp::min(finalized_block, limit_block);
+        let confirming_block = self
+            .client
+            .find_funds_in_block(
                 address,
                 opid,
                 *amount,
                 *after_block,
-                scanned_block,
+                max(scanned_block, *after_block),
+                last_block,
                 LOGS_BLOCK_RANGE,
             )
             .map_err(resolver_issue)?;
-        Ok(match scan {
-            FundsInScan::Confirmed => true,
-            FundsInScan::NotFound { finalized_block } => {
-                self.scanned_blocks
-                    .borrow_mut()
-                    .insert(*opid, finalized_block);
-                false
-            }
-        })
+        if confirming_block.is_some() {
+            return Ok(true);
+        }
+        self.scanned_blocks
+            .borrow_mut()
+            .insert(*opid, max(scanned_block, last_block));
+        if last_block == limit_block {
+            self.exhausted.borrow_mut().insert(*opid);
+        }
+        Ok(false)
+    }
+}
+
+/// An anchor resolver over an [`EvmClient`] for the mints of a received consignment: terminal
+/// mints resumed, history mints not, all of them within the same scan limit.
+///
+/// The ones paying the recipient (the terminal ones) may still be waited for, so their scan is
+/// resumed across refreshes by a [`ResumingAnchorResolver`]. The ones in their history must
+/// already be confirmed, so they're resolved by a [`BoundedAnchorResolver`] instead. Both only
+/// scan the same number of blocks after the one the anchor commits to (`after_block`), which is
+/// chosen by whoever created the mint.
+#[cfg(feature = "_online")]
+pub(crate) struct MintAnchorResolver<'a> {
+    terminal: ResumingAnchorResolver<'a>,
+    history: BoundedAnchorResolver<'a>,
+    /// Operation IDs of the terminal mints
+    terminal_opids: &'a HashSet<OpId>,
+}
+
+#[cfg(feature = "_online")]
+impl<'a> MintAnchorResolver<'a> {
+    pub(crate) fn new(
+        client: &'a EvmClient,
+        terminal_opids: &'a HashSet<OpId>,
+        scanned_blocks: HashMap<OpId, u64>,
+        max_scan_blocks: u64,
+    ) -> Self {
+        Self {
+            terminal: ResumingAnchorResolver::new(client, scanned_blocks, max_scan_blocks),
+            history: BoundedAnchorResolver::new(client, max_scan_blocks),
+            terminal_opids,
+        }
+    }
+
+    /// The last finalized block scanned without finding the event, by terminal mint operation ID.
+    pub(crate) fn scanned_blocks(&self) -> HashMap<OpId, u64> {
+        self.terminal.scanned_blocks()
+    }
+
+    /// Whether the event confirming the mint with the given operation ID will never be found
+    /// within the scan limit (see [`BoundedAnchorResolver::is_exhausted`]).
+    pub(crate) fn is_exhausted(&self, opid: &OpId) -> bool {
+        if self.terminal_opids.contains(opid) {
+            self.terminal.is_exhausted(opid)
+        } else {
+            self.history.is_exhausted(opid)
+        }
+    }
+}
+
+#[cfg(feature = "_online")]
+impl ResolveAnchor for MintAnchorResolver<'_> {
+    fn evm_chain_id(&self) -> Result<u64, AnchorResolverError> {
+        self.terminal.evm_chain_id()
+    }
+
+    /// Whether `anchor` is confirmed, resolved as a terminal or as a history mint.
+    fn is_confirmed(
+        &self,
+        location: &BridgeLocation,
+        anchor: &ExternalAnchor,
+    ) -> Result<bool, AnchorResolverError> {
+        let ExternalAnchor::MintEvent { opid, .. } = anchor;
+        if self.terminal_opids.contains(opid) {
+            self.terminal.is_confirmed(location, anchor)
+        } else {
+            self.history.is_confirmed(location, anchor)
+        }
     }
 }
 
@@ -1034,9 +1234,9 @@ mod tests {
     fn mock_block_number(server: &mut mockito::Server) -> mockito::Mock {
         server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
-                "jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1,
-            })))
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}"#.to_string(),
+            ))
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x10"}"#)
             .create()
     }
@@ -1223,6 +1423,35 @@ mod tests {
     }
 
     #[test]
+    fn reject_list_entries_too_long() {
+        // a list longer than supported is refused before reading any page
+        let mut server = mockito::Server::new();
+        let _block_number = mock_block_number(&mut server);
+        let _finalized_block = mock_finalized_block(&mut server, 8);
+        let _finalized_length = mock_eth_call_at(&mut server, 8, REJECT_LIST_LENGTH_SELECTOR, "0x");
+        let length = mock_eth_call(
+            &mut server,
+            REJECT_LIST_LENGTH_SELECTOR,
+            &format!("0x{:064x}", MAX_REJECT_LIST_ENTRIES + 1),
+        );
+        let entries = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"params":[{{"data":"{REJECT_LIST_ENTRIES_SELECTOR}"}}]}}"#
+            )))
+            .expect(0)
+            .create();
+        let client = EvmClient::new(&server.url()).unwrap();
+        let result = client.reject_list_entries(&EvmAddress::default());
+        assert!(
+            matches!(result, Err(Error::Network { ref details }) if details.contains("reject list too long")),
+            "{result:?}"
+        );
+        length.assert();
+        entries.assert();
+    }
+
+    #[test]
     fn reject_list_entries_not_a_contract() {
         // calling an address with no code returns no data: refused, not taken as an empty list
         let mut server = mockito::Server::new();
@@ -1324,9 +1553,9 @@ mod tests {
         let mut server = mockito::Server::new();
         let mock = server
             .mock("POST", "/")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
-                "jsonrpc": "2.0", "method": "eth_chainId", "params": [], "id": 1,
-            })))
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#.to_string(),
+            ))
             .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x7a69"}"#)
             .expect(2)
             .create();
@@ -1347,6 +1576,61 @@ mod tests {
                 "eth_chainId error -32601: not found"
             )))
         );
+    }
+
+    #[test]
+    fn post_retries() {
+        let chain_id_mock = |server: &mut mockito::Server, status: usize, hits: usize| {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJsonString(
+                    r#"{"method":"eth_chainId"}"#.to_string(),
+                ))
+                .with_status(status)
+                .with_body(r#"{"jsonrpc":"2.0","id":1,"result":"0x7a69"}"#)
+                .expect(hits)
+                .create()
+        };
+
+        // a node temporarily unavailable is asked again
+        for status in [502, 503, 504] {
+            let mut server = mockito::Server::new();
+            let unavailable = chain_id_mock(&mut server, status, RPC_RETRIES as usize);
+            let available = chain_id_mock(&mut server, 200, 1);
+            let client = EvmClient::new(&server.url()).unwrap();
+            assert_eq!(client.chain_id().unwrap(), 31337);
+            unavailable.assert();
+            available.assert();
+        }
+
+        // up to RPC_RETRIES times, then its answer is handled as any other
+        let mut server = mockito::Server::new();
+        let unavailable = server
+            .mock("POST", "/")
+            .with_status(503)
+            .with_body("<html>503 Service Temporarily Unavailable</html>")
+            .expect(RPC_RETRIES as usize + 1)
+            .create();
+        let client = EvmClient::new(&server.url()).unwrap();
+        assert!(matches!(client.chain_id(), Err(Error::Network { .. })));
+        unavailable.assert();
+
+        // other errors are not retried
+        let mut server = mockito::Server::new();
+        let refused = chain_id_mock(&mut server, 500, 1);
+        let client = EvmClient::new(&server.url()).unwrap();
+        client.chain_id().unwrap();
+        refused.assert();
+
+        // a request that cannot be sent is sent again, then reported
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = EvmClient::new(&url).unwrap();
+        let start = std::time::Instant::now();
+        assert!(matches!(client.chain_id(), Err(Error::Network { .. })));
+        let pauses: u32 = (1..=RPC_RETRIES).sum();
+        assert!(start.elapsed() >= RPC_RETRY_PAUSE * pauses);
     }
 
     #[test]
@@ -1382,9 +1666,9 @@ mod tests {
                 let mut server = mockito::Server::new();
                 let mock = server
                     .mock("POST", "/")
-                    .match_body(mockito::Matcher::Json(serde_json::json!({
-                        "jsonrpc": "2.0", "method": method, "params": [], "id": 1,
-                    })))
+                    .match_body(mockito::Matcher::JsonString(format!(
+                        r#"{{"jsonrpc":"2.0","method":"{method}","params":[],"id":1}}"#,
+                    )))
                     .with_body(body)
                     .expect(1)
                     .create();
@@ -1609,6 +1893,7 @@ mod tests {
         ranges.iter().for_each(|r| r.assert());
     }
 
+    #[cfg(feature = "_online")]
     #[test]
     fn resuming_resolver() {
         let opid = OpId::from([0u8; 32]);
@@ -1631,11 +1916,12 @@ mod tests {
             mock_get_logs(&mut server, 1017, 1020, NO_LOGS, 1),
         ];
         let client = EvmClient::new(&server.url()).unwrap();
-        let resolver = ResumingAnchorResolver::new(&client, HashMap::new());
+        let resolver = ResumingAnchorResolver::new(&client, HashMap::new(), 100_000);
         assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
         ranges.iter().for_each(|r| r.assert());
         let scanned_blocks = resolver.scanned_blocks();
         assert_eq!(scanned_blocks, HashMap::from([(opid, 1020)]));
+        assert!(!resolver.is_exhausted(&opid));
 
         // a later resolution resumes after it, until the event is found
         let mut server = mockito::Server::new();
@@ -1648,9 +1934,144 @@ mod tests {
             1,
         )];
         let client = EvmClient::new(&server.url()).unwrap();
-        let resolver = ResumingAnchorResolver::new(&client, scanned_blocks);
+        let resolver = ResumingAnchorResolver::new(&client, scanned_blocks.clone(), 100_000);
         assert!(resolver.is_confirmed(&location, &anchor).unwrap());
         ranges.iter().for_each(|r| r.assert());
+
+        // a scan resumed only covers the blocks within the limit: with no event in them, all
+        // finalized, the mint is exhausted
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 2000);
+        let ranges = [mock_get_logs(&mut server, 1021, 1026, NO_LOGS, 1)];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = ResumingAnchorResolver::new(&client, scanned_blocks.clone(), 1010);
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert_eq!(resolver.scanned_blocks(), HashMap::from([(opid, 1026)]));
+        assert!(resolver.is_exhausted(&opid));
+
+        // as it is when resuming after the limit, with no more blocks to scan
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 2000);
+        let get_logs = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"method":"eth_getLogs"}"#.to_string(),
+            ))
+            .expect(0)
+            .create();
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = ResumingAnchorResolver::new(&client, scanned_blocks, 10);
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        get_logs.assert();
+        assert_eq!(resolver.scanned_blocks(), HashMap::from([(opid, 1020)]));
+        assert!(resolver.is_exhausted(&opid));
+    }
+
+    #[cfg(feature = "_online")]
+    #[test]
+    fn bounded_resolver() {
+        let opid = OpId::from([0u8; 32]);
+        let location = BridgeLocation::Evm(EvmContract {
+            chain_id: 31337,
+            address: EvmAddress::default(),
+        });
+        let anchor = ExternalAnchor::MintEvent {
+            opid,
+            amount: 7,
+            after_block: 16,
+        };
+
+        // the scan stops at the limit, even if more blocks are finalized: with no event within it,
+        // the mint is exhausted
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let ranges = [mock_get_logs(&mut server, 17, 26, NO_LOGS, 1)];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = BoundedAnchorResolver::new(&client, 10);
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert!(resolver.is_exhausted(&opid));
+
+        // with a limit past the finalized block, the scan stops at the finalized block: the event
+        // may still be in a later block within the limit, so the mint is not exhausted
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 20);
+        let ranges = [mock_get_logs(&mut server, 17, 20, NO_LOGS, 1)];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = BoundedAnchorResolver::new(&client, 10);
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert!(!resolver.is_exhausted(&opid));
+
+        // an event within the limit confirms the mint
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let ranges = [mock_get_logs(
+            &mut server,
+            17,
+            26,
+            &format!(r#""result":[{}]"#, funds_in_log(7, 26)),
+            1,
+        )];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = BoundedAnchorResolver::new(&client, 10);
+        assert!(resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert!(!resolver.is_exhausted(&opid));
+    }
+
+    #[cfg(feature = "_online")]
+    #[test]
+    fn mint_resolver() {
+        let opid = OpId::from([0u8; 32]);
+        let location = BridgeLocation::Evm(EvmContract {
+            chain_id: 31337,
+            address: EvmAddress::default(),
+        });
+        let anchor = ExternalAnchor::MintEvent {
+            opid,
+            amount: 7,
+            after_block: 16,
+        };
+
+        // a terminal mint is scanned resuming after the scanned block, up to the finalized one
+        // while within the limit, then it's exhausted
+        let terminal_opids = HashSet::from([opid]);
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let ranges = [mock_get_logs(&mut server, 1001, 1020, NO_LOGS, 1)];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = MintAnchorResolver::new(
+            &client,
+            &terminal_opids,
+            HashMap::from([(opid, 1000)]),
+            2000,
+        );
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert_eq!(resolver.scanned_blocks(), HashMap::from([(opid, 1020)]));
+        assert!(!resolver.is_exhausted(&opid));
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let ranges = [mock_get_logs(&mut server, 17, 26, NO_LOGS, 1)];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let resolver = MintAnchorResolver::new(&client, &terminal_opids, HashMap::new(), 10);
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert!(resolver.is_exhausted(&opid));
+
+        // a history mint is scanned up to the limit only, and exhausted with no event within it
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 1020);
+        let ranges = [mock_get_logs(&mut server, 17, 26, NO_LOGS, 1)];
+        let client = EvmClient::new(&server.url()).unwrap();
+        let terminal_opids = HashSet::from([OpId::from([1u8; 32])]);
+        let resolver = MintAnchorResolver::new(&client, &terminal_opids, HashMap::new(), 10);
+        assert!(!resolver.is_confirmed(&location, &anchor).unwrap());
+        ranges.iter().for_each(|r| r.assert());
+        assert!(resolver.scanned_blocks().is_empty());
+        assert!(resolver.is_exhausted(&opid));
     }
 
     #[test]
@@ -1688,6 +2109,54 @@ mod tests {
         ));
         refused.assert();
         ranges.iter().for_each(|r| r.assert());
+
+        // a range refused with an HTTP 413 is halved too, whatever the answer body
+        let mut server = mockito::Server::new();
+        let _finalized = mock_finalized_block(&mut server, 24);
+        let refused = server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJsonString(format!(
+                r#"{{"method":"eth_getLogs","params":[{{"fromBlock":"0x{:x}","toBlock":"0x{:x}"}}]}}"#,
+                17, 24
+            )))
+            .with_status(413)
+            .with_body("<html>413 Request Entity Too Large</html>")
+            .expect(1)
+            .create();
+        let ranges =
+            [(17, 20), (21, 24)].map(|(from, to)| mock_get_logs(&mut server, from, to, NO_LOGS, 1));
+        let client = EvmClient::new(&server.url()).unwrap();
+        assert!(matches!(
+            client.find_funds_in(&address, &opid, 7, 16, 16, 8).unwrap(),
+            FundsInScan::NotFound { .. }
+        ));
+        refused.assert();
+        ranges.iter().for_each(|r| r.assert());
+
+        // a request refused whatever its range (rate limited, or not authorized) is reported
+        // right away, without halving the range
+        for status in [429, 401, 403] {
+            let mut server = mockito::Server::new();
+            let _finalized = mock_finalized_block(&mut server, 32);
+            let refused = server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJsonString(
+                    r#"{"method":"eth_getLogs"}"#.to_string(),
+                ))
+                .with_status(status)
+                .with_body(
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32011,"message":"limited"}}"#,
+                )
+                .expect(1)
+                .create();
+            let client = EvmClient::new(&server.url()).unwrap();
+            let result = client.find_funds_in(&address, &opid, 7, 16, 16, 8);
+            assert!(
+                matches!(result, Err(Error::Network { ref details }) if details.starts_with("eth_getLogs error -32011 (HTTP")),
+                "{result:?}"
+            );
+            refused.assert();
+        }
 
         // a single block refused too is reported, with the node's error
         let mut server = mockito::Server::new();

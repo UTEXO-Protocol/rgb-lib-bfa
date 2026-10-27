@@ -833,6 +833,73 @@ fn evm_rpc_urls() {
     ));
     assert!(party.wallet.online_data().is_none());
 
+    // endpoints on the right chain not serving what confirming mint events needs
+    let mock_endpoint = |finalized: &str, logs: &str| {
+        let mut server = mockito::Server::new();
+        let rpc_mock = |server: &mut mockito::Server, method: &str, body: &str| {
+            server
+                .mock("POST", "/")
+                .match_body(mockito::Matcher::PartialJsonString(format!(
+                    r#"{{"method":"{method}"}}"#
+                )))
+                .with_body(format!(r#"{{"jsonrpc":"2.0","id":1,{body}}}"#))
+                .create()
+        };
+        let mocks = [
+            rpc_mock(
+                &mut server,
+                "eth_chainId",
+                &format!(r#""result":"0x{ANVIL_CHAIN_ID:x}""#),
+            ),
+            rpc_mock(&mut server, "eth_getBlockByNumber", finalized),
+            rpc_mock(&mut server, "eth_getLogs", logs),
+        ];
+        (server, mocks)
+    };
+    let finalized = r#""result":{"number":"0x10"}"#;
+    // no finalized block
+    let (server, _mocks) = mock_endpoint(
+        r#""error":{"code":-32602,"message":"invalid block tag"}"#,
+        r#""result":[]"#,
+    );
+    let result = party.wallet.go_online(options_with_urls(HashMap::from([(
+        ANVIL_CHAIN_ID,
+        server.url(),
+    )])));
+    assert!(matches!(
+        result,
+        Err(Error::InvalidEvmRpcUrl { ref details })
+            if details.starts_with("cannot get the latest finalized block")
+    ));
+    // only the logs of recent blocks
+    let (server, _mocks) = mock_endpoint(
+        finalized,
+        r#""error":{"code":-32602,"message":"Archive requests require a personal token"}"#,
+    );
+    let result = party.wallet.go_online(options_with_urls(HashMap::from([(
+        ANVIL_CHAIN_ID,
+        server.url(),
+    )])));
+    assert!(matches!(
+        result,
+        Err(Error::InvalidEvmRpcUrl { ref details })
+            if details.starts_with("cannot get the logs of the oldest blocks")
+                && details.ends_with("Archive requests require a personal token")
+    ));
+    // serving both
+    let (server, _mocks) = mock_endpoint(finalized, r#""result":[]"#);
+    party
+        .wallet
+        .go_online(options_with_urls(HashMap::from([(
+            ANVIL_CHAIN_ID,
+            server.url(),
+        )])))
+        .unwrap();
+    assert_eq!(
+        party.wallet.online_data().as_ref().unwrap().evm_rpc_urls,
+        HashMap::from([(ANVIL_CHAIN_ID, server.url())])
+    );
+
     // no endpoints: going online works, mint operations will need one
     let online = party
         .wallet

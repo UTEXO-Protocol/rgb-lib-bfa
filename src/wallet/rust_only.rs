@@ -46,117 +46,8 @@ pub fn load_fascia(path: &Path) -> Result<Fascia, Error> {
     read_fascia(path)
 }
 
-/// Validate the RGB consignment (transfer or contract) at the given path, without a wallet,
-/// resolving its witness transactions with the provided resolver, which must be for the
-/// [`ValidationOptions::bitcoin_network`].
-///
-/// This works like [`validate_consignment`], which uses the indexer it's given: the witness with
-/// the [`ValidationOptions::offchain_txid`] is taken from the consignment, as it may not have been
-/// broadcast yet, external anchors are confirmed through the [`ValidationOptions::evm_rpc_urls`]
-/// and the terminals are checked against the asset's reject list (if any). When `safe_height` is provided, witnesses mined above it
-/// (including unconfirmed ones) are reported in a warning. The same trust assumptions apply, with
-/// the provided resolver trusted in place of the indexer.
-///
-/// <div class="warning">This method is meant for special usage and is normally not needed, use
-/// it only if you know what you're doing</div>
-#[cfg(feature = "_online")]
-pub fn validate_consignment_with_resolver(
-    consignment_path: &str,
-    resolver: &dyn ResolveWitness,
-    safe_height: Option<NonZeroU32>,
-    options: &ValidationOptions,
-) -> Result<ConsignmentValidation, Error> {
-    check_file_exists(consignment_path)?;
-    let offchain_witness_id = options
-        .offchain_txid
-        .as_deref()
-        .map(|txid| RgbTxid::from_str(txid).map_err(|_| Error::InvalidTxid))
-        .transpose()?;
-    match UniversalFile::load_file(consignment_path) {
-        Ok(UniversalFile::Transfer(consignment)) => validate_loaded_consignment(
-            &consignment,
-            resolver,
-            safe_height,
-            offchain_witness_id,
-            options,
-        ),
-        Ok(UniversalFile::Contract(consignment)) => validate_loaded_consignment(
-            &consignment,
-            resolver,
-            safe_height,
-            offchain_witness_id,
-            options,
-        ),
-        _ => Err(Error::InvalidConsignment),
-    }
-}
-
-/// Validate the given consignment, see [`validate_consignment_with_resolver`], then check its
-/// terminals against the reject list of its asset (if any).
-#[cfg(feature = "_online")]
-fn validate_loaded_consignment<const TRANSFER: bool>(
-    consignment: &Consignment<TRANSFER>,
-    resolver: &dyn ResolveWitness,
-    safe_height: Option<NonZeroU32>,
-    offchain_witness_id: Option<RgbTxid>,
-    options: &ValidationOptions,
-) -> Result<ConsignmentValidation, Error> {
-    // a TXID matching no witness would silently fall back to the resolver
-    if let Some(witness_id) = offchain_witness_id
-        && !consignment
-            .bundled_witnesses()
-            .any(|bw| bw.witness_id() == witness_id)
-    {
-        return Err(Error::OffchainTxidNotFound {
-            txid: witness_id.to_string(),
-        });
-    }
-
-    let asset_schema = AssetSchema::try_from(consignment.schema_id())?;
-    let validation_config = ValidationConfig {
-        chain_net: options.bitcoin_network.into(),
-        build_opouts_dag: asset_schema.supports_reject_list(),
-        safe_height,
-    };
-    let valid_consignment = validate_consignment_internal(
-        consignment,
-        offchain_witness_id,
-        resolver,
-        &options.evm_rpc_urls,
-        options.max_mint_scan_blocks,
-        &validation_config,
-    )?;
-
-    // the reject list is a genesis global, so it can be read off the consignment
-    if let Some(source) = genesis_reject_list_source(asset_schema, consignment.genesis())? {
-        let reject_list = match &source {
-            RejectListSource::Url(url) => {
-                RejectList::parse(&RejectListClient::new(url)?.get_reject_list()?).0
-            }
-            RejectListSource::Evm(contract) => RejectList::from_evm(
-                &checked_evm_client(&options.evm_rpc_urls, contract.chain_id)?,
-                &contract.address,
-            )?,
-        };
-        let dag_data = valid_consignment
-            .validation_status()
-            .dag_data_opt
-            .as_ref()
-            .expect("build_opouts_dag is set for schemas supporting a reject list");
-        let rejected = rejected_opouts(dag_data, &reject_list, &terminal_opouts(consignment))?;
-        if !rejected.is_empty() {
-            let mut opouts: Vec<String> = rejected.iter().map(|o| o.to_string()).collect();
-            opouts.sort();
-            return Err(Error::ConsignmentRejected { opouts });
-        }
-    }
-
-    Ok(ConsignmentValidation::new(
-        &valid_consignment,
-        safe_height,
-        offchain_witness_id,
-    ))
-}
+#[cfg(feature = "validation")]
+pub use crate::no_wallet::validate_consignment_with_resolver;
 
 /// Rust-only APIs of the wallet.
 impl Wallet {
@@ -388,7 +279,12 @@ impl Wallet {
         Ok(transfers)
     }
 
-    /// Create consignments for a PSBT created with the [`send_begin`](Wallet::send_begin) method.
+    /// Create consignments for a PSBT created with the
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`send_begin`](Wallet::send_begin) method."
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -453,7 +349,6 @@ impl Wallet {
             Some(witness_id),
             &self.blockchain_resolver(),
             self.evm_rpc_urls(),
-            None,
             &validation_config,
         ) {
             Ok(consignment) => consignment,
@@ -600,7 +495,6 @@ impl Wallet {
             Some(witness_id),
             &self.blockchain_resolver(),
             self.evm_rpc_urls(),
-            None,
             &validation_config,
         )?;
         let valid_contract = valid_transfer.clone().into_valid_contract();
@@ -730,8 +624,11 @@ impl Wallet {
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
 
+        self.check_end_initiated(&txn, &psbt)?;
         let (txid, transfer_dir, info_contents, _) = self.get_transfer_end_data(&psbt)?;
-        if !info_contents.is_operation(&TypeOfTransition::Transfer) {
+        // the data must be of a donation send: another operation (including a non-donation send)
+        // would be completed skipping its checks and steps
+        if !info_contents.is_operation(&TypeOfTransition::Transfer) || !info_contents.donation {
             return Err(Error::WrongOperation { txid });
         }
 

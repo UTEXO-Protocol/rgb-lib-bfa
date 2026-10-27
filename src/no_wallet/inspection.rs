@@ -1,7 +1,7 @@
-//! Inspection.
+//! Consignment inspection.
 //!
-//! This module defines the objects returned when inspecting RGB data and the inspection methods
-//! that don't require a wallet.
+//! This module defines the consignment inspection, which doesn't require a wallet, and the objects
+//! it returns, some of which are shared with wallet methods (e.g. the PSBT inspection ones).
 
 use super::*;
 
@@ -168,13 +168,11 @@ pub enum BundleFilter {
 /// the given filter.
 ///
 /// Inputs are resolved from the consignment history, outputs report whether they're allocated to
-/// the consignment recipient. Unless the file is a validated consignment, the witness transactions
-/// are verified to commit to the inspected transitions. This doesn't validate the consignment: a
-/// successful inspection doesn't mean the consignment is valid nor that its witness transactions
-/// have been broadcast.
-///
-/// <div class="warning">A validated consignment file is trusted to have been validated, so only
-/// provide one produced locally (e.g. by a wallet that received the consignment)</div>
+/// the consignment recipient. The witness transactions are verified to commit to the inspected
+/// transitions, and the transitions their inputs are resolved from to have the operation ID they
+/// are referred to by, also for a validated consignment file. This doesn't validate the
+/// consignment: a successful inspection doesn't mean the consignment is valid nor that its witness
+/// transactions have been broadcast.
 pub fn inspect_consignment(
     consignment_path: String,
     bundle_filter: BundleFilter,
@@ -191,19 +189,16 @@ pub fn inspect_consignment(
     };
 
     let inspection = match UniversalFile::load_file(&consignment_path) {
-        Ok(UniversalFile::Transfer(consignment)) => {
-            consignment_inspection(&consignment, selected, true)
-        }
-        Ok(UniversalFile::Contract(consignment)) => {
-            consignment_inspection(&consignment, selected, true)
-        }
+        Ok(UniversalFile::Transfer(consignment)) => consignment_inspection(&consignment, selected),
+        Ok(UniversalFile::Contract(consignment)) => consignment_inspection(&consignment, selected),
         Ok(UniversalFile::SchemaDefinition(_)) => Err(Error::InvalidConsignment),
-        // validated consignments have their own file type
+        // validated consignments have their own file type, but they're checked as any other: the
+        // file doesn't prove it has been validated
         Err(LoadError::InvalidMagic) => {
             if let Ok(consignment) = ValidTransfer::load_file(&consignment_path) {
-                consignment_inspection(&consignment, selected, false)
+                consignment_inspection(&consignment, selected)
             } else if let Ok(consignment) = ValidContract::load_file(&consignment_path) {
-                consignment_inspection(&consignment, selected, false)
+                consignment_inspection(&consignment, selected)
             } else {
                 Err(Error::InvalidConsignment)
             }
@@ -223,30 +218,39 @@ pub fn inspect_consignment(
 
 /// Build the inspection details of a consignment, inspecting the bundles selected by the given
 /// function (called with their witness TXID and whether they contain terminals) and checking the
-/// witness transactions commit to the inspected transitions if requested (not needed for a
-/// validated consignment).
+/// witness transactions commit to the inspected transitions.
 fn consignment_inspection<const TRANSFER: bool>(
     consignment: &Consignment<TRANSFER>,
     selected: impl Fn(Txid, bool) -> bool,
-    check_commitments: bool,
 ) -> Result<ConsignmentInspection, Error> {
     let contract_id = consignment.contract_id();
     let asset_schema = AssetSchema::from_schema_id(consignment.schema_id())?;
     let genesis = genesis_info(contract_id, asset_schema, &consignment.genesis)?;
 
-    // index the operations whose assignments can be spent by consignment transitions
+    // index the operations whose assignments can be spent by consignment transitions. Inputs refer
+    // to them by operation ID, so only the transitions having the ID they're listed with are
+    // indexed (a different one would make inputs show assignments they don't spend), and an
+    // operation in more than one bundle is refused (it's not clear which witness spends it)
     let genesis_id = consignment.genesis.id();
-    let transitions: HashMap<OpId, (&Transition, Txid)> = consignment
-        .bundles
-        .iter()
-        .flat_map(|wb| {
-            let witness_id = wb.witness_id();
-            wb.bundle
-                .known_transitions
-                .iter()
-                .map(move |KnownTransition { opid, transition }| (*opid, (transition, witness_id)))
-        })
-        .collect();
+    let mut transitions: HashMap<OpId, (&Transition, Txid)> = HashMap::new();
+    for witness_bundle in consignment.bundles.iter() {
+        let witness_id = witness_bundle.witness_id();
+        for KnownTransition { opid, transition } in witness_bundle.bundle.known_transitions.iter() {
+            if transition.id() != *opid {
+                continue;
+            }
+            if let Some((_, other_witness_id)) = transitions.insert(*opid, (transition, witness_id))
+                && other_witness_id != witness_id
+            {
+                return Err(Error::RgbInspection {
+                    details: format!(
+                        "transition {opid} in the bundles of witnesses {other_witness_id} and \
+                         {witness_id}"
+                    ),
+                });
+            }
+        }
+    }
     // get the spent outpoint and assignment of a transition input
     let resolve_input = |opout: Opout| -> Option<(OutPoint, Assignment)> {
         if opout.op == genesis_id {
@@ -282,9 +286,7 @@ fn consignment_inspection<const TRANSFER: bool>(
                 .map_err(|e| Error::RgbInspection {
                     details: format!("bundle {bundle_id} not committed by witness {txid}: {e}"),
                 })?;
-        if check_commitments {
-            verify_witness_commitment(&anchor.dbc_proof, &commitment, tx)?;
-        }
+        verify_witness_commitment(&anchor.dbc_proof, &commitment, tx)?;
 
         let terminal_seals: HashSet<SecretSeal> = terminal_seals
             .map(|seals| seals.into_iter().map(|s| s.to_secret_seal()).collect())
@@ -295,7 +297,7 @@ fn consignment_inspection<const TRANSFER: bool>(
             consignment.genesis.chain_net,
             &witness_bundle.bundle,
             tx,
-            check_commitments,
+            true,
             resolve_input,
             |_| None,
             |seal| Some(terminal_seals.contains(&seal.to_secret_seal())),
@@ -318,16 +320,6 @@ fn consignment_inspection<const TRANSFER: bool>(
         genesis,
         witnesses,
     })
-}
-
-/// Check the file at the given path exists.
-pub(crate) fn check_file_exists(file_path: &str) -> Result<(), Error> {
-    if !Path::new(file_path).exists() {
-        return Err(Error::InvalidFilePath {
-            file_path: file_path.to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// Verify the witness transaction commits to the given MPC commitment with the given DBC proof.
@@ -679,14 +671,14 @@ mod tests {
         std::fs::write(&file_path, b"not a consignment").unwrap();
         let result =
             inspect_consignment(file_path.to_string_lossy().to_string(), BundleFilter::All);
-        assert!(matches!(result, Err(Error::InvalidConsignment)));
+        assert_matches!(result, Err(Error::InvalidConsignment));
 
         // invalid witness TXID
         let result = inspect_consignment(
             file_path.to_string_lossy().to_string(),
             BundleFilter::Witness("invalid".to_string()),
         );
-        assert!(matches!(result, Err(Error::InvalidTxid)));
+        assert_matches!(result, Err(Error::InvalidTxid));
     }
 
     #[test]
@@ -725,18 +717,18 @@ mod tests {
 
         // type defined by the schema but not supported by rgb-lib
         let result = outputs(AssetSchema::Ifa, OS_LINK);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::RgbInspection { details })
                 if details == format!("ctx: currently unsupported assignment type: {OS_LINK}")
-        ));
+        );
 
         // type unknown to the schema
         let result = outputs(AssetSchema::Nia, OS_LINK);
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(Error::RgbInspection { details })
                 if details == format!("ctx: unknown assignment type: {OS_LINK}")
-        ));
+        );
     }
 }

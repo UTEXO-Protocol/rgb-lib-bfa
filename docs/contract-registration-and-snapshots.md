@@ -85,6 +85,7 @@ restore interface. Raw archive creation is not proof of full Lightning recovery.
 ```sh
 cargo test --locked --lib --no-default-features --features wallet -- --test-threads=1
 cargo test --locked --lib --no-default-features --features wallet,bitcoind migration_prerequisites -- --test-threads=1
+cargo test --locked --lib --no-default-features --features validation -- --test-threads=1
 ```
 
 The prerequisite tests use fresh private wallets and the supplied public contract.
@@ -92,3 +93,19 @@ They require no chain, proxy, bridge, VSS server or hosted-service operation. Th
 second command additionally checks persisted proxy operation-secret mutations.
 Funded flows, real VSS transport/restore, platform artifacts and app acceptance are
 separate integration scopes.
+
+## Current BFA branch integration
+
+The migration branch merges BFA source `4b78c2285b7e9d719dd5b465d186b2fe8ad6450b`
+without rewriting its earlier tested commits. It retains upstream's wallet-less
+inspection/validation split, EVM finality and retry handling, reject-list bounds,
+and updated dependency graph. Contract registration stays available with `wallet`
+alone; the schema rules it needs are also available to wallet-less `validation`.
+The no-argument EVM request fix still sends `params: []` through upstream's shared
+RPC/retry path. The snapshot token and archive-admission boundaries are unchanged.
+
+Linux/macOS CI checks formatting, offline wallet/import/snapshot regressions,
+online-capable import/snapshot and mock EVM tests, and wallet-less validation.
+Dependent repositories must pin this merged source explicitly and update their
+Cargo graphs; this source integration does not replace previously qualified
+native binaries or establish qualification for the new graph.

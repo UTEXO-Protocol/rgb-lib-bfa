@@ -1286,6 +1286,8 @@ pub trait WalletOffline: WalletBackup {
             let invoice_id = invoice_id(&recipient_id, &recipient_pk);
             let reservation_expiration = expiration_timestamp.to_string();
             let mut reserved = false;
+            // whether a proxy refused the reservation as it is draining
+            let mut draining = false;
             for endpoint in &endpoints {
                 // skip endpoints that are unreachable or run an unsupported protocol version
                 let Ok(info) = check_proxy(endpoint) else {
@@ -1318,15 +1320,21 @@ pub trait WalletOffline: WalletBackup {
                                 Some(max(retention_deadline.unwrap_or(deadline), deadline));
                         }
                     }
-                    Ok(res) => {
+                    Ok(res) => match map_proxy_error(res.error.unwrap()) {
+                        // a draining proxy, the invoice can be reserved on the other ones
+                        Error::ProxyDraining => draining = true,
                         // a definite proxy-side rejection (e.g. invoice already reserved) is fatal
-                        return Err(map_proxy_error(res.error.unwrap()));
-                    }
+                        e => return Err(e),
+                    },
                     Err(_) => continue,
                 }
             }
             if !reserved {
-                return Err(Error::NoValidTransportEndpoint);
+                return Err(if draining {
+                    Error::ProxyDraining
+                } else {
+                    Error::NoValidTransportEndpoint
+                });
             }
         }
 

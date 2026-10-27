@@ -7,20 +7,6 @@ use std::io::Write;
 #[cfg(feature = "_online")]
 use std::time::{Duration, Instant};
 
-/// Panic if the given expression doesn't match the provided pattern, logging the unexpected result
-#[macro_export]
-macro_rules! assert_matches {
-    ($expression:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {{
-        #[allow(unreachable_patterns)]
-        match $expression {
-            $pattern $(if $guard)? => {},
-            _ => {
-                panic!("received unexpected result: {}", format!("{:?}", $expression));
-            }
-        }
-    }};
-}
-
 /// A data dir of its own for a test that doesn't call `initialize()`.
 ///
 /// `initialize()` runs `regtest.sh prepare_tests_environment`, which wipes the shared
@@ -611,6 +597,60 @@ pub(crate) fn failing_list_proxy(
                 return b"not valid json".to_vec();
             }
             forward_to_proxy(req, body)
+        })
+        .expect_at_least(1)
+        .create();
+    (server, mock)
+}
+
+// proxy that forwards every call to the real one, except the calls starting a new transfer
+// (invoice.prepare, consignment.post and ack.prepare) that are refused as by a draining proxy
+#[cfg(feature = "electrum")]
+pub(crate) fn draining_proxy(draining: Arc<AtomicBool>) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/json-rpc")
+        .with_body_from_request(move |req| {
+            let body = req.body().unwrap().clone();
+            let body_str = String::from_utf8_lossy(&body);
+            // consignment.post is a multipart call, so its method name is not quoted
+            if draining.load(Ordering::Relaxed)
+                && ["invoice.prepare", "consignment.post", "ack.prepare"]
+                    .iter()
+                    .any(|m| body_str.contains(m))
+            {
+                return br#"{"jsonrpc":"2.0","id":null,"error":{"code":-115,"message":"Server draining"}}"#.to_vec();
+            }
+            forward_to_proxy(req, body)
+        })
+        .expect_at_least(1)
+        .create();
+    (server, mock)
+}
+
+// proxy that forwards every call to the real one, advertising `max_media` in server.info (not
+// advertising any while it's 0, which a proxy cannot set)
+#[cfg(feature = "electrum")]
+pub(crate) fn max_media_proxy(
+    max_media: Arc<AtomicUsize>,
+) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/json-rpc")
+        .with_body_from_request(move |req| {
+            let body = req.body().unwrap().clone();
+            let is_info = String::from_utf8_lossy(&body).contains("\"server.info\"");
+            let res = forward_to_proxy(req, body);
+            if !is_info {
+                return res;
+            }
+            let mut res: serde_json::Value = serde_json::from_slice(&res).unwrap();
+            let result = res["result"].as_object_mut().unwrap();
+            match max_media.load(Ordering::Relaxed) {
+                0 => result.remove("max_media"),
+                max => result.insert(s!("max_media"), max.to_string().into()),
+            };
+            serde_json::to_vec(&res).unwrap()
         })
         .expect_at_least(1)
         .create();

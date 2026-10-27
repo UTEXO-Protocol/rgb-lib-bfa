@@ -100,6 +100,8 @@ pub(crate) struct ServerInfoResponse {
     pub(crate) max_pow_difficulty: Option<String>,
     #[serde(default)]
     pub(crate) retention_grace_secs: Option<String>,
+    #[serde(default)]
+    pub(crate) max_media: Option<String>,
 }
 
 /// Status of an invoice on a recipient proxy, as reported by `invoice.check`.
@@ -158,7 +160,7 @@ pub(crate) struct GetAckResponse {
     pub(crate) signatures: HashMap<String, String>,
 }
 
-/// Per-transfer data registered with `ack.prepare`.
+/// Per-transfer data registered with `ack.prepare`, whose signed TX travels in the uploaded file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct AckTransferData {
     pub(crate) recipient_pk: String,
@@ -175,7 +177,8 @@ pub struct PostConsignmentData {
     pub(crate) sender_pk: String,
     pub(crate) consignment_hash: String,
     pub(crate) batch: bool,
-    /// signature of `transfer_id ‖ consignment_hash ‖ blob_hash` with the sender key
+    /// signature of `transfer_id ‖ consignment_hash ‖ blob_hash ‖ "consignment"` with the sender
+    /// key
     pub(crate) signature: String,
 }
 
@@ -227,18 +230,20 @@ pub(crate) fn prepare_ack_auth_message(
 }
 
 /// Message signed by the sender to post a consignment:
-/// `transfer_id ‖ consignment_hash ‖ blob_hash`.
+/// `transfer_id ‖ consignment_hash ‖ blob_hash ‖ "consignment"`, the literal keeping it distinct
+/// from the `media.post` one.
 pub(crate) fn post_consignment_message(
     transfer_id: &str,
     consignment_hash: &str,
     blob_hash: &str,
 ) -> String {
-    format!("{transfer_id}{consignment_hash}{blob_hash}")
+    format!("{transfer_id}{consignment_hash}{blob_hash}consignment")
 }
 
-/// Message signed by the sender to post a media: `transfer_id ‖ media_id ‖ blob_hash`.
+/// Message signed by the sender to post a media: `transfer_id ‖ media_id ‖ blob_hash ‖ "media"`,
+/// the literal keeping it distinct from the `consignment.post` one.
 pub(crate) fn post_media_message(transfer_id: &str, media_id: &str, blob_hash: &str) -> String {
-    format!("{transfer_id}{media_id}{blob_hash}")
+    format!("{transfer_id}{media_id}{blob_hash}media")
 }
 
 /// Message signed by the recipient to list the transfers of an invoice: `invoice_id ‖ timestamp`.
@@ -298,11 +303,18 @@ struct TransferRetrievedParams {
 }
 
 #[derive(Debug, Serialize)]
-struct PrepareAckParams {
-    transfer_data: HashMap<String, AckTransferData>,
+struct AckTransferParams<'a> {
+    recipient_pk: &'a str,
+    consignment_hash: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PrepareAckParams<'a> {
+    transfer_data: HashMap<&'a str, AckTransferParams<'a>>,
     expires_at: String,
     signed_tx_hash: String,
     sender_pk: String,
+    file_size: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
 }
@@ -359,6 +371,10 @@ pub(crate) fn map_proxy_error(err: JsonRpcError) -> Error {
         -111 => Error::InvoiceExpired,
         -112 => Error::InvoiceQuotaExceeded,
         -113 => Error::TransferIDDeleted,
+        // the proxy refuses calls starting a new transfer
+        -115 => Error::ProxyDraining,
+        // the transfer already has the max number of media the proxy accepts
+        -116 => Error::ProxyTooManyMedia,
         // the consignment is not (or no longer, after transfer.retrieved) available
         -400 | -402 | -403 => Error::NoConsignment,
         -401 => Error::NoMedia,
@@ -417,18 +433,18 @@ impl ProxyClient {
             .map_err(Self::req_err)
     }
 
-    fn call_multipart<R: serde::de::DeserializeOwned, P: AsRef<Path>>(
+    fn call_multipart<R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         params_json: String,
-        file: P,
+        file: multipart::Part,
     ) -> Result<JsonRpcResponse<R>, Error> {
         let form = multipart::Form::new()
             .text("method", method.to_string())
             .text("jsonrpc", "2.0")
             .text("id", "null")
             .text("params", params_json)
-            .file("file", file)?;
+            .part("file", file);
         self.client
             .post(&self.base_url)
             .multipart(form)
@@ -499,7 +515,11 @@ impl ProxyClient {
             pow_nonce: pow_nonce.to_string(),
         })
         .expect("serializable");
-        self.call_multipart("consignment.post", params, consignment_path)
+        self.call_multipart(
+            "consignment.post",
+            params,
+            multipart::Part::file(consignment_path)?,
+        )
     }
 
     pub(crate) fn get_media(
@@ -531,7 +551,7 @@ impl ProxyClient {
             signature: signature.to_string(),
         })
         .expect("serializable");
-        self.call_multipart("media.post", params, media_path)
+        self.call_multipart("media.post", params, multipart::Part::file(media_path)?)
     }
 
     pub(crate) fn list_transfers(
@@ -572,16 +592,37 @@ impl ProxyClient {
         sender_pk: &str,
         signature: Option<String>,
     ) -> Result<JsonRpcResponse<bool>, Error> {
-        self.call(
-            "ack.prepare",
-            Some(PrepareAckParams {
-                transfer_data,
-                expires_at: expiration.to_string(),
-                signed_tx_hash: signed_tx_hash.to_string(),
-                sender_pk: sender_pk.to_string(),
-                signature,
-            }),
-        )
+        // the signed TXs are uploaded as a file mapping each transfer ID to its signed TX
+        let signed_txs: HashMap<&str, &str> = transfer_data
+            .iter()
+            .map(|(tid, data)| (tid.as_str(), data.signed_tx.as_str()))
+            .collect();
+        let file = serde_json::to_vec(&signed_txs).expect("serializable");
+        let params = serde_json::to_string(&PrepareAckParams {
+            transfer_data: transfer_data
+                .iter()
+                .map(|(tid, data)| {
+                    (
+                        tid.as_str(),
+                        AckTransferParams {
+                            recipient_pk: &data.recipient_pk,
+                            consignment_hash: &data.consignment_hash,
+                        },
+                    )
+                })
+                .collect(),
+            expires_at: expiration.to_string(),
+            signed_tx_hash: signed_tx_hash.to_string(),
+            sender_pk: sender_pk.to_string(),
+            file_size: file.len().to_string(),
+            signature,
+        })
+        .expect("serializable");
+        let file = multipart::Part::bytes(file)
+            .file_name("signed_txs.json")
+            .mime_str(JSON)
+            .expect("valid mime");
+        self.call_multipart("ack.prepare", params, file)
     }
 
     pub(crate) fn post_ack(
@@ -778,6 +819,8 @@ mod tests {
         assert_matches!(map(-111), Error::InvoiceExpired);
         assert_matches!(map(-112), Error::InvoiceQuotaExceeded);
         assert_matches!(map(-113), Error::TransferIDDeleted);
+        assert_matches!(map(-115), Error::ProxyDraining);
+        assert_matches!(map(-116), Error::ProxyTooManyMedia);
         assert_matches!(map(-402), Error::NoConsignment);
         assert_matches!(map(-403), Error::NoConsignment);
     }

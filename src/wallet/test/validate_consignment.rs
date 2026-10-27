@@ -20,7 +20,6 @@ fn validation_options(offchain_txid: Option<&str>) -> ValidationOptions {
         bitcoin_network: BitcoinNetwork::Regtest,
         offchain_txid: offchain_txid.map(str::to_string),
         evm_rpc_urls: HashMap::new(),
-        max_mint_scan_blocks: None,
     }
 }
 
@@ -109,6 +108,17 @@ fn success() {
     assert_eq!(validation.asset_id, asset.asset_id);
     assert!(validation.witnesses.is_empty());
     assert!(validation.warnings.is_empty());
+    // it has no witness, so no offchain TXID can match one
+    let contract_path = contract_file.path().to_string_lossy().to_string();
+    let result = validate(&contract_path, Some(&txid), None);
+    assert_matches!(result, Err(Error::OffchainTxidNotFound { txid: t }) if t == txid);
+
+    // a contract consignment carrying bundles is invalid, so no offchain TXID can be of use
+    let mut contract = consignment.clone().into_contract();
+    contract.bundles = consignment.bundles.clone();
+    contract.save_file(contract_file.path()).unwrap();
+    let result = validate(&contract_path, None, None);
+    assert_matches!(result, Err(Error::ConsignmentValidationFailed { .. }));
 
     // settle the transfer, the witness then being resolved by the indexer
     rcv_party.wait_for_refresh(None);
@@ -427,8 +437,11 @@ fn mint() {
         .get_send_consignment_path(&asset.asset_id, &txid)
         .to_string_lossy()
         .to_string();
-    let validate_mint = |evm_rpc_urls: HashMap<u64, String>, max_mint_scan_blocks: Option<u64>| {
-        validate_consignment(
+    // validate the mint, scanning for its event at most the given number of blocks (if any)
+    // instead of MAX_MINT_SCAN_BLOCKS
+    let validate_mint = |evm_rpc_urls: HashMap<u64, String>, max_scan_blocks: Option<u64>| {
+        MOCK_MAX_MINT_SCAN_BLOCKS.replace(max_scan_blocks);
+        let result = validate_consignment(
             &consignment_path,
             &IndexerConfig::Electrum {
                 url: ELECTRUM_URL.to_string(),
@@ -436,10 +449,11 @@ fn mint() {
             None,
             &ValidationOptions {
                 evm_rpc_urls,
-                max_mint_scan_blocks,
                 ..validation_options(Some(&txid))
             },
-        )
+        );
+        MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
+        result
     };
     let evm_rpc_urls = HashMap::from([(ANVIL_CHAIN_ID, EVM_RPC_URL.to_string())]);
 
@@ -474,9 +488,10 @@ fn mint() {
     assert!(validation.warnings.is_empty());
 
     // the lock is outside the scanned blocks: the event follows the block the mint commits to, so
-    // it's never within 0 blocks from it
+    // it's never within 0 blocks from it, and the mint will never be confirmed (unlike when it
+    // wasn't found yet above)
     let result = validate_mint(evm_rpc_urls.clone(), Some(0));
-    assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
+    assert_matches!(result, Err(Error::MintEventOutOfScanWindow { opid, max_scan_blocks: 0 }) if opid == res.details.opid);
     validate_mint(evm_rpc_urls.clone(), Some(1000)).unwrap();
 
     // the minted allocation rejected by the reject list contract, once finalized

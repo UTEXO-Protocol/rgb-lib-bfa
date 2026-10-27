@@ -10,11 +10,11 @@ use std::{
 use rgb_lib::{
     AssetSchema, Assignment as RgbLibAssignment, CloseMethod, Encryption, Error as RgbLibError,
     TransferStatus, TransportType, WalletTransactionType,
-    inspect::{
+    keys::{Keys, WitnessVersion},
+    no_wallet::{
         BundleFilter as RgbLibBundleFilter, ConsignmentInspection as RgbLibConsignmentInspection,
         RgbGenesisInfo as RgbLibRgbGenesisInfo, TransitionMetadata as RgbLibTransitionMetadata,
     },
-    keys::{Keys, WitnessVersion},
     utils::BitcoinNetwork,
     wallet::{
         Address as RgbLibAddress, AssetBFA, AssetCFA, AssetFilter as RgbLibAssetFilter, AssetIFA,
@@ -1185,7 +1185,8 @@ fn inspect_consignment(
     consignment_path: String,
     bundle_filter: BundleFilter,
 ) -> Result<ConsignmentInspection, RgbLibError> {
-    rgb_lib::inspect::inspect_consignment(consignment_path, bundle_filter.into()).map(|i| i.into())
+    rgb_lib::no_wallet::inspect_consignment(consignment_path, bundle_filter.into())
+        .map(|i| i.into())
 }
 
 fn validate_consignment(
@@ -1194,7 +1195,7 @@ fn validate_consignment(
     min_confirmations: Option<u8>,
     options: ValidationOptions,
 ) -> Result<ConsignmentValidation, RgbLibError> {
-    rgb_lib::wallet::validate_consignment(
+    rgb_lib::no_wallet::validate_consignment(
         &consignment_path,
         &indexer_config.into(),
         min_confirmations,

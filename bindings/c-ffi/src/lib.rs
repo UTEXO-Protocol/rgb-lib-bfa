@@ -13,8 +13,8 @@ use std::{
 
 use rgb_lib::{
     AssetSchema, Assignment, Encryption, Error as RgbLibError,
-    inspect::BundleFilter,
     keys::WitnessVersion,
+    no_wallet::BundleFilter,
     utils::BitcoinNetwork,
     wallet::{
         AssetFilter, BitcoindAuth, IndexerConfig, Online, OnlineOptions, Recipient, RefreshFilter,

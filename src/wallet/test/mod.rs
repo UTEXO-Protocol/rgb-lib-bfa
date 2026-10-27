@@ -53,7 +53,9 @@ use crate::wallet::utils::build_indexer;
 #[cfg(feature = "electrum")]
 use crate::{
     database::enums::{SCHEMA_ID_CFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA, SCHEMA_ID_UDA},
-    inspect::{BundleFilter, inspect_consignment},
+    no_wallet::{
+        BundleFilter, inspect_consignment, validate_consignment, validation::terminal_opouts,
+    },
     utils::{get_account_data, recipient_id_from_script_buf, script_buf_from_recipient_id},
     wallet::{multisig::*, rust_only::*},
 };
@@ -238,6 +240,7 @@ thread_local! {
     pub(crate) static MOCK_CONFIRMATION_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MINT_LOCK_WINDOW: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MINT_AFTER_BLOCK_GRACE: RefCell<Option<i64>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_MAX_MINT_SCAN_BLOCKS: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "_online")]
@@ -493,6 +496,13 @@ pub fn mock_mint_lock_window() -> Option<u32> {
 #[cfg(feature = "_online")]
 pub fn mock_mint_after_block_grace() -> Option<i64> {
     MOCK_MINT_AFTER_BLOCK_GRACE.with_borrow(|m| *m)
+}
+
+/// Maximum number of blocks scanned for the event of a received mint to use instead of
+/// `MAX_MINT_SCAN_BLOCKS`, if set.
+#[cfg(feature = "_online")]
+pub fn mock_max_mint_scan_blocks() -> Option<u64> {
+    MOCK_MAX_MINT_SCAN_BLOCKS.with_borrow(|m| *m)
 }
 
 /// Sender proxy retention grace (seconds) to use instead of the one advertised by the proxy, if

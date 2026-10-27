@@ -558,7 +558,7 @@ pub(crate) fn inspect_consignment(
 ) -> Result<String, Error> {
     let consignment_path = ptr_to_string(consignment_path);
     let bundle_filter: BundleFilter = serde_json::from_str(&ptr_to_string(bundle_filter))?;
-    let res = rgb_lib::inspect::inspect_consignment(consignment_path, bundle_filter)?;
+    let res = rgb_lib::no_wallet::inspect_consignment(consignment_path, bundle_filter)?;
     Ok(serde_json::to_string(&res)?)
 }
 
@@ -991,7 +991,7 @@ pub(crate) fn validate_consignment(
     let indexer_config: IndexerConfig = serde_json::from_str(&ptr_to_string(indexer_config))?;
     let min_confirmations = convert_optional_number(min_confirmations)?;
     let options: ValidationOptions = serde_json::from_str(&ptr_to_string(options))?;
-    let res = rgb_lib::wallet::validate_consignment(
+    let res = rgb_lib::no_wallet::validate_consignment(
         &consignment_path,
         &indexer_config,
         min_confirmations,

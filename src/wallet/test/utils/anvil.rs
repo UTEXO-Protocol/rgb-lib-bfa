@@ -147,6 +147,27 @@ pub(crate) fn deploy_reject_list() -> DeployedContract {
     )
 }
 
+/// The ways a `MaliciousRejectList` contract breaks the `IRgbRejectList` read model (see
+/// `tests/contracts/MaliciousRejectList.sol`, whose `Mode` enum this mirrors).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MaliciousRejectListMode {
+    LengthReverts,
+    EntriesReverts,
+    ShortPage,
+    BadBool,
+    LengthOverflow,
+    Shrinking,
+    HugeLength,
+}
+
+/// Deploy a MaliciousRejectList contract behaving as `mode` on anvil and return contract info.
+pub(crate) fn deploy_malicious_reject_list(mode: MaliciousRejectListMode) -> DeployedContract {
+    forge_create(
+        "MaliciousRejectList.sol:MaliciousRejectList",
+        &[(mode as u8).to_string()],
+    )
+}
+
 /// Append entries to the RgbRejectList contract at `reject_list`.
 ///
 /// Each entry is the RGB operation output it applies to and whether it is rejected.

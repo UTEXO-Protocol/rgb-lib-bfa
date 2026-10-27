@@ -241,6 +241,30 @@ fn success() {
         serde_json::to_value(&witness_1_inspection.witnesses[0]).unwrap(),
         serde_json::to_value(witness_1).unwrap()
     );
+    // a history transition not having the operation ID it's listed with is not used to resolve
+    // the inputs spending it, which would show assignments they don't spend
+    let mut consignment = RgbTransfer::load_file(&consignment_path).unwrap();
+    let history_witness_id = consignment
+        .bundled_witnesses()
+        .map(|bw| bw.witness_id())
+        .find(|id| id.to_string() == txid_1)
+        .unwrap();
+    assert!(
+        consignment.modify_bundle(history_witness_id, |witness_bundle| {
+            let bundle = witness_bundle.bundle_mut();
+            let mut known_transitions = bundle.known_transitions.to_unconfined();
+            known_transitions[0].transition.nonce =
+                known_transitions[0].transition.nonce.wrapping_add(1);
+            bundle.known_transitions = Confined::from_iter_checked(known_transitions);
+        })
+    );
+    let forged_file = tempfile::NamedTempFile::with_prefix("inspect_consignment::").unwrap();
+    consignment.save_file(forged_file.path()).unwrap();
+    let result = inspect_consignment(
+        forged_file.path().to_string_lossy().to_string(),
+        BundleFilter::Terminals,
+    );
+    assert_matches!(result, Err(Error::RgbInspection { details: d }) if d.contains("unknown input"));
     let result = inspect_consignment(consignment_path, BundleFilter::Witness("00".repeat(32)));
     assert_matches!(result, Err(Error::RgbInspection { details: d }) if d.contains("not found"));
     // the new witness spends both received allocations

@@ -317,9 +317,12 @@ fn raw_snapshot_is_a_standalone_fingerprint_rooted_database() {
     let mut zip = zip::ZipArchive::new(Cursor::new(&snapshot.data)).unwrap();
     for i in 0..zip.len() {
         let entry = zip.by_index(i).unwrap();
-        assert!(entry.name().starts_with(&format!("{fingerprint}/")));
-        assert!(!entry.name().ends_with("-wal"));
-        assert!(!entry.name().ends_with("-shm"));
+        let name = entry
+            .name()
+            .expect("snapshot entry has a valid canonical name");
+        assert!(name.starts_with(&format!("{fingerprint}/")));
+        assert!(!name.ends_with("-wal"));
+        assert!(!name.ends_with("-shm"));
     }
     let mut database = Vec::new();
     zip.by_name(&format!("{fingerprint}/rgb_lib_db"))

@@ -847,7 +847,7 @@ fn send_end_db_update_only_success() {
 
     let result = party
         .wallet
-        .send_end_db_update_only(party.online, signed_psbt)
+        .send_end_db_update_only(party.online, signed_psbt.clone())
         .unwrap();
 
     assert!(!result.txid.is_empty());
@@ -857,6 +857,63 @@ fn send_end_db_update_only_success() {
         party
             .check_test_transfer_status_sender(&result.txid, TransferStatus::WaitingConfirmations,)
     );
+
+    // a donation that has already been ended cannot be ended again
+    let result_again = party
+        .wallet
+        .send_end_db_update_only(party.online, signed_psbt);
+    assert_matches!(result_again, Err(Error::CannotEndTransfer { txid }) if txid == result.txid);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn send_end_db_update_only_wrong_operation() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // a non-donation send
+    let asset = party.issue_asset_ifa(None, None, None);
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(10),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let begin = party.send_begin_result(&recipient_map).unwrap();
+    let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    let txid = Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let result = party
+        .wallet
+        .send_end_db_update_only(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::WrongOperation { txid: t }) if t == txid);
+
+    // another operation
+    let asset = party.issue_asset_ifa(None, None, None);
+    let unsigned_psbt = party.burn_begin(&asset.asset_id, 1, None);
+    let signed_psbt = party.wallet.sign_psbt(unsigned_psbt, None).unwrap();
+    let txid = Psbt::from_str(&signed_psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let result = party
+        .wallet
+        .send_end_db_update_only(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::WrongOperation { txid: t }) if t == txid);
 }
 
 #[cfg(feature = "electrum")]

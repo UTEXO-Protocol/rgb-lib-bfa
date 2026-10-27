@@ -19,7 +19,14 @@ mod snapshot;
 pub(crate) mod test;
 
 pub use crate::database::enums::TypeOfTransition;
-pub use crate::inspect::{
+#[cfg(feature = "_validation")]
+pub use crate::no_wallet::{BitcoindAuth, IndexerConfig, IndexerProtocol};
+#[cfg(feature = "validation")]
+pub use crate::no_wallet::{
+    ConsignmentValidation, ValidatedWitness, ValidationOptions, ValidationWarning,
+    WitnessValidationStatus,
+};
+pub use crate::no_wallet::{
     RgbInputInfo, RgbInspection, RgbOperationInfo, RgbOutputInfo, RgbTransitionInfo,
     TransitionGlobal, TransitionMetadata,
 };
@@ -41,17 +48,13 @@ pub use objects::{
 };
 #[cfg(feature = "_online")]
 pub use objects::{
-    BitcoindAuth, BurnBeginResult, BurnDetails, ConsignmentValidation, IndexerConfig,
-    IndexerProtocol, InflateBeginResult, InflateDetails, MintBeginResult, MintDetails,
+    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, MintBeginResult, MintDetails,
     OnlineOptions, OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus,
-    RefreshedTransfer, SendBeginResult, SendDetails, ValidatedWitness, ValidationOptions,
-    ValidationWarning, WitnessValidationStatus,
+    RefreshedTransfer, SendBeginResult, SendDetails,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
-pub use online::{RgbWalletOpsOnline, check_indexer_url, validate_consignment};
-#[cfg(feature = "_online")]
-pub(crate) use rust_only::validate_consignment_with_resolver;
+pub use online::{RgbWalletOpsOnline, check_indexer_url};
 pub use singlesig::{SinglesigKeys, Wallet};
 pub use snapshot::{WalletSnapshot, WalletSnapshotToken};
 
@@ -71,8 +74,7 @@ pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, FailTransfersOutcome,
     LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData, PrepareRgbPsbtResult,
     PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher, ReceiveMode,
-    ReceivedConsignmentMeta, RefreshResultTrait, RejectList, RejectListSource,
-    TryFailBatchTransferOutcome,
+    ReceivedConsignmentMeta, RefreshResultTrait, TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails, LocalAssetData,
