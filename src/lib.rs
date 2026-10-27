@@ -172,7 +172,7 @@ pub use crate::{
 #[cfg(feature = "_online")]
 use std::{
     cmp::{Ordering, max, min},
-    collections::hash_map::DefaultHasher,
+    collections::hash_map::{DefaultHasher, Entry},
     hash::Hasher,
     num::NonZeroU32,
 };
