@@ -35,4 +35,3 @@ jobs:
           toolchain: ${{matrix.toolchain}}
       - name: Build with all features
         run: cargo build --release --all-features
-
