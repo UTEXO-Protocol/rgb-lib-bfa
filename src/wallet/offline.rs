@@ -306,6 +306,12 @@ pub trait WalletOffline: WalletBackup {
         })
     }
 
+    fn check_unicode_ticker(&self, ticker: String) -> Result<UnicodeTicker, Error> {
+        UnicodeTicker::try_from(ticker).map_err(|e| Error::InvalidTicker {
+            details: e.to_string(),
+        })
+    }
+
     fn get_total_issue_amount(&self, amounts: &[u64], allow_empty: bool) -> Result<u64, Error> {
         if amounts.is_empty() && !allow_empty {
             return Err(Error::NoIssuanceAmounts);
@@ -1002,10 +1008,7 @@ pub trait WalletOffline: WalletBackup {
         let details = mock_contract_details(self);
         #[cfg(not(test))]
         let details: Option<Details> = None;
-        let bfa_ticker = UnicodeTicker::try_from(self.check_ticker(ticker.clone())?.to_string())
-            .map_err(|e| Error::InvalidTicker {
-                details: e.to_string(),
-            })?;
+        let bfa_ticker = self.check_unicode_ticker(ticker.clone())?;
 
         let contract_address = self.check_contract_address(contract_address)?;
 
