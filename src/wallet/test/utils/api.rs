@@ -883,6 +883,12 @@ pub(crate) trait SigParty: OfflineSigParty<W: RgbWalletOpsOnline> {
             .unwrap()
     }
 
+    #[cfg(feature = "_online")]
+    fn fail_mint_result(&mut self, batch_transfer_idx: i32, force: bool) -> Result<(), Error> {
+        let online = self.party_online();
+        self.wlt_mut().fail_mint(online, batch_transfer_idx, force)
+    }
+
     #[cfg(feature = "electrum")]
     fn get_btc_balance_with_sync(&mut self) -> BtcBalance {
         let online = self.party_online();

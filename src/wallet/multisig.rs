@@ -348,6 +348,26 @@ impl RgbWalletOpsOnline for MultisigWallet {
         }
         Ok(outcome.transfers_changed)
     }
+
+    fn fail_mint(
+        &mut self,
+        online: Online,
+        batch_transfer_idx: i32,
+        force: bool,
+    ) -> Result<(), Error> {
+        self.check_online(online)?;
+        self.check_is_cosigner()?;
+        info!(
+            self.logger(),
+            "Failing mint with batch transfer idx {batch_transfer_idx}..."
+        );
+        let txn = self.database().begin_transaction()?;
+        self.fail_mint_impl(&txn, batch_transfer_idx, force)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Fail mint completed");
+        Ok(())
+    }
 }
 
 /// Multisig-specific options for the [`MultisigWallet::go_online`] method.

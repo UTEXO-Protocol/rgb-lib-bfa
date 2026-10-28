@@ -280,16 +280,6 @@ fn min_operation_lifetime() -> u32 {
     PROXY_CLOCK_SKEW_MARGIN_SECS
 }
 
-/// Minimum time the recipient's invoice must have left when a mint begins (see
-/// [`MIN_MINT_LOCK_WINDOW_SECS`]).
-fn min_mint_lock_window() -> u32 {
-    #[cfg(test)]
-    if let Some(window) = mock_mint_lock_window() {
-        return window;
-    }
-    MIN_MINT_LOCK_WINDOW_SECS
-}
-
 /// Check the expiration of an outgoing operation leaves it enough time (see
 /// [`min_operation_lifetime`]).
 fn check_operation_expiration(expiration_timestamp: i64) -> Result<(), Error> {
@@ -1183,7 +1173,8 @@ pub trait WalletOnline: WalletOffline {
             let batch_transfer =
                 txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
-            if !batch_transfer.is_fallible() {
+            // a mint can only be failed by fail_mint, which checks its lock first
+            if !batch_transfer.is_fallible() || self.is_mint(&batch_transfer, &db_data)? {
                 return Ok(FailTransfersOutcome {
                     transfers_changed: false,
                     cannot_fail: true,
@@ -1191,12 +1182,9 @@ pub trait WalletOnline: WalletOffline {
             }
 
             // a transfer waiting for the counterparty's broadcast can only be failed once it has
-            // expired, since the TX may still be broadcast before then (for a mint, until the
-            // finality grace of a lock included in time has passed too)
+            // expired, since the TX may still be broadcast before then
             if batch_transfer.status == TransferStatus::WaitingBroadcast {
-                let now = now().unix_timestamp();
-                let expired =
-                    self.is_expired_with_mint_grace(txn, &batch_transfer, &db_data, now)?;
+                let expired = incoming_expired(&batch_transfer, now().unix_timestamp());
                 if !expired {
                     return Ok(FailTransfersOutcome {
                         transfers_changed: false,
@@ -1227,16 +1215,17 @@ pub trait WalletOnline: WalletOffline {
         } else {
             // fail all expired transfers that are in a fallible status; an outgoing one is expired
             // once its expiration has passed on the sender proxy's clock too (ack.get reports no
-            // expiration), as the proxy may release its TX until then. A mint is the exception: it
-            // is never registered on the sender proxy and mint_end refuses to broadcast it past
-            // its expiration on the local clock, so no margin is needed. A mint whose lock was
-            // included on the external chain by the expiration is waited for past it, until the
-            // lock is finalized or the finality grace has passed, on both sides
+            // expiration), as the proxy may release its TX until then. A mint never expires by a
+            // timestamp: its recipient fails it at refresh once its lock has expired, its sender at
+            // mint_end, and either one with fail_mint
             let now = now().unix_timestamp();
             let mut expired_transfers = vec![];
             for t in db_data.batch_transfers.iter().filter(|t| t.is_fallible()) {
-                let expired = if t.incoming || Self::is_pending_mint(t, &db_data) {
-                    self.is_expired_with_mint_grace(txn, t, &db_data, now)?
+                if self.is_mint(t, &db_data)? {
+                    continue;
+                }
+                let expired = if t.incoming {
+                    incoming_expired(t, now)
                 } else {
                     expired_beyond_skew_margin(t)
                 };
@@ -2993,7 +2982,9 @@ pub trait WalletOnline: WalletOffline {
             // the RPC endpoint configured for the chain the mint events live on is checked to
             // actually be on it before being asked about the anchors. A missing or misconfigured
             // endpoint is a local issue, not one with the consignment: keep it and retry at the
-            // next refresh, until the transfer expires, without blocking the other transfers
+            // next refresh, without blocking the other transfers, until the transfer expires or,
+            // once the mint has been checked (when it no longer expires by a timestamp), until it's
+            // failed with fail_mint
             let BridgeLocation::Evm(EvmContract { chain_id, address }) = &bridge_location;
             let chain_id = *chain_id;
             // the mint paying this recipient, as opposed to those in its history
@@ -3040,21 +3031,6 @@ pub trait WalletOnline: WalletOffline {
                 }
                 Err(e) => return Err(e.into()),
             };
-            // past its deadline (the invoice expiration), a mint is only waited for, and accepted,
-            // if its lock was included by then (see mint_in_finality_grace)
-            if let (Some(received_mint), Some(deadline)) =
-                (&received_mint, batch_transfer.expiration)
-            {
-                let now = now().unix_timestamp();
-                if now > deadline && !self.mint_in_finality_grace(received_mint, deadline, now) {
-                    info!(
-                        self.logger(),
-                        "Mint {} expired with no lock included by its deadline, failing it",
-                        received_mint.opid
-                    );
-                    return Ok(Some(self.fail_batch_transfer(txn, batch_transfer)?));
-                }
-            }
             debug!(
                 self.logger(),
                 "Resolving external anchors {:?} at bridge location {:?}",
@@ -3086,7 +3062,7 @@ pub trait WalletOnline: WalletOffline {
 
             // a missing mint event doesn't make the consignment invalid, the event may simply
             // not have happened yet or not be finalized yet: keep the (cached)
-            // consignment and try again at the next refresh, until the transfer expires
+            // consignment and try again at the next refresh, until the lock expires
             if unconfirmed > 0 {
                 // a mint is posted before its lock is made, so that its recipient can check it
                 // first: check it now (once), assuming the lock is there, so the user knows whether
@@ -6007,6 +5983,7 @@ pub trait WalletOnline: WalletOffline {
         recipient_vout: &mut u32,
         operation_sk: &ed25519_dalek::SigningKey,
         now_ts: i64,
+        mint: bool,
     ) -> Result<LocalRecipient, Error> {
         let out_of_band = recipient.transport_endpoints.is_empty();
         if !out_of_band {
@@ -6072,8 +6049,17 @@ pub trait WalletOnline: WalletOffline {
             (public_key, Some(recipient_vk))
         };
 
-        // a transfer to a proxy recipient cannot be created after the invoice expiration
-        let invoice_expiration = if out_of_band {
+        // a transfer to a proxy recipient cannot be created after the invoice expiration. A mint
+        // is the exception: it expires by the external chain block its lock has to be included
+        // before, never by a timestamp, so its recipient must have no expiration
+        let invoice_expiration = if mint {
+            if recipient.expiration_timestamp.is_some() {
+                return Err(Error::InvalidRecipientData {
+                    details: s!("a mint recipient cannot have an expiration"),
+                });
+            }
+            None
+        } else if out_of_band {
             None
         } else {
             let invoice_expiration =
@@ -6405,6 +6391,7 @@ pub trait WalletOnline: WalletOffline {
                     &mut recipient_vout,
                     &operation_sk,
                     now_ts,
+                    false,
                 )?;
                 if let Some(invoice_expiration) = local_recipient.invoice_expiration {
                     min_invoice_expiration = Some(
@@ -7352,21 +7339,15 @@ pub trait WalletOnline: WalletOffline {
             &mut recipient_vout,
             &operation_sk,
             now_ts,
+            true,
         )?;
-        // the lock has to be included on the external chain by the invoice expiration, which is
-        // therefore the mint's expiration: refuse an invoice leaving too little time for it. No
-        // operation expiration is needed, as a mint is never registered on the sender proxy
-        let expiration_timestamp = local_recipient
-            .invoice_expiration
-            .expect("set for a proxy recipient");
-        if expiration_timestamp < now_ts + min_mint_lock_window() as i64 {
-            return Err(Error::InvoiceExpired);
-        }
         local_recipients.push(local_recipient);
 
         // the lock commits to this operation's ID, so it can only be included after the latest
         // external chain block: refuse a block to commit to (see RGB_METADATA_BEFORE_BLOCK)
-        // leaving no block before it for the lock. The latest block is taken from an RPC endpoint
+        // leaving no block before it for the lock. This block is the mint's only expiration: no
+        // timestamp is involved, as the recipient has no expiration and a mint is never
+        // registered on the sender proxy. The latest block is taken from an RPC endpoint
         // checked to be on the bridge's chain, the block numbers of another chain being unrelated
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
         let (evm_client, _) = self.checked_evm_client(&stock, contract_id)?;
@@ -7415,7 +7396,7 @@ pub trait WalletOnline: WalletOffline {
             &witness_recipients,
             fee_rate_checked,
             min_confirmations,
-            Some(expiration_timestamp),
+            None,
             Some(sender_transport_endpoint.clone()),
             Some(operation_secret_key.clone()),
             &mut stock,
@@ -7507,80 +7488,22 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
-    /// The deadline for the lock of the mint the given batch transfer data carries, as its
-    /// sender: the expiration of the recipient's invoice, the one the recipient fails the transfer
-    /// by (when no lock was included by then), falling back to the transfer expiration.
-    fn sent_mint_deadline(info_contents: &InfoBatchTransfer) -> Option<i64> {
-        info_contents
-            .transfers
-            .values()
-            .find(|t| t.main_transition == TypeOfTransition::Mint)
-            .and_then(|t| t.recipients.first())
-            .and_then(|r| r.invoice_expiration)
-            .or(info_contents.expiration_timestamp)
-    }
-
-    /// Whether the lock of `mint` was included on the external chain by `expiration`: `None` if
-    /// not, otherwise whether it's finalized.
-    fn mint_lock_included_by(
-        &self,
-        mint: &ReceivedMint,
-        expiration: i64,
-    ) -> Result<Option<bool>, Error> {
-        let evm_client = self.checked_evm_client_for_chain(mint.evm_chain_id)?;
-        let address = EvmAddress::from_str(&mint.bridge_contract).map_err(|e| Error::Internal {
-            details: format!("invalid bridge contract address: {e}"),
-        })?;
-        let opid = OpId::from_str(&mint.opid).map_err(|e| Error::Internal {
-            details: format!("invalid mint operation ID: {e}"),
-        })?;
-        Ok(evm_client
-            .funds_in_inclusion(&address, &opid, mint.amount, mint.before_block)?
-            .filter(|inclusion| inclusion.timestamp as i64 <= expiration)
-            .map(|inclusion| inclusion.finalized))
-    }
-
-    /// Whether an expired mint is still waited for, for its lock to be finalized: the lock was
-    /// included on the external chain by the expiration, which the deadline applies to, and the
-    /// finality grace (see [`MINT_FINALITY_GRACE_SECS`]) hasn't passed yet.
-    fn mint_in_finality_grace(&self, mint: &ReceivedMint, expiration: i64, now: i64) -> bool {
-        if now > expiration + MINT_FINALITY_GRACE_SECS {
-            return false;
-        }
-        match self.mint_lock_included_by(mint, expiration) {
-            Ok(included) => included.is_some(),
-            // the lock cannot be looked up (e.g. the EVM RPC endpoint is unreachable): keep
-            // waiting rather than failing a mint that may have been paid, until the grace passes
-            Err(e) => {
-                warn!(
-                    self.logger(),
-                    "Cannot check the lock of expired mint {}: {e}", mint.opid
-                );
-                true
-            }
-        }
-    }
-
-    /// The mint the given batch transfer carries, if any, as its recipient (once checked) or as
-    /// its sender (until mint_end), along with the deadline for its lock: the expiration of the
-    /// recipient's invoice (see [`Self::sent_mint_deadline`]).
+    /// The mint the given batch transfer carries, if any, as its recipient once the mint has been
+    /// checked (and its details saved, see [`Self::read_received_mint`]) or as its sender until
+    /// mint_end.
     fn batch_transfer_mint(
         &self,
         txn: &DbTxn,
         batch_transfer: &DbBatchTransfer,
         db_data: &DbData,
-    ) -> Result<Option<(ReceivedMint, i64)>, Error> {
+    ) -> Result<Option<ReceivedMint>, Error> {
         if batch_transfer.incoming {
             let (_, transfer) = batch_transfer
                 .get_incoming_transfer(&db_data.asset_transfers, &db_data.transfers)?;
-            let (Some(recipient_id), Some(expiration)) =
-                (&transfer.recipient_id, batch_transfer.expiration)
-            else {
+            let Some(recipient_id) = &transfer.recipient_id else {
                 return Ok(None);
             };
-            return Ok(self
-                .read_received_mint(recipient_id)?
-                .map(|mint| (mint, expiration)));
+            return self.read_received_mint(recipient_id);
         }
         if !Self::is_pending_mint(batch_transfer, db_data) {
             return Ok(None);
@@ -7595,33 +7518,75 @@ pub trait WalletOnline: WalletOffline {
                 .map_err(InternalError::from)?;
         let fascia = read_fascia(&transfer_dir.join(FASCIA_FILE))?;
         let stock = self.rgb_stock(txn)?;
-        let Some(deadline) = Self::sent_mint_deadline(&info_contents) else {
-            return Ok(None);
-        };
-        Ok(Some((
-            self.sent_mint(&stock, &info_contents, &fascia)?,
-            deadline,
-        )))
+        Ok(Some(self.sent_mint(&stock, &info_contents, &fascia)?))
     }
 
-    /// Whether the given batch transfer has expired. A mint expires by the deadline for its lock
-    /// (see [`Self::batch_transfer_mint`]), unless its lock was included by then, in which case it
-    /// expires once the finality grace has passed (see [`Self::mint_in_finality_grace`]).
-    fn is_expired_with_mint_grace(
-        &self,
+    /// Whether the given batch transfer is a mint (see [`Self::batch_transfer_mint`]), which only
+    /// [`fail_mint`](RgbWalletOpsOnline::fail_mint) can fail.
+    fn is_mint(&self, batch_transfer: &DbBatchTransfer, db_data: &DbData) -> Result<bool, Error> {
+        if !batch_transfer.incoming {
+            return Ok(Self::is_pending_mint(batch_transfer, db_data));
+        }
+        let (_, transfer) =
+            batch_transfer.get_incoming_transfer(&db_data.asset_transfers, &db_data.transfers)?;
+        Ok(transfer
+            .recipient_id
+            .as_ref()
+            .is_some_and(|recipient_id| self.get_received_mint_path(recipient_id).exists()))
+    }
+
+    /// The status of the lock of `mint` on the external chain, as of its latest finalized block
+    /// (see [`MintLockStatus`]).
+    fn mint_lock_status(&self, mint: &ReceivedMint) -> Result<MintLockStatus, Error> {
+        let evm_client = self.checked_evm_client_for_chain(mint.evm_chain_id)?;
+        let address = EvmAddress::from_str(&mint.bridge_contract).map_err(|e| Error::Internal {
+            details: format!("invalid bridge contract address: {e}"),
+        })?;
+        let opid = OpId::from_str(&mint.opid).map_err(|e| Error::Internal {
+            details: format!("invalid mint operation ID: {e}"),
+        })?;
+        evm_client.mint_lock_status(&address, &opid, mint.amount, mint.before_block)
+    }
+
+    fn fail_mint_impl(
+        &mut self,
         txn: &DbTxn,
-        batch_transfer: &DbBatchTransfer,
-        db_data: &DbData,
-        now: i64,
-    ) -> Result<bool, Error> {
-        Ok(
-            match self.batch_transfer_mint(txn, batch_transfer, db_data)? {
-                Some((mint, deadline)) => {
-                    now > deadline && !self.mint_in_finality_grace(&mint, deadline, now)
-                }
-                None => incoming_expired(batch_transfer, now),
-            },
-        )
+        batch_transfer_idx: i32,
+        force: bool,
+    ) -> Result<(), Error> {
+        let db_data = txn.get_db_data(false)?;
+        let batch_transfer =
+            txn.get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
+        if !batch_transfer.is_fallible() {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        let Some(mint) = self.batch_transfer_mint(txn, &batch_transfer, &db_data)? else {
+            return Err(Error::CannotFailBatchTransfer);
+        };
+        let fail = match self.mint_lock_status(&mint) {
+            Ok(MintLockStatus::Expired) => true,
+            // a lock that may still be (or has been) included in time is waited for, unless the
+            // recipient forces the fail, which only puts itself at risk: if the sender broadcasts
+            // the mint later, the minted assets are allocated to a seal it no longer tracks
+            Ok(MintLockStatus::Confirmed | MintLockStatus::Pending) => {
+                batch_transfer.incoming && force
+            }
+            // the lock cannot be checked, e.g. as the EVM RPC endpoint is unreachable, which may
+            // be temporary or permanent (e.g. the chain has stopped): fail only if forced
+            Err(e) if force => {
+                warn!(
+                    self.logger(),
+                    "Cannot check the lock of mint {}, failing it as forced: {e}", mint.opid
+                );
+                true
+            }
+            Err(e) => return Err(e),
+        };
+        if !fail {
+            return Err(Error::CannotFailBatchTransfer);
+        }
+        self.fail_batch_transfer(txn, &batch_transfer)?;
+        Ok(())
     }
 
     // check the bridge contract records a finalized lock matching the mint in the given fascia,
@@ -7675,30 +7640,21 @@ pub trait WalletOnline: WalletOffline {
             return Err(Error::WrongOperation { txid });
         }
 
-        // don't broadcast a mint that has expired: past its expiration the recipient is allowed
-        // to fail the transfer (and reuse its seal), so broadcasting now could allocate the minted
-        // assets to a seal the recipient has already given up on. Unlike a send, no ACK gates the
-        // broadcast, so this is the only place the sender can honor the deadline. The deadline is
-        // the recipient's invoice expiration, the one the recipient knows, and applies to the
-        // inclusion of the lock on the external chain: a lock included by then is waited for by
-        // the recipient past it, until the finality grace has passed (see
-        // MINT_FINALITY_GRACE_SECS), so the mint can be broadcast until then. As the inclusion is
-        // judged by the timestamp of the external chain block, which both parties read, their
-        // clocks don't need to agree
-        let now = now().unix_timestamp();
-        let deadline = Self::sent_mint_deadline(&info_contents).unwrap_or(now);
-        if deadline < now {
-            if now > deadline + MINT_FINALITY_GRACE_SECS {
-                return Err(Error::TransferExpired);
+        // a mint expires only once its lock can no longer be included before the block it commits
+        // to (no timestamp is involved): an expired one never confirms, so fail it, releasing its
+        // inputs (the caller commits the fail along with the error)
+        if let Err(e) = self.check_mint_event(txn, &info_contents, &fascia) {
+            if let Error::MintEventExpired { .. } = e
+                && let Some(batch_transfer) = txn
+                    .get_batch_transfers_by_txid(&txid)?
+                    .into_iter()
+                    .find(|batch_transfer| !batch_transfer.incoming)
+            {
+                info!(self.logger(), "Mint lock expired, failing the transfer");
+                self.fail_batch_transfer(txn, &batch_transfer)?;
             }
-            let stock = self.rgb_stock(txn)?;
-            let mint = self.sent_mint(&stock, &info_contents, &fascia)?;
-            if self.mint_lock_included_by(&mint, deadline)?.is_none() {
-                return Err(Error::TransferExpired);
-            }
+            return Err(e);
         }
-
-        self.check_mint_event(txn, &info_contents, &fascia)?;
 
         // the consignments were generated (and posted) by mint_begin
         let consignment_hashes = self.consignment_hashes(&transfer_dir, &info_contents)?;
@@ -7744,11 +7700,12 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
     ///
     /// An outgoing transfer is considered expired only once its expiration has passed on the
     /// sender proxy's clock as well (a fixed clock skew margin is added), as the proxy may release
-    /// its TX until then. A mint not yet ended is the exception, as it is never registered on the
-    /// sender proxy: it is considered expired as soon as the deadline for its lock (the expiration
-    /// of the recipient's invoice) has passed. A mint (sent or received) whose lock was included on
-    /// the external chain by the deadline is instead considered expired only once 24 hours have
-    /// passed since the deadline, leaving time for the lock to be finalized. When a
+    /// its TX until then.
+    ///
+    /// A mint, either sent and not ended yet or received and checked (see
+    /// [`get_received_mint`](RgbWalletOpsOffline::get_received_mint)), is never failed by this
+    /// method, as it doesn't expire by a timestamp but by the external chain block its lock has to
+    /// be included before: see [`fail_mint`](RgbWalletOpsOnline::fail_mint). When a
     /// `batch_transfer_idx` is provided, the signed TX of an outgoing transfer is revoked on the
     /// sender proxy before failing it: if a recipient already obtained it, the transfer cannot be
     /// failed. If the sender proxy no longer knows the operation (e.g. it lost its data), the
@@ -7782,6 +7739,47 @@ pub trait RgbWalletOpsOnline: RgbWalletOpsOffline + WalletOnline {
             return Err(Error::CannotFailBatchTransfer);
         }
         Ok(outcome.transfers_changed)
+    }
+
+    /// Set the status of the mint with the provided `batch_transfer_idx` to
+    /// [`TransferStatus::Failed`], releasing its inputs.
+    ///
+    /// The mint can be one sent and not ended yet (see `mint_end`) or one received and checked
+    /// (see [`get_received_mint`](RgbWalletOpsOffline::get_received_mint)): a receive the
+    /// consignment of which hasn't been checked yet is a regular one, to be failed with
+    /// [`fail_transfers`](RgbWalletOpsOnline::fail_transfers). Any other transfer errors with
+    /// [`Error::CannotFailBatchTransfer`].
+    ///
+    /// A mint expires once its lock can no longer be included on the external chain before the
+    /// block the mint commits to, as of the latest finalized block (see `mint_begin`), and only
+    /// then it is failed. A lock that is recorded in time, or that may still be, errors with
+    /// [`Error::CannotFailBatchTransfer`] instead, unless `force` is set by the recipient: this
+    /// only puts the recipient at risk, as a mint broadcast later allocates the minted assets to a
+    /// seal the wallet no longer tracks (e.g. useful when the sender never broadcasts a mint whose
+    /// lock is confirmed).
+    ///
+    /// The lock is checked via the EVM RPC endpoint of the bridge contract's chain: if it cannot
+    /// be checked (e.g. the endpoint is unreachable, which might be temporary or permanent) the
+    /// error is returned, unless `force` is set, in which case the mint is failed. A sender
+    /// forcing the fail of a mint whose lock is confirmed leaves the lock unpaid, so it should do
+    /// so only when the external chain cannot be reached for good.
+    fn fail_mint(
+        &mut self,
+        online: Online,
+        batch_transfer_idx: i32,
+        force: bool,
+    ) -> Result<(), Error> {
+        info!(
+            self.logger(),
+            "Failing mint with batch transfer idx {batch_transfer_idx}..."
+        );
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        self.fail_mint_impl(&txn, batch_transfer_idx, force)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Fail mint completed");
+        Ok(())
     }
 
     /// Sync the wallet and save new colored UTXOs to the DB.

@@ -1121,6 +1121,9 @@ interface Wallet {
     boolean skip_sync);
 
   [Throws=RgbLibError]
+  void fail_mint(Online online, i32 batch_transfer_idx, boolean force);
+
+  [Throws=RgbLibError]
   string get_address();
 
   [Throws=RgbLibError]
@@ -1316,6 +1319,9 @@ interface MultisigWallet {
   boolean fail_transfers(
     Online online, i32? batch_transfer_idx, boolean no_asset_only,
     boolean skip_sync);
+
+  [Throws=RgbLibError]
+  void fail_mint(Online online, i32 batch_transfer_idx, boolean force);
 
   [Throws=RgbLibError]
   Balance get_asset_balance(string asset_id);

@@ -247,6 +247,16 @@ pub extern "C" fn rgblib_fail_transfers(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rgblib_fail_mint(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    batch_transfer_idx: *const c_char,
+    force: bool,
+) -> CResultString {
+    fail_mint(wallet, online, batch_transfer_idx, force).into()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rgblib_finalize_psbt(
     wallet: &COpaqueStruct,
     signed_psbt: *const c_char,

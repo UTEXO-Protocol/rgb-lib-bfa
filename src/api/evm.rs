@@ -24,7 +24,7 @@ const RPC_RETRY_PAUSE: Duration = Duration::from_millis(10);
 /// before the block the mint commits to (`before_block`), as recorded by the bridge contract as of
 /// the latest finalized block (see [`EvmClient::mint_lock_status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MintLockStatus {
+pub enum MintLockStatus {
     /// The lock is recorded, included before `before_block`
     Confirmed,
     /// No lock is recorded yet, but one may still be included before `before_block`
@@ -223,20 +223,6 @@ struct CallObject {
 struct BlockHeader {
     /// Block number (hex).
     number: String,
-    /// Block timestamp (hex, seconds since the Unix epoch).
-    #[cfg(feature = "_online")]
-    #[serde(default)]
-    timestamp: Option<String>,
-}
-
-/// Where the lock of a mint was included on the external chain.
-#[cfg(feature = "_online")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FundsInInclusion {
-    /// Timestamp of the block the lock was included in.
-    pub timestamp: u64,
-    /// Whether that block is finalized.
-    pub finalized: bool,
 }
 
 impl EvmClient {
@@ -347,43 +333,6 @@ impl EvmClient {
                 None => MintLockStatus::Pending,
             },
         )
-    }
-
-    /// Where the lock of the mint of `amount` with operation `opid` was included before
-    /// `before_block`, finalized or not, if it was: a lock included at or after it doesn't confirm
-    /// the mint.
-    #[cfg(feature = "_online")]
-    pub(crate) fn funds_in_inclusion(
-        &self,
-        contract: &EvmAddress,
-        opid: &OpId,
-        amount: u64,
-        before_block: u64,
-    ) -> Result<Option<FundsInInclusion>, Error> {
-        // the finalized block is read first, so it cannot be past the latest one read after it
-        let finalized_block = self.finalized_block_number()?;
-        let latest_block = self.block_number()?;
-        let Some(block) = self
-            .funds_in_block(contract, opid, amount, latest_block)?
-            .filter(|block| *block < before_block)
-        else {
-            return Ok(None);
-        };
-        Ok(Some(FundsInInclusion {
-            timestamp: self.block_timestamp(block)?,
-            finalized: block <= finalized_block,
-        }))
-    }
-
-    /// Timestamp of the block with the given number (`eth_getBlockByNumber`).
-    #[cfg(feature = "_online")]
-    pub(crate) fn block_timestamp(&self, block: u64) -> Result<u64, Error> {
-        let header: BlockHeader =
-            self.rpc("eth_getBlockByNumber", (format!("0x{block:x}"), false))?;
-        let timestamp = header.timestamp.ok_or_else(|| Error::Network {
-            details: format!("the node reports no timestamp for block {block}"),
-        })?;
-        parse_quantity(&timestamp, "block timestamp")
     }
 
     /// Call a JSON-RPC method, failing if it reports an error or no result.
@@ -1423,68 +1372,5 @@ mod tests {
         assert!(!client.is_confirmed(&location, &anchor(7, 0x11)).unwrap());
         record.assert();
         no_record.assert();
-    }
-
-    #[cfg(feature = "_online")]
-    #[test]
-    fn funds_in_inclusion() {
-        let contract = EvmAddress::default();
-        let opid = OpId::from([0u8; 32]);
-        // the record as of the latest block (0x10), with the finalized block 0x0c, for a mint
-        // committing to `before_block`
-        let inclusion = |record: u64, before_block: u64| {
-            let mut server = mockito::Server::new();
-            let _finalized = mock_finalized_block(&mut server, 0x0c);
-            let _latest = mock_block_number(&mut server);
-            let _timestamp = server
-                .mock("POST", "/")
-                .match_body(mockito::Matcher::PartialJsonString(
-                    r#"{"method":"eth_getBlockByNumber","params":["0xc",false]}"#.to_string(),
-                ))
-                .with_body(
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0xc","timestamp":"0x64"}}"#,
-                )
-                .create();
-            let _timestamp_2 = server
-                .mock("POST", "/")
-                .match_body(mockito::Matcher::PartialJsonString(
-                    r#"{"method":"eth_getBlockByNumber","params":["0xd",false]}"#.to_string(),
-                ))
-                .with_body(
-                    r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0xd","timestamp":"0x65"}}"#,
-                )
-                .create();
-            let call = mock_eth_call(
-                &mut server,
-                &funds_in_call(0, 7),
-                &format!("0x{record:064x}"),
-            );
-            let inclusion = EvmClient::new(&server.url())
-                .unwrap()
-                .funds_in_inclusion(&contract, &opid, 7, before_block)
-                .unwrap();
-            call.assert();
-            inclusion
-        };
-
-        assert_eq!(inclusion(0, 0x20), None);
-        // included in the finalized block
-        assert_eq!(
-            inclusion(0x0d, 0x20),
-            Some(FundsInInclusion {
-                timestamp: 0x64,
-                finalized: true,
-            })
-        );
-        // included after it
-        assert_eq!(
-            inclusion(0x0e, 0x20),
-            Some(FundsInInclusion {
-                timestamp: 0x65,
-                finalized: false,
-            })
-        );
-        // included, but not before the block the mint commits to
-        assert_eq!(inclusion(0x0e, 0x0d), None);
     }
 }

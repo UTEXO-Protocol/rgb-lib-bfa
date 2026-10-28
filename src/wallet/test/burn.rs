@@ -16,7 +16,7 @@ fn mint_bfa_to_self(
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, asset_id, recipient);

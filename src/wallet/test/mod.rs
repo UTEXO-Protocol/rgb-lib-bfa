@@ -246,7 +246,6 @@ thread_local! {
     pub(crate) static MOCK_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MIN_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CONFIRMATION_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_MINT_LOCK_WINDOW: RefCell<Option<u32>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "_online")]
@@ -478,13 +477,6 @@ pub fn spv_only() -> bool {
 #[cfg(feature = "_online")]
 pub fn mock_clock_skew_margin() -> Option<u32> {
     MOCK_CLOCK_SKEW_MARGIN.with_borrow(|m| *m)
-}
-
-/// Minimum time (seconds) left on the invoice of a mint to use instead of
-/// `MIN_MINT_LOCK_WINDOW_SECS`, if set.
-#[cfg(feature = "_online")]
-pub fn mock_mint_lock_window() -> Option<u32> {
-    MOCK_MINT_LOCK_WINDOW.with_borrow(|m| *m)
 }
 
 /// Sender proxy retention grace (seconds) to use instead of the one advertised by the proxy, if

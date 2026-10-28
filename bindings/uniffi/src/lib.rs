@@ -567,7 +567,9 @@ impl From<RgbLibTransitionMetadata> for TransitionMetadata {
             RgbLibTransitionMetadata::AllowedInflation(amount) => {
                 TransitionMetadata::AllowedInflation { amount }
             }
-            RgbLibTransitionMetadata::BeforeBlock(block) => TransitionMetadata::BeforeBlock { block },
+            RgbLibTransitionMetadata::BeforeBlock(block) => {
+                TransitionMetadata::BeforeBlock { block }
+            }
         }
     }
 }
@@ -577,7 +579,9 @@ impl From<TransitionMetadata> for RgbLibTransitionMetadata {
             TransitionMetadata::AllowedInflation { amount } => {
                 RgbLibTransitionMetadata::AllowedInflation(amount)
             }
-            TransitionMetadata::BeforeBlock { block } => RgbLibTransitionMetadata::BeforeBlock(block),
+            TransitionMetadata::BeforeBlock { block } => {
+                RgbLibTransitionMetadata::BeforeBlock(block)
+            }
         }
     }
 }
@@ -1504,6 +1508,16 @@ impl Wallet {
             .fail_transfers(online, batch_transfer_idx, no_asset_only, skip_sync)
     }
 
+    fn fail_mint(
+        &self,
+        online: Online,
+        batch_transfer_idx: i32,
+        force: bool,
+    ) -> Result<(), RgbLibError> {
+        self._get_wallet()
+            .fail_mint(online, batch_transfer_idx, force)
+    }
+
     fn get_address(&self) -> Result<String, RgbLibError> {
         self._get_wallet().get_address()
     }
@@ -2065,6 +2079,16 @@ impl MultisigWallet {
     ) -> Result<bool, RgbLibError> {
         self._get_wallet()
             .fail_transfers(online, batch_transfer_idx, no_asset_only, skip_sync)
+    }
+
+    fn fail_mint(
+        &self,
+        online: Online,
+        batch_transfer_idx: i32,
+        force: bool,
+    ) -> Result<(), RgbLibError> {
+        self._get_wallet()
+            .fail_mint(online, batch_transfer_idx, force)
     }
 
     fn get_asset_balance(&self, asset_id: String) -> Result<Balance, RgbLibError> {

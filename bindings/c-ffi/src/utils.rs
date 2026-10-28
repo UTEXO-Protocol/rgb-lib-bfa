@@ -412,6 +412,19 @@ pub(crate) fn fail_transfers(
     Ok(serde_json::to_string(&res)?)
 }
 
+pub(crate) fn fail_mint(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    batch_transfer_idx: *const c_char,
+    force: bool,
+) -> Result<String, Error> {
+    let wallet = Wallet::from_opaque(wallet)?;
+    let online = convert_online(online)?;
+    let batch_transfer_idx = ptr_to_num(batch_transfer_idx)?;
+    wallet.fail_mint(online, batch_transfer_idx, force)?;
+    Ok(serde_json::to_string(&())?)
+}
+
 pub(crate) fn finalize_psbt(
     wallet: &COpaqueStruct,
     signed_psbt: *const c_char,

@@ -1571,14 +1571,16 @@ impl Wallet {
     /// leave at least a block for the lock after the latest one, erroring with
     /// [`Error::InvalidBeforeBlock`] otherwise.
     ///
-    /// The deadline for the lock is also the expiration of the recipient's invoice, which is the
-    /// expiration of the transfer: the lock has to be included on the external chain by then. If
-    /// it is, the transfer is waited for past it, for the lock to be finalized, for up to 24
-    /// hours; otherwise, once the deadline passes, the recipient is allowed to fail the transfer
-    /// and [`mint_end`](Wallet::mint_end) will refuse to broadcast it. The invoice must have at
-    /// least 1 hour left, to leave time for the lock, erroring with [`Error::InvoiceExpired`]
-    /// otherwise. The lock should still be made well before the deadline, paying enough fees for
-    /// it to be included in time, since a lock included after it doesn't mint anything.
+    /// The provided `before_block` is the mint's only expiration, no timestamp is involved: the
+    /// `recipient` must have no expiration, erroring with [`Error::InvalidRecipientData`]
+    /// otherwise. Its invoice expiration only bounds how long its proxy keeps the invoice and the
+    /// consignment, so the consignment can't be posted once it has passed. The mint expires once
+    /// its lock can no longer be included before `before_block`, as of the latest finalized block
+    /// of the external chain: then the recipient fails it (at refresh), the sender fails it at
+    /// [`mint_end`](Wallet::mint_end), and either one can fail it with
+    /// [`fail_mint`](crate::wallet::RgbWalletOpsOnline::fail_mint). The lock should be made well
+    /// before `before_block`, paying enough fees for it to be included in time, since a lock
+    /// included after it doesn't mint anything.
     ///
     /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
     /// to be fed to the [`mint_end`](Wallet::mint_end) function for broadcasting.
@@ -1645,12 +1647,10 @@ impl Wallet {
     /// if it never will be. This enforces the safe operation order: begin,
     /// lock on the external chain, wait for the lock to be final, then end.
     ///
-    /// The TX is not broadcast once the deadline for the lock (the expiration of the recipient's
-    /// invoice, see [`mint_begin`](Wallet::mint_begin)) has passed, erroring with
-    /// [`Error::TransferExpired`] instead, since the recipient may have already failed the
-    /// transfer, unless the lock was included on the external chain by the deadline and 24 hours
-    /// haven't passed since it, as the recipient waits for such a lock to be finalized. The
-    /// expired transfer can then be failed with [`fail_transfers`](Wallet::fail_transfers).
+    /// A mint whose lock has expired (see [`mint_begin`](Wallet::mint_begin)) is failed, releasing
+    /// its inputs, before erroring with [`Error::MintEventExpired`]. A mint whose lock is not
+    /// confirmed yet is left as is, so this can be called again later, and can be failed with
+    /// [`fail_mint`](crate::wallet::RgbWalletOpsOnline::fail_mint) once its lock has expired.
     ///
     /// A mint that has already failed or been ended errors with [`Error::CannotEndTransfer`].
     ///
@@ -1666,7 +1666,16 @@ impl Wallet {
         self.check_online(online)?;
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
-        let res = self.mint_end_impl(&txn, &psbt)?;
+        let res = match self.mint_end_impl(&txn, &psbt) {
+            Ok(res) => res,
+            // the mint has been failed, which needs to be committed
+            Err(e @ Error::MintEventExpired { .. }) => {
+                self.update_backup_info(&txn, false)?;
+                self.persist_and_commit(txn)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Minting (end) completed");

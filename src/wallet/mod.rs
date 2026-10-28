@@ -106,12 +106,6 @@ pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 #[cfg(feature = "_online")]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
-/// Minimum time, in seconds, the recipient's invoice must have left when a mint begins: the lock
-/// has to be included on the external chain by the invoice expiration, so a shorter window would
-/// leave too little time to make it.
-#[cfg(feature = "_online")]
-pub(crate) const MIN_MINT_LOCK_WINDOW_SECS: u32 = 60 * 60;
-
 /// Minimum retention grace, in seconds, a recipient requires from the sender proxy
 /// (`retention_grace_secs`) to ACK a transfer: it's the time a released signed TX can still be
 /// retrieved after the operation expiration, so a recipient offline for longer might miss it. A
@@ -125,13 +119,6 @@ pub(crate) const MIN_SENDER_RETENTION_GRACE_SECS: u32 = 86400;
 /// differences (see `v1.0-changes-spec.md` 6.4).
 #[cfg(feature = "_online")]
 pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
-
-/// Time, in seconds, a mint whose lock was included on the external chain by its expiration is
-/// still waited for past it, for the lock to be finalized. It only applies when such a lock
-/// exists, so it can be generous enough for the slowest finality (and for finality stalls) of any
-/// external chain.
-#[cfg(feature = "_online")]
-pub(crate) const MINT_FINALITY_GRACE_SECS: i64 = 24 * 60 * 60;
 
 /// Maximum proof of work difficulty (leading zero bits) the wallet accepts to compute when posting
 /// a consignment; a proxy requiring more cannot be used to create transfers.
