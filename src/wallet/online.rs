@@ -249,6 +249,15 @@ fn invoice_expiration_margin() -> u32 {
     INVOICE_EXPIRATION_MARGIN_SECS
 }
 
+/// Check an outgoing operation expires at least the clock skew margin after its creation: one
+/// expiring sooner could already be expired on the sender proxy's clock.
+fn check_operation_expiration(expiration_timestamp: i64) -> Result<(), Error> {
+    if expiration_timestamp < now().unix_timestamp() + i64::from(clock_skew_margin()) {
+        return Err(Error::InvalidExpiration);
+    }
+    Ok(())
+}
+
 /// Interpret an error returned by the sender proxy to `ack.get`, requested while waiting for the
 /// recipients' ACKs.
 ///
@@ -5548,6 +5557,9 @@ pub trait WalletOnline: WalletOffline {
     ) -> Result<BeginOperationData, Error> {
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
             return Err(Error::InvalidRecipientMap);
+        }
+        if let Some(expiration_timestamp) = expiration_timestamp {
+            check_operation_expiration(expiration_timestamp)?;
         }
         if let Some(endpoint) = &sender_transport_endpoint {
             self.convert_transport_endpoint_url(endpoint)?;
