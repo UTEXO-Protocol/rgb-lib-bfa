@@ -16,6 +16,32 @@ pub(crate) const UTXO_NUM: u8 = 5;
 pub(crate) const MIN_BLOCK_ESTIMATION: u16 = 1;
 pub(crate) const MAX_BLOCK_ESTIMATION: u16 = 1008;
 
+/// The maximum length of a confined collection, given an accessor returning it from a bundle.
+const fn bundle_confinement_max<
+    C: amplify::confinement::Collection,
+    const MIN: usize,
+    const MAX: usize,
+>(
+    _: fn(&TransitionBundle) -> &Confined<C, MIN, MAX>,
+) -> usize {
+    MAX
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold and still be spent: spending it moves
+/// all of them as inputs of the bundle of the asset, which spends at most as many opouts as its
+/// input map can hold (all assignment types together)
+pub(crate) const MAX_UTXO_ASSET_ALLOCATIONS: usize =
+    bundle_confinement_max(|b: &TransitionBundle| &b.input_map);
+
+/// Maximum number of allocations of an asset a UTXO can hold (see [`MAX_UTXO_ASSET_ALLOCATIONS`]).
+pub(crate) fn max_utxo_asset_allocations() -> usize {
+    #[cfg(test)]
+    if let Some(max_allocations) = mock_max_utxo_asset_allocations() {
+        return max_allocations;
+    }
+    MAX_UTXO_ASSET_ALLOCATIONS
+}
+
 /// Return the indexer protocol for the provided URL.
 /// An error is raised if the provided indexer URL is invalid or if the service is for the wrong
 /// network or doesn't have the required functionality.
@@ -1770,6 +1796,23 @@ pub trait WalletOnline: WalletOffline {
         payments
     }
 
+    /// The number of allocations of the asset with ID `asset_id` the TXO at `outpoint`, if known
+    /// and unspent, holds or is due to receive from transfers that haven't failed.
+    fn count_utxo_asset_allocations(
+        &self,
+        txn: &DbTxn,
+        outpoint: &Outpoint,
+        asset_id: &str,
+    ) -> Result<usize, Error> {
+        let Some(txo) = txn.get_txo(outpoint)? else {
+            return Ok(0);
+        };
+        if txo.spent {
+            return Ok(0);
+        }
+        txn.count_txo_incoming_asset_colorings(txo.idx, asset_id)
+    }
+
     // extract the assignments in a single bundle that pay the recipient identified by
     // `known_concealed` (blind receives) or by the witness `vout` (witness receives)
     fn assignments_for_bundle(
@@ -2709,6 +2752,38 @@ pub trait WalletOnline: WalletOffline {
                 self.logger(),
                 "Consignment pays this recipient {} allocations, refusing it",
                 receiving.len()
+            );
+            return self.refuse_consignment(
+                txn,
+                &mode,
+                &recipient_id,
+                &recipient_seed,
+                updated_batch_transfer,
+            );
+        }
+
+        // a UTXO holding more allocations of the asset than a bundle can spend would be frozen,
+        // as spending it requires moving all of them: refuse a consignment that would cause it
+        // (e.g. paying a UTXO the change of a send has just filled up). This is intended even when
+        // some of the allocations counted are still pending, as their transfers settling would
+        // freeze the UTXO, while waiting to know whether they fail would leave this transfer
+        // pending
+        let receive_outpoint = match &transfer.recipient_type {
+            Some(RecipientTypeFull::Blind { unblinded_utxo }) => unblinded_utxo.clone(),
+            Some(RecipientTypeFull::Witness { .. }) => Outpoint {
+                txid: txid.clone(),
+                vout: vout.ok_or(InternalError::Unexpected)?,
+            },
+            _ => return Err(InternalError::Unexpected.into()),
+        };
+        let held = self.count_utxo_asset_allocations(txn, &receive_outpoint, &asset_id)?;
+        if held + receiving.len() > max_utxo_asset_allocations() {
+            error!(
+                self.logger(),
+                "Consignment pays {} allocation(s) of the asset to a UTXO already holding {held}, \
+                 exceeding the {} a UTXO can hold and still be spent",
+                receiving.len(),
+                max_utxo_asset_allocations()
             );
             return self.refuse_consignment(
                 txn,

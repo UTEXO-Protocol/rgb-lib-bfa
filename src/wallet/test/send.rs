@@ -11983,6 +11983,68 @@ fn receive_multiple_allocations_refused() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
+fn utxo_freeze_limit() {
+    initialize();
+
+    // a low limit, to check it with a few allocations
+    let max_allocations: usize = 2;
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations));
+    let amount: u64 = 100;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // paying the only UTXO of the receiver up to the limit is accepted
+    for _ in 0..max_allocations {
+        send_and_settle(
+            &mut party,
+            &mut rcv_party,
+            asset_id,
+            Assignment::Fungible(amount),
+        );
+    }
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        max_allocations
+    );
+
+    // paying it one allocation more is refused
+    let receive_data = rcv_party.blind_receive();
+    send_to_blind_refused(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data,
+        Assignment::Fungible(amount),
+    );
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        max_allocations
+    );
+
+    // and the UTXO can be spent
+    let total = amount * max_allocations as u64;
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, total);
+    send_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        Assignment::Fungible(total),
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
     initialize();
 

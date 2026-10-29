@@ -418,9 +418,9 @@ use crate::wallet::BitcoindClient;
 #[cfg(test)]
 use crate::wallet::test::{
     accept_multiple_allocations, mock_chain_tx, mock_clock_skew_margin, mock_confirmation_margin,
-    mock_input_unspents, mock_local_version, mock_min_retention_grace, mock_retention_grace,
-    mock_send_end_crash, mock_spam_recipient_assignments, skip_build_dag, skip_check_fee_rate,
-    spv_only,
+    mock_input_unspents, mock_local_version, mock_max_utxo_asset_allocations,
+    mock_min_retention_grace, mock_retention_grace, mock_send_end_crash,
+    mock_spam_recipient_assignments, skip_build_dag, skip_check_fee_rate, spv_only,
 };
 #[cfg(feature = "_online")]
 use crate::{

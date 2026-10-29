@@ -222,6 +222,7 @@ thread_local! {
     pub(crate) static MOCK_SEND_END_CRASH: RefCell<Option<()>> = const { RefCell::new(None) };
     pub(crate) static MOCK_SPAM_RECIPIENT_ASSIGNMENTS: RefCell<Option<(u16, u64)>> = const { RefCell::new(None) };
     pub(crate) static MOCK_ACCEPT_MULTIPLE_ALLOCATIONS: RefCell<bool> = const { RefCell::new(false) };
+    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: RefCell<Option<usize>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CLOCK_SKEW_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MIN_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
@@ -522,6 +523,13 @@ pub fn mock_spam_recipient_assignments(mut transition: Transition) -> Transition
             .unwrap();
     }
     transition
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold to use instead of
+/// `MAX_UTXO_ASSET_ALLOCATIONS`, if set.
+#[cfg(feature = "_online")]
+pub fn mock_max_utxo_asset_allocations() -> Option<usize> {
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m)
 }
 
 #[cfg(feature = "_online")]
