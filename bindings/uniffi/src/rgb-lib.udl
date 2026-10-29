@@ -836,6 +836,8 @@ enum TypeOfTransition {
   "Inflate",
   "Transfer",
   "Burn",
+  "TransferInflation",
+  "TransferLink",
 };
 
 [Remote]
