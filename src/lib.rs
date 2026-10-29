@@ -176,9 +176,10 @@ use std::{
     hash::Hasher,
     num::NonZeroU32,
 };
+use std::{collections::HashMap, fmt, path::Path, str::FromStr};
 #[cfg(feature = "wallet")]
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     hash::Hash,
     io::{self, Read, Write},
@@ -186,12 +187,6 @@ use std::{
     path::PathBuf,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
-};
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    path::Path,
-    str::FromStr,
 };
 
 use amplify::{ByteArray, Wrapper};
@@ -293,6 +288,8 @@ use rgb_lib_migration::{
 #[cfg(feature = "wallet")]
 use rgbinvoice::{AddressPayload, RgbInvoice, RgbInvoiceBuilder, RgbTransport};
 use rgbinvoice::{Beneficiary, XChainNet};
+#[cfg(feature = "wallet")]
+use rgbstd::SecretSeal;
 #[cfg(feature = "electrum")]
 use rgbstd::indexers::electrum_blocking::electrum_client::{
     Config as ElectrumConfig, ConfigBuilder,
@@ -321,7 +318,7 @@ use rgbstd::{
         Attachment, ContractTerms, EmbeddedMedia as RgbEmbeddedMedia, MediaType,
         ProofOfReserves as RgbProofOfReserves, RejectListUrl, RicardianContract, Ticker, TokenData,
     },
-    txout::{BlindSeal, ExplicitSeal, TxPtr},
+    txout::ExplicitSeal,
     validation::{
         ResolveWitness, SchemaDefinition, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
     },
@@ -329,8 +326,8 @@ use rgbstd::{
 };
 use rgbstd::{
     Amount, AssignmentType, Assignments, ChainNet, ExposedSeal, Genesis, GlobalStateType,
-    GraphSeal, KnownTransition, OpId, Operation as _, Opout, Precision, Schema, SecretSeal,
-    Transition, TransitionBundle, TransitionType, TypedAssigns,
+    GraphSeal, KnownTransition, OpId, Operation as _, Opout, Precision, Schema, Transition,
+    TransitionBundle, TransitionType, TypedAssigns,
     bitcoin::{OutPoint, Transaction as BdkTransaction, Txid},
     containers::{
         BuilderSeal, Consignment, LoadError, UniversalFile, ValidContract, ValidTransfer,
@@ -338,17 +335,14 @@ use rgbstd::{
     contract::IssuerWrapper,
     rgbcore::{commit_verify::mpc::Commitment, dbc::Proof as _},
     stl::{AssetSpec, BurnReason, Details, Name},
-    txout::TxoSeal,
+    txout::{BlindSeal, SealTxid, TxPtr, TxoSeal},
     validation::DbcProof,
 };
 #[cfg(feature = "_online")]
 use rgbstd::{
     contract::FilterIncludeAll,
-    daggy::Walker,
     indexers::AnyResolver,
-    validation::{
-        OpoutsDagData, SchemaRules, ValidationConfig, ValidationError, Validity, Warning,
-    },
+    validation::{OpsDag, SchemaRules, ValidationConfig, ValidationError, Validity, Warning},
 };
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
@@ -360,7 +354,7 @@ use schemata::{
 use schemata::{
     GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION, GS_DETAILS, GS_ISSUED_SUPPLY, GS_NAME,
     GS_NOMINAL, GS_PRECISION, MS_ALLOWED_INFLATION, OS_ASSET, OS_INFLATION, TS_BURN, TS_INFLATION,
-    TS_TRANSFER,
+    TS_TRANSFER, TS_TRANSFER_INFLATION, TS_TRANSFER_LINK,
 };
 #[cfg(feature = "wallet")]
 use scrypt::{Params, phc::Salt, scrypt};
@@ -425,7 +419,7 @@ use crate::wallet::BitcoindClient;
 use crate::wallet::test::{
     mock_chain_tx, mock_clock_skew_margin, mock_confirmation_margin, mock_input_unspents,
     mock_local_version, mock_min_retention_grace, mock_retention_grace, mock_send_end_crash,
-    skip_build_dag, skip_check_fee_rate, spv_only, strip_terminals,
+    skip_build_dag, skip_check_fee_rate, spv_only,
 };
 #[cfg(feature = "_online")]
 use crate::{
