@@ -45,6 +45,17 @@ pub(crate) fn max_utxo_asset_allocations() -> usize {
     MAX_UTXO_ASSET_ALLOCATIONS
 }
 
+/// The ID of the contract a contract `link` (e.g. [`LinkableSchemaWrapper::link_from`]) points
+/// to, if any.
+pub(crate) fn contract_link(
+    link: Result<Option<ContractId>, LinkError>,
+) -> Result<Option<String>, Error> {
+    link.map(|contract_id| contract_id.map(|c| c.to_string()))
+        .map_err(|e| Error::Internal {
+            details: format!("invalid contract link: {e}"),
+        })
+}
+
 pub trait WalletOffline: WalletBackup {
     fn bitcoin_network(&self) -> BitcoinNetwork {
         self.wallet_data().bitcoin_network
@@ -569,6 +580,7 @@ pub trait WalletOffline: WalletBackup {
             max_supply: None,
             known_circulating_supply: None,
             reject_list_url: None,
+            linked_from_contract: None,
             token: None,
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -714,6 +726,7 @@ pub trait WalletOffline: WalletBackup {
             max_supply: None,
             known_circulating_supply: None,
             reject_list_url: None,
+            linked_from_contract: None,
             token: Some(Token::from_token_data(&token_data, self.media_dir())),
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -823,6 +836,7 @@ pub trait WalletOffline: WalletBackup {
             max_supply: None,
             known_circulating_supply: None,
             reject_list_url: None,
+            linked_from_contract: None,
             token: None,
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -846,10 +860,19 @@ pub trait WalletOffline: WalletBackup {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<IssueData, Error> {
         let asset_schema = &AssetSchema::Ifa;
 
         self.check_schema_support(asset_schema)?;
+
+        let linked_from_contract = linked_from_contract
+            .map(|contract_id| {
+                ContractId::from_str(&contract_id)
+                    .map_err(|_| Error::InvalidContractId { contract_id })
+            })
+            .transpose()?;
 
         let settled = self.get_total_issue_amount(&amounts, true)?;
         let inflation_amt = self.get_total_inflation_amount(&inflation_amounts, settled)?;
@@ -942,6 +965,30 @@ pub trait WalletOffline: WalletBackup {
                 .expect("invalid global state data");
         }
 
+        if link_right {
+            let utxo = self.get_utxo(txn, &exclude_outpoints, Some(&unspents), false, Some(0))?;
+            exclude_outpoints.push(utxo.outpoint());
+            issue_utxos
+                .entry(utxo.idx)
+                .or_default()
+                .push(Assignment::LinkRight);
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, self.get_builder_seal(utxo))
+                .expect("invalid link right");
+        }
+        if let Some(linked_from_contract) = &linked_from_contract {
+            builder = builder
+                .add_global_state(RGB_GLOBAL_LINKED_FROM_CONTRACT, *linked_from_contract)
+                .expect("invalid global state data");
+        }
+
+        #[cfg(test)]
+        if let Some(seal) = mock_ifa_link_right() {
+            builder = builder
+                .add_rights(RGB_STATE_LINK_RIGHT, seal)
+                .expect("invalid link right");
+        }
+
         debug!(self.logger(), "Issuing: {issue_utxos:?}");
 
         let (asset_id, _contract_path, valid_contract) = self.issue_contract(builder)?;
@@ -958,6 +1005,7 @@ pub trait WalletOffline: WalletBackup {
             max_supply: Some(max_supply),
             known_circulating_supply: Some(settled),
             reject_list_url,
+            linked_from_contract: linked_from_contract.map(|c| c.to_string()),
             token: None,
             timestamp: valid_contract.genesis.timestamp,
             added_at: created_at,
@@ -1122,6 +1170,7 @@ pub trait WalletOffline: WalletBackup {
             Assignment::Fungible(amt) | Assignment::InflationRight(amt) => {
                 invoice_builder = invoice_builder.set_amount_raw(*amt);
             }
+            Assignment::LinkRight => invoice_builder = invoice_builder.set_void(),
             Assignment::NonFungible | Assignment::Any => {}
         }
         if let Some(state_name) = detected_assignment.state_name() {
@@ -1481,6 +1530,8 @@ pub trait WalletOffline: WalletBackup {
             details: asset.details,
             token,
             reject_list_url: asset.reject_list_url,
+            linked_from_contract: asset.linked_from_contract,
+            linked_to_contract: asset.linked_to_contract,
         })
     }
 
@@ -1527,6 +1578,8 @@ pub trait WalletOffline: WalletBackup {
             ticker: ActiveValue::Set(asset_data.ticker.clone()),
             timestamp: ActiveValue::Set(asset_data.timestamp),
             reject_list_url: ActiveValue::Set(asset_data.reject_list_url.clone()),
+            linked_from_contract: ActiveValue::Set(asset_data.linked_from_contract.clone()),
+            linked_to_contract: ActiveValue::Set(None),
         };
         let idx = txn.set_asset(db_asset.clone())?;
         db_asset.idx = ActiveValue::Set(idx);
@@ -1714,6 +1767,7 @@ pub trait WalletOffline: WalletBackup {
                     max_supply: None,
                     known_circulating_supply: None,
                     reject_list_url: None,
+                    linked_from_contract: None,
                     token: None,
                     timestamp,
                     added_at,
@@ -1744,6 +1798,7 @@ pub trait WalletOffline: WalletBackup {
                     max_supply: None,
                     known_circulating_supply: None,
                     reject_list_url: None,
+                    linked_from_contract: None,
                     token: Some(token_full),
                     timestamp,
                     added_at,
@@ -1771,6 +1826,7 @@ pub trait WalletOffline: WalletBackup {
                     max_supply: None,
                     known_circulating_supply: None,
                     reject_list_url: None,
+                    linked_from_contract: None,
                     token: None,
                     timestamp,
                     added_at,
@@ -1797,6 +1853,7 @@ pub trait WalletOffline: WalletBackup {
                     initial_supply
                 };
                 let reject_list_url = contract.reject_list_url().map(|u| u.to_string());
+                let linked_from_contract = contract_link(contract.link_from())?;
                 LocalAssetData {
                     asset_id: contract_id.to_string(),
                     name,
@@ -1809,6 +1866,7 @@ pub trait WalletOffline: WalletBackup {
                     max_supply: Some(max_supply),
                     known_circulating_supply: Some(known_circulating_supply),
                     reject_list_url,
+                    linked_from_contract,
                     token: None,
                     timestamp,
                     added_at,
@@ -2135,14 +2193,20 @@ pub trait WalletOffline: WalletBackup {
                     RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
                 }
             }
-        } else if transfer.recipient_id.is_none() {
-            // burn is the only outgoing transfer with no recipient
-            TransferKind::Burn
-        } else if coloring_info.any_issue {
-            // inflation transfer is outgoing and connected to issue colorings
-            TransferKind::Inflation
         } else {
-            TransferKind::Send
+            match asset_transfer
+                .transition_type
+                .expect("outgoing asset transfers record their transition")
+            {
+                // the transfers of rights are not the main transition of an operation, so they're
+                // never recorded, but they would be sends
+                TypeOfTransition::Transfer
+                | TypeOfTransition::TransferInflation
+                | TypeOfTransition::TransferLink => TransferKind::Send,
+                TypeOfTransition::Inflate => TransferKind::Inflation,
+                TypeOfTransition::Burn => TransferKind::Burn,
+                TypeOfTransition::Link => TransferKind::Link,
+            }
         };
 
         let receive_utxo = match &transfer.recipient_type {
@@ -2159,16 +2223,19 @@ pub trait WalletOffline: WalletBackup {
             TransferKind::ReceiveBlind | TransferKind::ReceiveWitness | TransferKind::Issuance => {
                 vec![]
             }
-            TransferKind::Send | TransferKind::Inflation | TransferKind::Burn => {
-                coloring_info.change_utxos.clone()
-            }
+            TransferKind::Send
+            | TransferKind::Inflation
+            | TransferKind::Burn
+            | TransferKind::Link => coloring_info.change_utxos.clone(),
         };
 
         let consignment_path = match (&kind, batch_transfer.status) {
-            (TransferKind::Send | TransferKind::Burn, _) => Some(self.send_consignment_path(
-                &asset_transfer.asset_id.clone().unwrap(),
-                &batch_transfer.txid.clone().unwrap(),
-            )),
+            (TransferKind::Send | TransferKind::Burn | TransferKind::Link, _) => {
+                Some(self.send_consignment_path(
+                    &asset_transfer.asset_id.clone().unwrap(),
+                    &batch_transfer.txid.clone().unwrap(),
+                ))
+            }
             // no consignment is produced for an inflation, which has no counterparty
             (TransferKind::Inflation, _) => None,
             (
@@ -2185,7 +2252,10 @@ pub trait WalletOffline: WalletBackup {
         .map(|p| p.to_string_lossy().to_string());
 
         let psbt_path = match &kind {
-            TransferKind::Send | TransferKind::Inflation | TransferKind::Burn => batch_transfer
+            TransferKind::Send
+            | TransferKind::Inflation
+            | TransferKind::Burn
+            | TransferKind::Link => batch_transfer
                 .txid
                 .as_ref()
                 .map(|txid| self.get_transfer_dir(txid).join(UNSIGNED_PSBT_FILE))

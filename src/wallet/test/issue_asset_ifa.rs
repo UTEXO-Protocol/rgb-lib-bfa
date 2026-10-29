@@ -317,6 +317,8 @@ fn fail() {
         vec![AMOUNT],
         vec![],
         None,
+        false,
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidTicker { details: m }) if m == EMPTY_MSG));
 
@@ -328,6 +330,8 @@ fn fail() {
         vec![AMOUNT],
         vec![],
         None,
+        false,
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_TOO_LONG_MSG));
 
@@ -338,6 +342,8 @@ fn fail() {
         PRECISION,
         vec![AMOUNT],
         vec![],
+        None,
+        false,
         None,
     );
     assert!(
@@ -352,6 +358,8 @@ fn fail() {
         PRECISION,
         vec![AMOUNT],
         vec![],
+        None,
+        false,
         None,
     );
     assert!(
@@ -368,6 +376,8 @@ fn fail() {
         vec![AMOUNT],
         vec![],
         None,
+        false,
+        None,
     );
     assert!(
         matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_NOT_ASCII_MSG
@@ -383,6 +393,8 @@ fn fail() {
         vec![AMOUNT],
         vec![],
         None,
+        false,
+        None,
     );
     assert!(
         matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_NOT_START_MSG
@@ -397,6 +409,8 @@ fn fail() {
         vec![AMOUNT],
         vec![],
         None,
+        false,
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidName { details: m }) if m == EMPTY_MSG));
 
@@ -407,6 +421,8 @@ fn fail() {
         PRECISION,
         vec![AMOUNT],
         vec![],
+        None,
+        false,
         None,
     );
     assert!(matches!(result, Err(Error::InvalidName { details: m }) if m == IDENT_TOO_LONG_MSG));
@@ -419,6 +435,8 @@ fn fail() {
         PRECISION,
         vec![AMOUNT],
         vec![],
+        None,
+        false,
         None,
     );
     assert!(
@@ -433,6 +451,8 @@ fn fail() {
         19,
         vec![AMOUNT],
         vec![],
+        None,
+        false,
         None,
     );
     assert!(matches!(
