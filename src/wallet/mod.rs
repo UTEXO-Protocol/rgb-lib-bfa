@@ -40,8 +40,8 @@ pub use objects::{
 #[cfg(feature = "_online")]
 pub use objects::{
     BitcoindAuth, BurnBeginResult, BurnDetails, IndexerConfig, IndexerProtocol, InflateBeginResult,
-    InflateDetails, OnlineOptions, OperationResult, RefreshFilter, RefreshResult,
-    RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
+    InflateDetails, LinkBeginResult, LinkDetails, OnlineOptions, OperationResult, RefreshFilter,
+    RefreshResult, RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
@@ -120,4 +120,5 @@ pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
+pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";

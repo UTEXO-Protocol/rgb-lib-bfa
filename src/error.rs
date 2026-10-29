@@ -262,6 +262,13 @@ pub enum Error {
     #[error("Invalid content signature")]
     InvalidContentSignature,
 
+    /// The provided contract ID is invalid
+    #[error("Invalid contract ID: {contract_id}")]
+    InvalidContractId {
+        /// The invalid contract ID
+        contract_id: String,
+    },
+
     /// The provided cosigner is invalid
     #[error("Invalid cosigner: {details}")]
     InvalidCosigner {
@@ -749,6 +756,13 @@ pub enum Error {
     UnsupportedLayer1 {
         /// Layer 1
         layer_1: String,
+    },
+
+    /// The schema doesn't support link transitions
+    #[error("Link not supported")]
+    UnsupportedLink {
+        /// Asset schema
+        asset_schema: AssetSchema,
     },
 
     /// The given schema is not supported

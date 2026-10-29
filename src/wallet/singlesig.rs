@@ -516,6 +516,13 @@ impl Wallet {
     ///
     /// The `inflation_amounts` can be empty. If provided the sum of its elements plus the sum of
     /// `amounts` cannot exceed the maximum `u64` value.
+    ///
+    /// If `link_right` is true, the asset is issued with its link right, on a separate UTXO, which
+    /// can be spent once to link the asset to another contract (see [`link`](Wallet::link)).
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
+    /// the one it replaces).
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -524,6 +531,8 @@ impl Wallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetIFA, Error> {
         info!(self.logger(), "Issuing IFA...");
         let txn = self.database().begin_transaction()?;
@@ -535,6 +544,8 @@ impl Wallet {
             amounts,
             inflation_amounts,
             reject_list_url,
+            link_right,
+            linked_from_contract,
         )?;
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
@@ -1459,6 +1470,134 @@ impl Wallet {
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Burn (end) completed");
+        Ok(res)
+    }
+
+    /// Link an RGB asset to the contract with ID `linked_to_contract` (e.g. one replacing it),
+    /// spending its link right.
+    ///
+    /// This calls [`link_begin`](Wallet::link_begin), signs the resulting PSBT and finally
+    /// calls [`link_end`](Wallet::link_end).
+    ///
+    /// A wallet with private keys is required.
+    pub fn link(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
+        info!(
+            self.logger(),
+            "Linking to contract: {}...", linked_to_contract
+        );
+        self.check_xprv()?;
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let mut begin_op_data = self.link_begin_impl(
+            &txn,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            true,
+        )?;
+        self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
+        let res = self.link_end_impl(&txn, &begin_op_data.psbt)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT to link an RGB asset to the contract with ID `linked_to_contract` (e.g. one
+    /// replacing it), with the provided `fee_rate` (in sat/vB).
+    ///
+    /// The link spends the link right of the asset, which the wallet needs to hold, and commits the
+    /// contract it links to (`linkedToContract`), which can't be the asset's own one. As the asset
+    /// has at most one link right, an asset can be linked only once.
+    ///
+    /// If `dry_run` is true, the wallet does not persist the transfer in
+    /// [`TransferStatus::Initiated`]. The returned [`LinkBeginResult::batch_transfer_idx`] is None
+    /// in that case. The PSBT and on-disk transfer data under the wallet directory are still
+    /// produced. [`link_end`](Wallet::link_end) can still complete the operation and will persist
+    /// the transfer.
+    ///
+    /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
+    /// to be fed to the [`link_end`](Wallet::link_end) function for broadcasting.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a PSBT ready to be signed and operation details.
+    pub fn link_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, Error> {
+        info!(
+            self.logger(),
+            "Linking (begin) to contract: {}...", linked_to_contract
+        );
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let begin_operation_data = self.link_begin_impl(
+            &txn,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            dry_run,
+        )?;
+        if !dry_run {
+            self.update_backup_info(&txn, false)?;
+        }
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link (begin) completed");
+        Ok(LinkBeginResult {
+            psbt: begin_operation_data.psbt.to_string(),
+            batch_transfer_idx: begin_operation_data.batch_transfer_idx,
+            details: LinkDetails {
+                fascia_path: begin_operation_data
+                    .transfer_dir
+                    .join(FASCIA_FILE)
+                    .to_string_lossy()
+                    .to_string(),
+                min_confirmations,
+                entropy: begin_operation_data.info_batch_transfer.entropy,
+            },
+        })
+    }
+
+    /// Complete the link operation by broadcasting the provided PSBT and saving the transfer to DB.
+    ///
+    /// The provided PSBT, prepared with the [`link_begin`](Wallet::link_begin) function, needs to
+    /// have already been signed.
+    ///
+    /// A consignment proving the link (with its full history) is also written to disk, at the
+    /// `consignment_path` reported by [`list_transfers`](Wallet::list_transfers) for the link
+    /// operation, so that it can be handed to third parties that need to verify it.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a [`OperationResult`].
+    pub fn link_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger(), "Linking (end)...");
+        self.check_online(online)?;
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let txn = self.database().begin_transaction()?;
+        let res = self.link_end_impl(&txn, &psbt)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link (end) completed");
         Ok(res)
     }
 }

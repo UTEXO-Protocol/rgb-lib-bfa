@@ -50,6 +50,8 @@ pub enum TransitionGlobal {
     BurnedInflation(u64),
     /// Hex-encoded 32-byte burn reason, committed in burn transitions
     BurnReason(String),
+    /// ID of the contract the asset is linked to, committed in link transitions
+    LinkedToContract(String),
 }
 
 /// A metadata entry committed in an RGB transition, read by its validation but not part of the
@@ -511,6 +513,7 @@ fn bundle_output(bundle: &TransitionBundle, opout: Opout) -> Option<(OutPoint, A
                 _ => return None,
             }
         }
+        TypedAssigns::Declarative(_) if opout.ty == OS_LINK => Assignment::LinkRight,
         _ => return None,
     };
     Some((OutPoint::new(txid, seal.vout.into_u32()), assignment))
@@ -579,6 +582,15 @@ fn transition_info(
                         })?
                         .to_string(),
                 ),
+                GS_LINKED_TO_CONTRACT => TransitionGlobal::LinkedToContract(
+                    ContractId::from_strict_serialized(value.to_inner())
+                        .map_err(|e| Error::RgbInspection {
+                            details: format!(
+                                "bundle for contract {contract_id}: invalid {RGB_GLOBAL_LINKED_TO_CONTRACT} global: {e}"
+                            ),
+                        })?
+                        .to_string(),
+                ),
                 _ => {
                     return Err(Error::RgbInspection {
                         details: format!(
@@ -630,7 +642,7 @@ fn transition_info(
 /// is a terminal one.
 ///
 /// Assignment types rgb-lib can't represent are rejected, telling apart the ones defined by the
-/// schema but not supported yet (e.g. link rights) from the ones unknown to it.
+/// schema but not supported yet from the ones unknown to it.
 fn outputs_info<Seal: ExposedSeal + TxoSeal>(
     context: &str,
     asset_schema: AssetSchema,
@@ -644,6 +656,7 @@ fn outputs_info<Seal: ExposedSeal + TxoSeal>(
     for (ass_type, typed_assigns) in assignments.iter() {
         for no in 0..typed_assigns.len_u16() {
             let Some(assignment) = Assignment::from_typed_assigns(*ass_type, typed_assigns, no)
+                .filter(|a| asset_schema.supports_assignment(a))
             else {
                 let in_schema = asset_schema.schema().owned_types.contains_key(ass_type);
                 let kind = if in_schema {
@@ -745,13 +758,10 @@ mod tests {
             )
         };
 
-        // type defined by the schema but not supported by rgb-lib
-        let result = outputs(AssetSchema::Ifa, OS_LINK);
-        assert!(matches!(
-            result,
-            Err(Error::RgbInspection { details })
-                if details == format!("ctx: currently unsupported assignment type: {OS_LINK}")
-        ));
+        // supported type
+        let result = outputs(AssetSchema::Ifa, OS_LINK).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].assignment, Assignment::LinkRight);
 
         // type unknown to the schema
         let result = outputs(AssetSchema::Nia, OS_LINK);

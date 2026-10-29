@@ -1861,6 +1861,17 @@ pub trait WalletOnline: WalletOffline {
                         received.insert(opout, Assignment::NonFungible);
                     }
                 }
+                for (no, declarative_assignment) in
+                    typed_assigns.as_declarative().iter().enumerate()
+                {
+                    let assignment = match *ass_type {
+                        OS_LINK => Assignment::LinkRight,
+                        _ => continue,
+                    };
+                    if payment_seal.matches(&declarative_assignment.seal) {
+                        received.insert(Opout::new(*opid, *ass_type, no as u16), assignment);
+                    }
+                }
             }
         }
 
@@ -4144,6 +4155,13 @@ pub trait WalletOnline: WalletOffline {
                 {
                     needed = true;
                 }
+                if !assignments_collected.link & assignments_needed.link
+                    && asset_allocations
+                        .iter()
+                        .any(|a| matches!(a.assignment, Assignment::LinkRight))
+                {
+                    needed = true;
+                }
 
                 // skip UTXOs with no needed allocations
                 if !needed {
@@ -4579,6 +4597,17 @@ pub trait WalletOnline: WalletOffline {
                             Amount::from(*amt).into(),
                         )?;
                     }
+                    Assignment::LinkRight => {
+                        seal = self.get_beneficiary_seal(&recipient.local_recipient_data);
+                        asset_transition_builder = add_or_side_output(
+                            asset_transition_builder,
+                            &main_assignment_types,
+                            &mut side_transfers,
+                            OS_LINK,
+                            seal,
+                            AllocatedState::Void,
+                        )?;
+                    }
                     _ => unreachable!(),
                 };
 
@@ -4711,6 +4740,16 @@ pub trait WalletOnline: WalletOffline {
                         asset_transition_builder = asset_transition_builder
                             .add_global_state(RGB_GLOBAL_BURN_REASON, burn_reason)?;
                     }
+                }
+                TypeOfTransition::Link => {
+                    let linked_to_contract =
+                        transfer_info
+                            .linked_to_contract
+                            .ok_or_else(|| Error::Internal {
+                                details: s!("link transfer is missing the contract to link to"),
+                            })?;
+                    asset_transition_builder = asset_transition_builder
+                        .add_global_state(RGB_GLOBAL_LINKED_TO_CONTRACT, linked_to_contract)?;
                 }
                 _ => {}
             }
@@ -5256,6 +5295,7 @@ pub trait WalletOnline: WalletOffline {
                 user_driven: ActiveValue::Set(true),
                 batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
                 asset_id: ActiveValue::Set(Some(asset_id.clone())),
+                transition_type: ActiveValue::Set(Some(transfer_info.main_transition)),
                 ..Default::default()
             };
             let asset_transfer_idx = txn.set_asset_transfer(asset_transfer)?;
@@ -5387,6 +5427,7 @@ pub trait WalletOnline: WalletOffline {
                         None,
                         recipient.assignment,
                     ),
+                    TypeOfTransition::Link => (None, None, Assignment::LinkRight),
                     TypeOfTransition::TransferInflation | TypeOfTransition::TransferLink => {
                         unreachable!("rights transfers are not the main transition of an operation")
                     }
@@ -5426,10 +5467,12 @@ pub trait WalletOnline: WalletOffline {
         }
 
         for (asset_id, txo_assignments) in &info_contents.extra_allocations {
+            // the allocations of other assets are moved along by transfer transitions
             let asset_transfer = DbAssetTransferActMod {
                 user_driven: ActiveValue::Set(false),
                 batch_transfer_idx: ActiveValue::Set(batch_transfer_idx),
                 asset_id: ActiveValue::Set(Some(asset_id.clone())),
+                transition_type: ActiveValue::Set(Some(TypeOfTransition::Transfer)),
                 ..Default::default()
             };
             let asset_transfer_idx = txn.set_asset_transfer(asset_transfer)?;
@@ -6052,6 +6095,13 @@ pub trait WalletOnline: WalletOffline {
                     .or_default()
                     .push(local_recipient);
 
+                // an asset has at most one link right
+                if recipient.assignment == Assignment::LinkRight && original_assignments_needed.link
+                {
+                    return Err(Error::InvalidRecipientData {
+                        details: s!("the link right can only be sent to a single recipient"),
+                    });
+                }
                 recipient
                     .assignment
                     .add_to_assignments(&mut original_assignments_needed);
@@ -6123,6 +6173,7 @@ pub trait WalletOnline: WalletOffline {
                     beneficiaries_blinded: vec![],
                     beneficiaries_witness: vec![],
                     burn_reason: None,
+                    linked_to_contract: None,
                 };
                 transfer_info_map.insert(asset_id.clone(), transfer_info);
             }
@@ -6629,6 +6680,7 @@ pub trait WalletOnline: WalletOffline {
             beneficiaries_blinded: vec![],
             beneficiaries_witness: vec![],
             burn_reason: None,
+            linked_to_contract: None,
         };
         let receive_ids: Vec<String> = local_recipients
             .iter()
@@ -6721,6 +6773,41 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
+    /// The recipient of an operation that pays no one (a burn or a link): a dust output to a new
+    /// address of this wallet, returned as the witness recipients and the local recipients of the
+    /// operation.
+    #[allow(clippy::type_complexity)]
+    fn own_dust_recipient(
+        &mut self,
+    ) -> Result<(Vec<(ScriptBuf, u64)>, Vec<LocalRecipient>), Error> {
+        let chainnet: ChainNet = self.bitcoin_network().into();
+        let script_pubkey = self
+            .get_new_addresses(KeychainKind::External, 1)?
+            .script_pubkey();
+        let dust = self
+            .bdk_wallet()
+            .public_descriptor(KeychainKind::External)
+            .dust_value()
+            .to_sat();
+        let witness_recipients = vec![(script_pubkey.clone(), dust)];
+        let beneficiary = beneficiary_from_script_buf(script_pubkey);
+        let beneficiary = XChainNet::with(chainnet, beneficiary);
+        let local_recipients = vec![LocalRecipient {
+            recipient_id: beneficiary.to_string(),
+            local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
+                amount_sat: dust,
+                blinding: None,
+                vout: 1,
+            }),
+            assignment: Assignment::Fungible(0),
+            transport_endpoints: vec![],
+            public_key: vec![],
+            encryption: Encryption::Unsupported,
+            invoice_expiration: None,
+        }];
+        Ok((witness_recipients, local_recipients))
+    }
+
     fn burn_begin_impl(
         &mut self,
         txn: &DbTxn,
@@ -6762,32 +6849,7 @@ pub trait WalletOnline: WalletOffline {
             &mut SelectedInputs::default(),
         )?;
 
-        let chainnet: ChainNet = self.bitcoin_network().into();
-        let script_pubkey = self
-            .get_new_addresses(KeychainKind::External, 1)?
-            .script_pubkey();
-        let dust = self
-            .bdk_wallet()
-            .public_descriptor(KeychainKind::External)
-            .dust_value()
-            .to_sat();
-        let witness_recipients: Vec<(ScriptBuf, u64)> = vec![(script_pubkey.clone(), dust)];
-        let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
-        let beneficiary = XChainNet::with(chainnet, beneficiary);
-        let recipient_id = beneficiary.to_string();
-        let local_recipients = vec![LocalRecipient {
-            recipient_id,
-            local_recipient_data: LocalRecipientData::Witness(LocalWitnessData {
-                amount_sat: dust,
-                blinding: None,
-                vout: 1,
-            }),
-            assignment: Assignment::Fungible(0),
-            transport_endpoints: vec![],
-            public_key: vec![],
-            encryption: Encryption::Unsupported,
-            invoice_expiration: None,
-        }];
+        let (witness_recipients, local_recipients) = self.own_dust_recipient()?;
 
         let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
         let asset_info = AssetInfo {
@@ -6806,6 +6868,7 @@ pub trait WalletOnline: WalletOffline {
             beneficiaries_blinded: vec![],
             beneficiaries_witness: vec![],
             burn_reason,
+            linked_to_contract: None,
         };
         let receive_ids: Vec<String> = local_recipients
             .iter()
@@ -6842,6 +6905,130 @@ pub trait WalletOnline: WalletOffline {
         }
 
         // embed the signed transaction, then generate the consignment proving the burn: a burn
+        // has no recipient, so the consignment is not posted anywhere and is only made available
+        // on disk (see the `consignment_path` of the operation)
+        let tx = signed_psbt
+            .clone()
+            .extract_tx()
+            .map_err(InternalError::from)?;
+        fascia.update_witness_tx(tx);
+        self.gen_consignments(txn, &fascia, &info_contents.transfers, &transfer_dir)?;
+        let consignment_hashes = self.consignment_hashes(&transfer_dir, &info_contents)?;
+
+        let batch_transfer_idx = self.finalize_transfer_end(
+            txn,
+            txid.clone(),
+            signed_psbt,
+            &info_contents,
+            TransferStatus::WaitingConfirmations,
+            &consignment_hashes,
+            fascia,
+            false,
+        )?;
+
+        Ok(OperationResult {
+            txid,
+            batch_transfer_idx,
+            entropy: info_contents.entropy,
+        })
+    }
+
+    fn link_begin_impl(
+        &mut self,
+        txn: &DbTxn,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<BeginOperationData, Error> {
+        let asset = txn.check_asset_exists(asset_id.clone())?;
+        let schema = asset.schema;
+        self.check_schema_support(&schema)?;
+        if !schema.supports_link() {
+            return Err(Error::UnsupportedLink {
+                asset_schema: schema,
+            });
+        }
+
+        let contract_id = ContractId::from_str(&asset_id).expect("invalid contract ID");
+        // the link right can be spent only once, linking the asset to itself would waste it
+        let linked_to_contract = ContractId::from_str(&linked_to_contract)
+            .ok()
+            .filter(|linked_to_contract| *linked_to_contract != contract_id)
+            .ok_or(Error::InvalidContractId {
+                contract_id: linked_to_contract,
+            })?;
+
+        let (fee_rate_checked, unspents, input_unspents, mut stock) =
+            self.get_transfer_begin_data(txn, fee_rate)?;
+
+        let assignments_needed = AssignmentsCollection {
+            link: true,
+            ..Default::default()
+        };
+        let asset_spend = self.select_rgb_inputs(
+            asset_id.clone(),
+            &assignments_needed,
+            input_unspents.clone(),
+            &mut SelectedInputs::default(),
+        )?;
+
+        let (witness_recipients, local_recipients) = self.own_dust_recipient()?;
+
+        let asset_info = AssetInfo {
+            contract_id,
+            reject_list_url: asset.reject_list_url,
+        };
+        let transfer_info = InfoAssetTransfer {
+            asset_info,
+            recipients: local_recipients.clone(),
+            asset_spend: asset_spend.clone(),
+            change: AssignmentsCollection::default(),
+            original_assignments_needed: assignments_needed.clone(),
+            assignments_needed,
+            assignments_spent: HashMap::new(),
+            main_transition: TypeOfTransition::Link,
+            beneficiaries_blinded: vec![],
+            beneficiaries_witness: vec![],
+            burn_reason: None,
+            linked_to_contract: Some(linked_to_contract),
+        };
+        let receive_ids: Vec<String> = local_recipients
+            .iter()
+            .map(|lr| lr.recipient_id.clone())
+            .collect();
+        let transfer_dir = self.setup_transfer_directory(receive_ids)?;
+
+        self.prepare_single_asset_psbt(
+            txn,
+            transfer_info,
+            transfer_dir,
+            unspents,
+            &input_unspents,
+            &witness_recipients,
+            fee_rate_checked,
+            min_confirmations,
+            None,
+            None,
+            None,
+            &mut stock,
+            dry_run,
+        )
+    }
+
+    fn link_end_impl(&mut self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<OperationResult, Error> {
+        self.check_end_initiated(txn, signed_psbt)?;
+        let (txid, transfer_dir, info_contents, mut fascia) =
+            self.get_transfer_end_data(signed_psbt)?;
+
+        // the data must be of this operation: another one would be completed skipping its checks
+        // and steps
+        if !info_contents.is_operation(&TypeOfTransition::Link) {
+            return Err(Error::WrongOperation { txid });
+        }
+
+        // embed the signed transaction, then generate the consignment proving the link: a link
         // has no recipient, so the consignment is not posted anywhere and is only made available
         // on disk (see the `consignment_path` of the operation)
         let tx = signed_psbt

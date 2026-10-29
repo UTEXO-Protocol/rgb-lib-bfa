@@ -302,8 +302,8 @@ use rgbstd::{
     Vout,
     containers::{SealWitness, SpvProof, ValidConsignment},
     contract::{
-        AllocatedState, ContractBuilder, ContractData, FilteredContractState, SchemaWrapper,
-        TransitionBuilder,
+        AllocatedState, ContractBuilder, ContractData, FilteredContractState, LinkError,
+        LinkableSchemaWrapper, SchemaWrapper, TransitionBuilder,
     },
     info::SchemaInfo,
     invoice::{InvoiceState, Pay2Vout},
@@ -354,9 +354,10 @@ use schemata::{
     CollectibleFungibleAsset, InflatableFungibleAsset, NonInflatableAsset, UniqueDigitalAsset,
 };
 use schemata::{
-    GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION, GS_DETAILS, GS_ISSUED_SUPPLY, GS_NAME,
-    GS_NOMINAL, GS_PRECISION, MS_ALLOWED_INFLATION, OS_ASSET, OS_INFLATION, TS_BURN, TS_INFLATION,
-    TS_TRANSFER, TS_TRANSFER_INFLATION, TS_TRANSFER_LINK,
+    GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION, GS_DETAILS, GS_ISSUED_SUPPLY,
+    GS_LINKED_TO_CONTRACT, GS_NAME, GS_NOMINAL, GS_PRECISION, MS_ALLOWED_INFLATION, OS_ASSET,
+    OS_INFLATION, OS_LINK, TS_BURN, TS_INFLATION, TS_LINK, TS_TRANSFER, TS_TRANSFER_INFLATION,
+    TS_TRANSFER_LINK,
 };
 #[cfg(feature = "wallet")]
 use scrypt::{Params, phc::Salt, scrypt};
@@ -525,17 +526,24 @@ use crate::{
     },
     wallet::{
         Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
-        RGB_STATE_ASSET_OWNER, RGB_STATE_INFLATION_ALLOWANCE, WalletDescriptors,
+        RGB_STATE_ASSET_OWNER, RGB_STATE_INFLATION_ALLOWANCE, RGB_STATE_LINK_RIGHT,
+        WalletDescriptors,
     },
 };
 #[cfg(all(test, feature = "wallet"))]
 use crate::{
     keys::generate_keys,
-    wallet::test::{mock_asset_terms, mock_chain_net, mock_contract_details, mock_token_data},
+    wallet::test::{
+        mock_asset_terms, mock_chain_net, mock_contract_details, mock_ifa_link_right,
+        mock_token_data,
+    },
 };
 
 pub(crate) const RGB_GLOBAL_BURNED_ASSET: &str = "burnedAsset";
 pub(crate) const RGB_GLOBAL_BURNED_INFLATION: &str = "burnedInflation";
 pub(crate) const RGB_GLOBAL_BURN_REASON: &str = "burnReason";
 pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
+#[cfg(feature = "wallet")]
+pub(crate) const RGB_GLOBAL_LINKED_FROM_CONTRACT: &str = "linkedFromContract";
+pub(crate) const RGB_GLOBAL_LINKED_TO_CONTRACT: &str = "linkedToContract";
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";

@@ -1222,6 +1222,8 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
             amounts,
             inflation_amounts,
             reject_list_url,
+            false,
+            None,
         )
     }
 

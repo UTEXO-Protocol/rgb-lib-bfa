@@ -533,6 +533,10 @@ pub struct Metadata {
     pub token: Option<Token>,
     /// Reject list URL
     pub reject_list_url: Option<String>,
+    /// ID of the contract the asset is linked from (e.g. the one it replaces), if any
+    pub linked_from_contract: Option<String>,
+    /// ID of the contract the asset has been linked to (e.g. the one replacing it), if any
+    pub linked_to_contract: Option<String>,
 }
 
 /// A Non-Inflatable Asset.
@@ -959,6 +963,8 @@ pub struct AssignmentsCollection {
     pub non_fungible: bool,
     /// Inflation right assignments
     pub inflation: u64,
+    /// Link right assignment
+    pub link: bool,
 }
 
 #[cfg(feature = "_online")]
@@ -992,6 +998,9 @@ impl AssignmentsCollection {
             AllocatedState::Data(_) => {
                 self.add_non_fungible();
             }
+            AllocatedState::Void if opout.ty == OS_LINK => {
+                self.link = true;
+            }
             _ => {}
         }
     }
@@ -1010,6 +1019,7 @@ impl AssignmentsCollection {
                 needed.inflation.saturating_sub(self.inflation) > 0
             }
             (AllocatedState::Data(_), _) => needed.non_fungible && !self.non_fungible,
+            (AllocatedState::Void, OS_LINK) => needed.link && !self.link,
             _ => false,
         }
     }
@@ -1025,6 +1035,7 @@ impl AssignmentsCollection {
                 .inflation
                 .checked_sub(needed.inflation)
                 .expect("selected inputs must cover outputs"),
+            link: false,
         }
     }
 
@@ -1036,6 +1047,9 @@ impl AssignmentsCollection {
             return false;
         }
         if self.inflation < needed.inflation {
+            return false;
+        }
+        if needed.link && !self.link {
             return false;
         }
         true
@@ -1233,6 +1247,9 @@ impl Invoice {
                         Assignment::InflationRight(v.value())
                     }
                     (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
+                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
+                        Assignment::LinkRight
+                    }
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
                     (None, None) => Assignment::Any,
                     (_, _) => {
@@ -1374,6 +1391,8 @@ pub enum TransferKind {
     Inflation,
     /// A burn transfer
     Burn,
+    /// A link transfer
+    Link,
 }
 
 #[derive(Debug, Clone)]
@@ -1785,6 +1804,32 @@ pub struct BurnDetails {
     pub burn_reason: Option<String>,
 }
 
+/// The result of a link begin operation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg(feature = "_online")]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct LinkBeginResult {
+    /// PSBT to inspect and sign
+    pub psbt: String,
+    /// Batch transfer idx, None when `dry_run: true`
+    pub batch_transfer_idx: Option<i32>,
+    /// Operation details
+    pub details: LinkDetails,
+}
+
+/// Details for link operations.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg(feature = "_online")]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct LinkDetails {
+    /// Path to the strict-encoded fascia file, for inspection
+    pub fascia_path: String,
+    /// Minimum confirmations for the operation
+    pub min_confirmations: u8,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
+}
+
 /// The result of an inflate begin operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg(feature = "_online")]
@@ -2071,16 +2116,21 @@ pub struct InfoAssetTransfer {
     pub beneficiaries_blinded: Vec<SecretSeal>,
     pub beneficiaries_witness: Vec<ExplicitSeal<RgbTxid>>,
     pub burn_reason: Option<BurnReason>,
+    /// The contract a link links the asset to
+    #[serde(default)]
+    pub linked_to_contract: Option<ContractId>,
 }
 
 impl InfoAssetTransfer {
-    /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn has no
-    /// beneficiary, so its transition is selected by OpId, while the others are selected by their
-    /// beneficiaries
+    /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn or a
+    /// link has no beneficiary, so its transition is selected by OpId, while the others are
+    /// selected by their beneficiaries
     pub(crate) fn requested_opids(&self, fascia: &Fascia) -> Vec<OpId> {
-        if self.main_transition != TypeOfTransition::Burn {
-            return vec![];
-        }
+        let transition_type = match self.main_transition {
+            TypeOfTransition::Burn => TS_BURN,
+            TypeOfTransition::Link => TS_LINK,
+            _ => return vec![],
+        };
         fascia
             .bundles()
             .get(&self.asset_info.contract_id)
@@ -2088,7 +2138,7 @@ impl InfoAssetTransfer {
                 bundle
                     .known_transitions
                     .iter()
-                    .filter(|kt| kt.transition.transition_type == TS_BURN)
+                    .filter(|kt| kt.transition.transition_type == transition_type)
                     .map(|kt| kt.opid)
                     .collect()
             })

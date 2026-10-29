@@ -349,7 +349,7 @@ fn expected_receive_assignment(
     match schema {
         None => match assignment {
             Assignment::Fungible(_) | Assignment::Any => Some(assignment.clone()),
-            Assignment::NonFungible | Assignment::InflationRight(_) => None,
+            Assignment::NonFungible | Assignment::InflationRight(_) | Assignment::LinkRight => None,
         },
         Some(AssetSchema::Nia) | Some(AssetSchema::Cfa) => match assignment {
             Assignment::Fungible(_) => Some(assignment.clone()),
@@ -361,9 +361,10 @@ fn expected_receive_assignment(
             _ => None,
         },
         Some(AssetSchema::Ifa) => match assignment {
-            Assignment::Fungible(_) | Assignment::InflationRight(_) | Assignment::Any => {
-                Some(assignment.clone())
-            }
+            Assignment::Fungible(_)
+            | Assignment::InflationRight(_)
+            | Assignment::LinkRight
+            | Assignment::Any => Some(assignment.clone()),
             _ => None,
         },
     }
@@ -390,7 +391,7 @@ fn schema_assignment_combinations() {
         .map(|a| match a {
             Assignment::Fungible(_) => Assignment::Fungible(amount),
             Assignment::InflationRight(_) => Assignment::InflationRight(amount),
-            Assignment::NonFungible | Assignment::Any => a,
+            Assignment::NonFungible | Assignment::LinkRight | Assignment::Any => a,
         })
         .collect();
     for (schema, asset_id) in schemas {
