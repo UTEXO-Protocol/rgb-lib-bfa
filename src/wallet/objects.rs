@@ -2017,6 +2017,28 @@ pub struct AssetSpend {
     pub input_btc_amt: u64,
 }
 
+/// The decisions of a reject list about single opouts, each holding only its latest decision.
+///
+/// This only tells whether an opout is listed: which decision applies to an allocation, given the
+/// ones along its history, is decided when walking the history (see `check_dag`).
+#[cfg(feature = "_online")]
+#[derive(Debug, Default)]
+pub struct RejectList {
+    pub(crate) reject_opouts: HashSet<Opout>,
+    pub(crate) allow_opouts: HashSet<Opout>,
+}
+
+#[cfg(feature = "_online")]
+impl RejectList {
+    pub(crate) fn rejects(&self, opout: &Opout) -> bool {
+        self.reject_opouts.contains(opout)
+    }
+
+    pub(crate) fn allows(&self, opout: &Opout) -> bool {
+        self.allow_opouts.contains(opout)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AssetInfo {
     pub contract_id: ContractId,
@@ -2042,6 +2064,29 @@ pub struct InfoAssetTransfer {
     pub beneficiaries_blinded: Vec<SecretSeal>,
     pub beneficiaries_witness: Vec<ExplicitSeal<RgbTxid>>,
     pub burn_reason: Option<BurnReason>,
+}
+
+impl InfoAssetTransfer {
+    /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn has no
+    /// beneficiary, so its transition is selected by OpId, while the others are selected by their
+    /// beneficiaries
+    pub(crate) fn requested_opids(&self, fascia: &Fascia) -> Vec<OpId> {
+        if self.main_transition != TypeOfTransition::Burn {
+            return vec![];
+        }
+        fascia
+            .bundles()
+            .get(&self.asset_info.contract_id)
+            .map(|bundle| {
+                bundle
+                    .known_transitions
+                    .iter()
+                    .filter(|kt| kt.transition.transition_type == TS_BURN)
+                    .map(|kt| kt.opid)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
