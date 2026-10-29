@@ -2697,6 +2697,28 @@ pub trait WalletOnline: WalletOffline {
         let witness_id = paying_bundle.witness_id();
         let txid = witness_id.to_string();
 
+        // an invoice is paid by a single allocation: a sender never needs more, as amounts can
+        // always be merged, while each extra allocation weighs on the receiving UTXO (spending it
+        // moves all of its allocations, which a bundle limits)
+        #[cfg(not(test))]
+        let single_allocation = receiving.len() == 1;
+        #[cfg(test)]
+        let single_allocation = receiving.len() == 1 || accept_multiple_allocations();
+        if !single_allocation {
+            error!(
+                self.logger(),
+                "Consignment pays this recipient {} allocations, refusing it",
+                receiving.len()
+            );
+            return self.refuse_consignment(
+                txn,
+                &mode,
+                &recipient_id,
+                &recipient_seed,
+                updated_batch_transfer,
+            );
+        }
+
         // validate consignment
         debug!(self.logger(), "Validating consignment...");
         let safe_height = NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations)?);
@@ -4581,6 +4603,8 @@ pub trait WalletOnline: WalletOffline {
 
             if main_needed {
                 let transition = asset_transition_builder.complete_transition()?;
+                #[cfg(test)]
+                let transition = mock_spam_recipient_assignments(transition);
                 all_transitions
                     .entry(transfer_info.asset_info.contract_id)
                     .or_default()
