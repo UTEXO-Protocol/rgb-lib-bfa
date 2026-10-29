@@ -3680,6 +3680,10 @@ fn send_assignment_supported(schema: AssetSchema, assignment: &Assignment) -> bo
             assignment,
             Assignment::Fungible(_) | Assignment::InflationRight(_) | Assignment::LinkRight
         ),
+        AssetSchema::Bfa => matches!(
+            assignment,
+            Assignment::Fungible(_) | Assignment::LinkRight | Assignment::MintRight
+        ),
     }
 }
 

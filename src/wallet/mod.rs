@@ -30,18 +30,20 @@ pub use multisig::{
     OperationInfo, RespondToOperation, UserRole,
 };
 pub use objects::{
-    Address, AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets, AssignmentsCollection,
-    Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, Invoice, InvoiceData, Media,
-    Metadata, Online, Outpoint, PendingVanillaTx, ProofOfReserves, PsbtInputInfo, PsbtInspection,
-    PsbtOutputInfo, ReceiveData, Recipient, RecipientInfo, RecipientType, RgbAllocation, Token,
-    TokenLight, Transaction, TransactionType, Transfer, TransferKind, TransferTransportEndpoint,
-    TransportEndpoint, Unspent, Utxo, WalletData, WalletDescriptors, WitnessData,
+    Address, AssetBFA, AssetCFA, AssetFilter, AssetIFA, AssetNIA, AssetUDA, Assets,
+    AssignmentsCollection, Balance, BlockTime, BtcBalance, DatabaseType, EmbeddedMedia, Invoice,
+    InvoiceData, Media, Metadata, Online, Outpoint, PendingVanillaTx, ProofOfReserves,
+    PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData, ReceivedMint, Recipient,
+    RecipientInfo, RecipientType, RgbAllocation, Token, TokenLight, Transaction, TransactionType,
+    Transfer, TransferKind, TransferTransportEndpoint, TransportEndpoint, Unspent, Utxo,
+    WalletData, WalletDescriptors, WitnessData,
 };
 #[cfg(feature = "_online")]
 pub use objects::{
     BitcoindAuth, BurnBeginResult, BurnDetails, IndexerConfig, IndexerProtocol, InflateBeginResult,
-    InflateDetails, LinkBeginResult, LinkDetails, OnlineOptions, OperationResult, RefreshFilter,
-    RefreshResult, RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
+    InflateDetails, LinkBeginResult, LinkDetails, MintBeginResult, MintDetails, OnlineOptions,
+    OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus, RefreshedTransfer,
+    SendBeginResult, SendDetails,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
@@ -64,8 +66,8 @@ pub(crate) use objects::{
     AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, ConsignmentPayment,
     FailTransfersOutcome, LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData,
     PaymentSeal, PrepareRgbPsbtResult, PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher,
-    ReceiveMode, ReceivedConsignmentMeta, RefreshResultTrait, RejectList, SelectedInputs,
-    TryFailBatchTransferOutcome,
+    ReceiveMode, ReceivedConsignmentMeta, RefreshResultTrait, RejectList, RejectListSource,
+    SelectedInputs, TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails, LocalAssetData,
@@ -121,4 +123,7 @@ pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
 pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
+pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
+pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
+pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";
 pub(crate) const RGB_GLOBAL_REJECT_LIST_URL: &str = "rejectListUrl";

@@ -60,6 +60,9 @@ pub enum TransitionGlobal {
 pub enum TransitionMetadata {
     /// Amount of inflation rights allowed in output, committed in IFA inflate transitions
     AllowedInflation(u64),
+    /// External chain block before which the lock backing the mint has to be included, committed
+    /// in BFA mint transitions
+    BeforeBlock(u64),
 }
 
 /// Information about an RGB transition.
@@ -392,7 +395,17 @@ fn genesis_info(
         AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Ifa => {
             let spec: AssetSpec =
                 global(contract_id, genesis, GS_NOMINAL)?.ok_or(missing(GS_NOMINAL))?;
-            (spec.name, Some(spec.ticker), spec.details, spec.precision)
+            let ticker = spec.ticker.to_string();
+            (spec.name, Some(ticker), spec.details, spec.precision)
+        }
+        AssetSchema::Bfa => {
+            let ticker: UnicodeTicker =
+                global(contract_id, genesis, GS_TICKER)?.ok_or(missing(GS_TICKER))?;
+            let name: Name = global(contract_id, genesis, GS_NAME)?.ok_or(missing(GS_NAME))?;
+            let details: Option<Details> = global(contract_id, genesis, GS_DETAILS)?;
+            let precision: Precision =
+                global(contract_id, genesis, GS_PRECISION)?.ok_or(missing(GS_PRECISION))?;
+            (name, Some(ticker.to_string()), details, precision)
         }
     };
 
@@ -401,7 +414,7 @@ fn genesis_info(
         timestamp: genesis.timestamp,
         issuer: genesis.issuer.to_string(),
         name: name.to_string(),
-        ticker: ticker.map(|t| t.to_string()),
+        ticker,
         details: details.map(|d| d.to_string()),
         precision: precision.into(),
         outputs: outputs_info(
@@ -514,6 +527,7 @@ fn bundle_output(bundle: &TransitionBundle, opout: Opout) -> Option<(OutPoint, A
             }
         }
         TypedAssigns::Declarative(_) if opout.ty == OS_LINK => Assignment::LinkRight,
+        TypedAssigns::Declarative(_) if opout.ty == OS_MINT => Assignment::MintRight,
         _ => return None,
     };
     Some((OutPoint::new(txid, seal.vout.into_u32()), assignment))
@@ -614,6 +628,11 @@ fn transition_info(
                 Amount::from_strict_serialized(value.to_inner())
                     .map_err(|e| invalid(RGB_METADATA_ALLOWED_INFLATION, e))?
                     .into(),
+            ),
+            MS_BEFORE_BLOCK => TransitionMetadata::BeforeBlock(
+                BlockNumber::from_strict_serialized(value.to_inner())
+                    .map_err(|e| invalid(RGB_METADATA_BEFORE_BLOCK, e))?
+                    .into_inner(),
             ),
             _ => {
                 return Err(Error::RgbInspection {
@@ -758,10 +777,13 @@ mod tests {
             )
         };
 
-        // supported type
+        // supported types
         let result = outputs(AssetSchema::Ifa, OS_LINK).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].assignment, Assignment::LinkRight);
+        let result = outputs(AssetSchema::Bfa, OS_MINT).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].assignment, Assignment::MintRight);
 
         // type unknown to the schema
         let result = outputs(AssetSchema::Nia, OS_LINK);

@@ -79,9 +79,19 @@ pub enum Error {
         details: String,
     },
 
-    /// Cannot use IFA schema on mainnet
-    #[error("Cannot use IFA schema on mainnet")]
-    CannotUseIfaOnMainnet,
+    /// The schema cannot be used on mainnet
+    #[error("Cannot use {asset_schema} schema on mainnet")]
+    CannotUseSchemaOnMainnet {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
+    /// The consignment failed validation
+    #[error("Consignment validation failed: {details}")]
+    ConsignmentValidationFailed {
+        /// Error details
+        details: String,
+    },
 
     /// A database error has been encountered
     #[error("Database error: {details}")]
@@ -102,6 +112,19 @@ pub enum Error {
     EmptyFile {
         /// File path
         file_path: String,
+    },
+
+    /// The configured EVM RPC endpoint is connected to a chain other than the one the asset's
+    /// bridge contract lives on
+    #[error(
+        "EVM chain ID mismatch: the bridge lives on chain ID {expected}, the RPC endpoint is on \
+         chain ID {actual}"
+    )]
+    EvmChainIdMismatch {
+        /// Chain ID of the bridge contract, as committed in the asset's genesis
+        expected: u64,
+        /// Chain ID reported by the configured EVM RPC endpoint
+        actual: u64,
     },
 
     /// The provided expiration is invalid (in the past or too far in the future)
@@ -229,6 +252,14 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided external chain block, before which the lock of a mint has to be included,
+    /// leaves no block for it
+    #[error("Invalid before block: {details}")]
+    InvalidBeforeBlock {
+        /// Error details
+        details: String,
+    },
+
     /// Keys derived from the provided data do not match
     #[error("Invalid bitcoin keys")]
     InvalidBitcoinKeys,
@@ -309,6 +340,22 @@ pub enum Error {
     /// Trying to request fee estimation for an invalid block number, it must be between 1 and 1008
     #[error("Trying to request fee estimation for an invalid block number")]
     InvalidEstimationBlocks,
+
+    /// The provided EVM contract address is invalid
+    #[error("Invalid EVM contract address: {details}")]
+    InvalidEvmContractAddress {
+        /// Error details
+        details: String,
+    },
+
+    /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it doesn't serve
+    /// what confirming mint events needs (the latest finalized block and the contract state as of
+    /// it)
+    #[error("Invalid EVM RPC URL: {details}")]
+    InvalidEvmRpcUrl {
+        /// Error details
+        details: String,
+    },
 
     /// The provided expiration is invalid
     #[error("Invalid expiration")]
@@ -471,7 +518,8 @@ pub enum Error {
     },
 
     /// The recipient proxy refused the transfer as the invoice has expired, or the invoice
-    /// expiration has passed before the transfer could be created
+    /// expiration has passed before the transfer could be created (or, for a mint, is too close
+    /// to leave time for the lock)
     #[error("Invoice expired")]
     InvoiceExpired,
 
@@ -482,6 +530,10 @@ pub enum Error {
     /// The invoice cannot accept more transfers on the recipient proxy
     #[error("Invoice quota exceeded")]
     InvoiceQuotaExceeded,
+
+    /// A mint cannot spend the last mint right of the wallet, which would be left unable to mint
+    #[error("Cannot mint with the last mint right")]
+    LastMintRight,
 
     /// The maximum fee has been exceeded
     #[error("Max fee exceeded for transfer with TXID: {txid}")]
@@ -495,6 +547,24 @@ pub enum Error {
     MinFeeNotMet {
         /// TXID of the transfer having fee issues
         txid: String,
+    },
+
+    /// The lock of the mint operation was not included on the external chain before the block the
+    /// mint commits to, and never will be: the mint will never be confirmed
+    #[error("Mint event for operation {opid} not included before block {before_block}")]
+    MintEventExpired {
+        /// ID of the mint operation
+        opid: String,
+        /// External chain block the lock had to be included before
+        before_block: u64,
+    },
+
+    /// No confirmed mint event committing to the mint operation was found on the external chain
+    /// (yet): it may still be, e.g. once the lock is made or finalized
+    #[error("Mint event for operation {opid} not found on the external chain")]
+    MintEventNotFound {
+        /// ID of the mint operation
+        opid: String,
     },
 
     /// Cannot mark operation as processed
@@ -573,6 +643,14 @@ pub enum Error {
     #[error("No cosigners supplied")]
     NoCosignersSupplied,
 
+    /// No EVM RPC URL is configured for the chain the asset's bridge lives on (see
+    /// [`OnlineOptions::evm_rpc_urls`](crate::wallet::OnlineOptions::evm_rpc_urls))
+    #[error("No EVM RPC URL configured for chain ID {chain_id}")]
+    NoEvmRpcUrl {
+        /// Chain ID of the bridge contract, as committed in the asset's genesis
+        chain_id: u64,
+    },
+
     /// Cannot inflate an asset with unknown o zero amounts
     #[error("Inflation request with no amounts or zero amounts")]
     NoInflationAmounts,
@@ -592,6 +670,10 @@ pub enum Error {
     /// No media found
     #[error("No media found")]
     NoMedia,
+
+    /// Cannot issue an asset with zero mint rights
+    #[error("Issuance request with zero mint rights")]
+    NoMintRights,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]
@@ -708,6 +790,10 @@ pub enum Error {
     #[error("PSBT has too many signatures")]
     TooManySignaturesInPsbt,
 
+    /// The transfer has expired
+    #[error("Transfer expired")]
+    TransferExpired,
+
     /// The transfer ID has been deleted on the recipient proxy and cannot be reused
     #[error("Transfer ID deleted")]
     TransferIDDeleted,
@@ -761,6 +847,13 @@ pub enum Error {
     /// The schema doesn't support link transitions
     #[error("Link not supported")]
     UnsupportedLink {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
+    /// The schema doesn't support mint transitions
+    #[error("Mint not supported")]
+    UnsupportedMint {
         /// Asset schema
         asset_schema: AssetSchema,
     },
@@ -995,6 +1088,25 @@ impl From<psrgbt::OpretKeyError> for InternalError {
 impl From<psrgbt::MpcPsbtError> for InternalError {
     fn from(e: psrgbt::MpcPsbtError) -> Self {
         InternalError::RgbPsbtError(e.to_string())
+    }
+}
+
+#[cfg(feature = "_online")]
+impl From<AnchorResolverError> for Error {
+    fn from(e: AnchorResolverError) -> Self {
+        match e {
+            AnchorResolverError::WrongChainId { expected, actual } => {
+                Error::EvmChainIdMismatch { expected, actual }
+            }
+            AnchorResolverError::Unconfirmed(opid) => Error::MintEventNotFound {
+                opid: opid.to_string(),
+            },
+            AnchorResolverError::ResolverIssue(details) => Error::Network { details },
+            // only the anchors the validation asked about get resolved
+            e @ AnchorResolverError::Validation(_) => Error::Internal {
+                details: format!("unexpected anchor resolution error: {e}"),
+            },
+        }
     }
 }
 

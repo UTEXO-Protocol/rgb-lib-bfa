@@ -505,7 +505,7 @@ fn fail() {
     for schema in AssetSchema::iter() {
         let supported = match schema {
             AssetSchema::Ifa => true,
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => false,
+            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa | AssetSchema::Bfa => false,
         };
         if supported {
             continue;

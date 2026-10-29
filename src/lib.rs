@@ -6,8 +6,8 @@
 //! ## Wallet
 //! The main components of the library are the [`wallet::Wallet`] and [`wallet::MultisigWallet`].
 //!
-//! They allow to create and operate RGB wallets that can issue and operate on NIA, CFA, IFA and
-//! UDA assets. The library also manages UTXOs and asset allocations.
+//! They allow to create and operate RGB wallets that can issue and operate on NIA, CFA, IFA, BFA
+//! and UDA assets. The library also manages UTXOs and asset allocations.
 //!
 //! ## Backend
 //! The library uses BDK for walleting operations and several components from the RGB ecosystem for
@@ -171,6 +171,7 @@ pub use crate::{
 
 #[cfg(feature = "_online")]
 use std::{
+    cell::RefCell,
     cmp::{Ordering, max, min},
     collections::hash_map::DefaultHasher,
     hash::Hasher,
@@ -280,7 +281,8 @@ use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::{RngExt, TryRng, distr::Alphanumeric, rngs::SysRng};
 #[cfg(feature = "_online")]
 use reqwest::{
-    blocking::{Client as RestClient, multipart},
+    StatusCode,
+    blocking::{Client as RestClient, Response, multipart},
     header::CONTENT_TYPE,
 };
 #[cfg(feature = "wallet")]
@@ -317,8 +319,9 @@ use rgbstd::{
         mpc::{MerkleTree, Message, MultiSource, ProtocolId},
     },
     stl::{
-        Attachment, ContractTerms, EmbeddedMedia as RgbEmbeddedMedia, MediaType,
-        ProofOfReserves as RgbProofOfReserves, RejectListUrl, RicardianContract, Ticker, TokenData,
+        Attachment, BridgeLocation, ContractTerms, EmbeddedMedia as RgbEmbeddedMedia, EvmAddress,
+        EvmContract, MediaType, ProofOfReserves as RgbProofOfReserves, RejectListLocation,
+        RejectListUrl, RicardianContract, Ticker, TokenData,
     },
     txout::{BlindSeal, ExplicitSeal},
     validation::{
@@ -336,28 +339,33 @@ use rgbstd::{
     },
     contract::IssuerWrapper,
     rgbcore::{commit_verify::mpc::Commitment, dbc::Proof as _},
-    stl::{AssetSpec, BurnReason, Details, Name},
+    stl::{AssetSpec, BlockNumber, BurnReason, Details, Name, UnicodeTicker},
     txout::{TxPtr, TxoSeal},
     validation::DbcProof,
 };
 #[cfg(feature = "_online")]
 use rgbstd::{
+    containers::{AnchorResolverError, CheckedAnchorResolver, PendingConsignment, ResolveAnchor},
     contract::FilterIncludeAll,
     indexers::AnyResolver,
-    validation::{OpsDag, SchemaRules, ValidationConfig, ValidationError, Validity, Warning},
+    validation::{
+        ExternalAnchor, OpsDag, SchemaRules, Status as ValidationStatus, ValidationConfig,
+        ValidationError, Validity, Warning,
+    },
 };
 #[cfg(feature = "wallet")]
 use schemata::IfaWrapper;
 #[cfg(feature = "_online")]
-use schemata::{CfaWrapper, NiaWrapper, UdaWrapper};
+use schemata::{BfaWrapper, CfaWrapper, NiaWrapper, UdaWrapper};
 use schemata::{
-    CollectibleFungibleAsset, InflatableFungibleAsset, NonInflatableAsset, UniqueDigitalAsset,
+    BridgedFungibleAsset, CollectibleFungibleAsset, InflatableFungibleAsset, NonInflatableAsset,
+    UniqueDigitalAsset,
 };
 use schemata::{
     GS_BURN_REASON, GS_BURNED_ASSET, GS_BURNED_INFLATION, GS_DETAILS, GS_ISSUED_SUPPLY,
-    GS_LINKED_TO_CONTRACT, GS_NAME, GS_NOMINAL, GS_PRECISION, MS_ALLOWED_INFLATION, OS_ASSET,
-    OS_INFLATION, OS_LINK, TS_BURN, TS_INFLATION, TS_LINK, TS_TRANSFER, TS_TRANSFER_INFLATION,
-    TS_TRANSFER_LINK,
+    GS_LINKED_TO_CONTRACT, GS_NAME, GS_NOMINAL, GS_PRECISION, GS_TICKER, MS_ALLOWED_INFLATION,
+    MS_BEFORE_BLOCK, OS_ASSET, OS_INFLATION, OS_LINK, OS_MINT, TS_BURN, TS_INFLATION, TS_LINK,
+    TS_MINT, TS_PROPAGATE, TS_TRANSFER, TS_TRANSFER_INFLATION, TS_TRANSFER_LINK,
 };
 #[cfg(feature = "wallet")]
 use scrypt::{Params, phc::Salt, scrypt};
@@ -430,6 +438,7 @@ use crate::wallet::test::{
 #[cfg(feature = "_online")]
 use crate::{
     api::{
+        evm::{EvmClient, MintAnchorResolver, MintLockStatus},
         multisig_hub::{
             FileMetadata, FileSource, FileType, InfoResponse, MultisigHubClient,
             OPERATION_TYPES_REQUIRING_SEED, OperationResponse, OperationStatus, OperationType,
@@ -461,6 +470,7 @@ use crate::{
     utils::{
         ChainResolver, OffchainResolver, check_proxy, detect_indexer, get_indexer_and_resolver,
         hash_file, proxy_max_media, proxy_retention_grace, script_buf_from_recipient_id,
+        validate_consignment_internal,
     },
     wallet::{
         AssignmentsCollection, BitcoindAuth, Indexer, IndexerConfig, multisig::RespondToOperation,
@@ -519,15 +529,15 @@ use crate::{
     utils::{
         ACCOUNT, DumbResolver, KEYCHAIN_BTC, KEYCHAIN_RGB, LOG_FILE, PURPOSE,
         RGB_RUNTIME_DELETING_DIR, RgbStock, adjust_canonicalization, atomic_tmp_path, atomic_write,
-        atomic_write_with, beneficiary_from_script_buf, from_str_or_number_mandatory,
-        from_str_or_number_optional, get_account_xpubs, get_coin_type, get_descriptors,
-        get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex, now, parse_address_str,
-        read_fascia, setup_logger, str_to_xpub,
+        atomic_write_with, beneficiary_from_script_buf, bfa_reject_list_url,
+        from_str_or_number_mandatory, from_str_or_number_optional, get_account_xpubs,
+        get_coin_type, get_descriptors, get_descriptors_from_xpubs, hash_bytes, hash_bytes_hex,
+        now, parse_address_str, read_fascia, setup_logger, str_to_xpub,
     },
     wallet::{
         Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
         RGB_STATE_ASSET_OWNER, RGB_STATE_INFLATION_ALLOWANCE, RGB_STATE_LINK_RIGHT,
-        WalletDescriptors,
+        RGB_STATE_MINT_RIGHT, WalletDescriptors,
     },
 };
 #[cfg(all(test, feature = "wallet"))]
@@ -546,4 +556,5 @@ pub(crate) const RGB_GLOBAL_ISSUED_SUPPLY: &str = "issuedSupply";
 #[cfg(feature = "wallet")]
 pub(crate) const RGB_GLOBAL_LINKED_FROM_CONTRACT: &str = "linkedFromContract";
 pub(crate) const RGB_GLOBAL_LINKED_TO_CONTRACT: &str = "linkedToContract";
+pub(crate) const RGB_METADATA_BEFORE_BLOCK: &str = "beforeBlock";
 pub(crate) const RGB_METADATA_ALLOWED_INFLATION: &str = "allowedInflation";

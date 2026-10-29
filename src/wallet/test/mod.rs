@@ -71,6 +71,19 @@ use crate::{
 const PROXY_HOST: &str = "127.0.0.1:3000/json-rpc";
 static PROXY_ENDPOINT: Lazy<String> = Lazy::new(|| format!("rpc://{PROXY_HOST}"));
 #[cfg(feature = "_online")]
+const EVM_RPC_URL: &str = "http://127.0.0.1:8545";
+/// EIP-155 chain ID of the anvil node (its default one, see tests/compose.yaml)
+#[cfg(feature = "_online")]
+const ANVIL_CHAIN_ID: u64 = 31337;
+/// Blocks to mine on anvil for the latest block to become finalized: two epochs of its default
+/// 32 slots
+#[cfg(feature = "electrum")]
+const EVM_FINALITY_DEPTH: u64 = 64;
+/// Blocks a mint leaves for its lock by default, after the latest one when it begins: more than any
+/// test mines
+#[cfg(feature = "electrum")]
+const MINT_LOCK_BLOCKS: u64 = 100_000;
+#[cfg(feature = "_online")]
 const TEST_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_srv"];
 const NOSRV_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_nosrv"];
 const PASSWORD: &str = "password";
@@ -128,6 +141,8 @@ const LISTS_DIR_PARTS: [&str; 2] = ["tests", "lists"];
 const HUB_DIR_PARTS: [&str; 2] = ["tests", "hub"];
 #[cfg(feature = "_online")]
 const TICKER: &str = "TICKER";
+#[cfg(feature = "electrum")]
+const UNICODE_TICKER: &str = "₿TC";
 #[cfg(feature = "_online")]
 const NAME: &str = "asset name";
 #[cfg(feature = "electrum")]
@@ -164,6 +179,10 @@ const MIN_CONFIRMATIONS: u8 = 1;
 const FAKE_TXID: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc053a176ccb";
 #[cfg(feature = "electrum")]
 const FAKE_OUTPOINT: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc053a176ccb:0";
+#[cfg(feature = "electrum")]
+const FAKE_EVM_ADDRESS: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+#[cfg(feature = "electrum")]
+const FAKE_PUBKEY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 #[cfg(feature = "electrum")]
 const FAKE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 #[cfg(feature = "electrum")]
@@ -551,6 +570,8 @@ pub fn mock_send_end_crash() -> bool {
 // test utilities
 #[macro_use]
 mod utils;
+#[cfg(feature = "electrum")]
+pub(crate) use utils::anvil::*;
 #[cfg(feature = "_online")]
 pub(crate) use utils::chain::*;
 pub(crate) use utils::{api::*, helpers::*};
@@ -593,6 +614,8 @@ mod inspect_consignment;
 #[cfg(feature = "electrum")]
 mod inspect_rgb_transfer;
 #[cfg(feature = "electrum")]
+mod issue_asset_bfa;
+#[cfg(feature = "electrum")]
 mod issue_asset_cfa;
 #[cfg(feature = "electrum")]
 mod issue_asset_ifa;
@@ -614,6 +637,7 @@ mod list_unspents;
 mod load;
 #[cfg(all(feature = "electrum", feature = "rgb_fs_store_migration"))]
 mod migrate;
+mod mint;
 #[cfg(feature = "electrum")]
 mod multisig;
 mod new;

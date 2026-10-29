@@ -282,6 +282,37 @@ fn success() {
         Some(Assignment::InflationRight(amount))
     );
 
+    // detect assignment: amount, BFA
+    party.create_utxos_default(); // more UTXOs to have free allocation slots
+    let asset_bfa = party.issue_asset_bfa(1, FAKE_EVM_ADDRESS.to_string(), None);
+    let asset_bfa_id = asset_bfa.asset_id;
+    let receive_data = party
+        .wallet
+        .blind_receive(
+            Some(party.online),
+            Some(asset_bfa_id.clone()),
+            Assignment::Fungible(amount),
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            None,
+        )
+        .unwrap();
+    let invoice = Invoice::new(receive_data.invoice).unwrap();
+    let invoice_data = invoice.invoice_data();
+    assert_eq!(invoice_data.asset_schema, Some(AssetSchema::Bfa));
+    assert_eq!(invoice_data.asset_id, Some(asset_bfa_id.clone()));
+    assert_eq!(invoice_data.assignment, Assignment::Fungible(amount));
+    assert_eq!(
+        invoice_data.assignment_name,
+        Some(RGB_STATE_ASSET_OWNER.to_string())
+    );
+    let transfer = party.get_test_transfer_recipient(&receive_data.recipient_id);
+    assert_eq!(
+        transfer.requested_assignment,
+        Some(Assignment::Fungible(amount))
+    );
+
     // detect assignment: any, no schema
     let receive_data = party
         .wallet
@@ -349,7 +380,10 @@ fn expected_receive_assignment(
     match schema {
         None => match assignment {
             Assignment::Fungible(_) | Assignment::Any => Some(assignment.clone()),
-            Assignment::NonFungible | Assignment::InflationRight(_) | Assignment::LinkRight => None,
+            Assignment::NonFungible
+            | Assignment::InflationRight(_)
+            | Assignment::LinkRight
+            | Assignment::MintRight => None,
         },
         Some(AssetSchema::Nia) | Some(AssetSchema::Cfa) => match assignment {
             Assignment::Fungible(_) => Some(assignment.clone()),
@@ -364,6 +398,13 @@ fn expected_receive_assignment(
             Assignment::Fungible(_)
             | Assignment::InflationRight(_)
             | Assignment::LinkRight
+            | Assignment::Any => Some(assignment.clone()),
+            _ => None,
+        },
+        Some(AssetSchema::Bfa) => match assignment {
+            Assignment::Fungible(_)
+            | Assignment::LinkRight
+            | Assignment::MintRight
             | Assignment::Any => Some(assignment.clone()),
             _ => None,
         },
@@ -391,7 +432,10 @@ fn schema_assignment_combinations() {
         .map(|a| match a {
             Assignment::Fungible(_) => Assignment::Fungible(amount),
             Assignment::InflationRight(_) => Assignment::InflationRight(amount),
-            Assignment::NonFungible | Assignment::LinkRight | Assignment::Any => a,
+            Assignment::NonFungible
+            | Assignment::LinkRight
+            | Assignment::MintRight
+            | Assignment::Any => a,
         })
         .collect();
     for (schema, asset_id) in schemas {
