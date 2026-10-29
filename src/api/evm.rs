@@ -542,6 +542,7 @@ impl EvmClient {
     ///
     /// The finalized block can be older than the blocks whose state some nodes keep (e.g. pruned
     /// ones), which would make the confirmation of a mint fail later, when receiving an asset.
+    #[cfg(feature = "_online")]
     pub(crate) fn check_mint_support(&self) -> Result<(), Error> {
         let finalized_block =
             self.finalized_block_number()
