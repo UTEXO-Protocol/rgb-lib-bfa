@@ -2516,17 +2516,9 @@ pub trait WalletOnline: WalletOffline {
         }
     }
 
-    /// Whether a `schema` can carry a reject list.
-    fn schema_supports_reject_list(schema: AssetSchema) -> bool {
-        match schema {
-            AssetSchema::Ifa => true,
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => false,
-        }
-    }
-
     /// The reject list URL a contract declares, read off it the way its `schema` requires.
     ///
-    /// Only for the schemas `schema_supports_reject_list` accepts.
+    /// Only for the schemas [`AssetSchema::supports_reject_list`] accepts.
     fn reject_list_url_for_schema(
         schema: AssetSchema,
         contract_data: ContractData<FilteredContractState>,
@@ -2676,7 +2668,7 @@ pub trait WalletOnline: WalletOffline {
         let safe_height = NonZeroU32::new(self.safe_height(batch_transfer.min_confirmations)?);
         let validation_config = ValidationConfig {
             chain_net: self.chain_net(),
-            build_opouts_dag: Self::schema_supports_reject_list(asset_schema),
+            build_opouts_dag: asset_schema.supports_reject_list(),
             safe_height,
         };
         let resolver = OffchainResolver {
@@ -2728,7 +2720,7 @@ pub trait WalletOnline: WalletOffline {
             );
         };
 
-        if Self::schema_supports_reject_list(asset_schema) {
+        if asset_schema.supports_reject_list() {
             let url = if let Ok(ass) = txn.check_asset_exists(asset_id.clone()) {
                 ass.reject_list_url
             } else {
@@ -5354,6 +5346,159 @@ pub trait WalletOnline: WalletOffline {
         Ok((fee_rate_checked, unspents, input_unspents, stock))
     }
 
+    /// Check that a recipient `assignment` is valid for an asset with the given `schema`.
+    fn check_recipient_assignment(
+        assignment: &Assignment,
+        schema: AssetSchema,
+    ) -> Result<(), Error> {
+        if !schema.supports_assignment(assignment) {
+            return Err(Error::InvalidAssignment);
+        }
+        if matches!(
+            assignment,
+            Assignment::Fungible(0) | Assignment::InflationRight(0)
+        ) {
+            return Err(Error::InvalidAmountZero);
+        }
+        Ok(())
+    }
+
+    /// Parse and validate the given recipient into a [`LocalRecipient`]. A recipient with no
+    /// transport endpoints uses the out-of-band exchange.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_recipient(
+        &self,
+        recipient: &Recipient,
+        schema: AssetSchema,
+        chainnet: ChainNet,
+        witness_recipients: &mut Vec<(ScriptBuf, u64)>,
+        recipient_vout: &mut u32,
+        operation_sk: &ed25519_dalek::SigningKey,
+        now_ts: i64,
+    ) -> Result<LocalRecipient, Error> {
+        Self::check_recipient_assignment(&recipient.assignment, schema)?;
+
+        let xchainnet_beneficiary = XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
+            .map_err(|_| Error::InvalidRecipientID)?;
+
+        if xchainnet_beneficiary.chain_network() != chainnet {
+            return Err(Error::InvalidRecipientNetwork);
+        }
+
+        // a proxy recipient needs a usable transport endpoint, its Ed25519 public key (to encrypt
+        // data for it and verify its ACK) and an invoice expiration (after which a transfer to it
+        // cannot be created), while the out-of-band exchange has no use for any of them
+        let (transport_endpoints, public_key, recipient_vk, invoice_expiration) =
+            if recipient.transport_endpoints.is_empty() {
+                if !self.supports_out_of_band_exchange() {
+                    return Err(Error::UnsupportedTransportType);
+                }
+                // no transport endpoint is stored: its absence marks the transfer as out-of-band
+                (vec![], vec![], None, None)
+            } else {
+                self.check_transport_endpoints(&recipient.transport_endpoints)?;
+                let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
+                for endpoint_str in &recipient.transport_endpoints {
+                    let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
+                    let usable = check_proxy(&transport_endpoint.endpoint).is_ok();
+                    transport_endpoints.push(LocalTransportEndpoint {
+                        transport_type: transport_endpoint.transport_type,
+                        endpoint: transport_endpoint.endpoint,
+                        used: false,
+                        usable,
+                    });
+                }
+                if !transport_endpoints.iter().any(|t| t.usable) {
+                    return Err(Error::InvalidTransportEndpoints {
+                        details: s!("no valid transport endpoints"),
+                    });
+                }
+
+                let public_key_hex =
+                    recipient
+                        .public_key
+                        .as_deref()
+                        .ok_or_else(|| Error::InvalidPubkey {
+                            details: s!("missing recipient public key"),
+                        })?;
+                let public_key = hex::decode(public_key_hex).map_err(|_| Error::InvalidPubkey {
+                    details: s!("recipient public key is not valid hex"),
+                })?;
+                let recipient_vk = verifying_key_from_bytes(&public_key)?;
+
+                let invoice_expiration =
+                    recipient
+                        .expiration_timestamp
+                        .ok_or_else(|| Error::InvalidRecipientData {
+                            details: s!("missing invoice expiration"),
+                        })? as i64;
+                if invoice_expiration <= now_ts {
+                    return Err(Error::InvoiceExpired);
+                }
+
+                (
+                    transport_endpoints,
+                    public_key,
+                    Some(recipient_vk),
+                    Some(invoice_expiration),
+                )
+            };
+
+        let local_recipient_data = match xchainnet_beneficiary.into_inner() {
+            Beneficiary::BlindedSeal(secret_seal) => {
+                if recipient.witness_data.is_some() {
+                    return Err(Error::InvalidRecipientData {
+                        details: s!("cannot provide witness data for a blinded recipient"),
+                    });
+                }
+                LocalRecipientData::Blind(secret_seal)
+            }
+            Beneficiary::WitnessVout(pay_2_vout, _) => {
+                if let Some(ref witness_data) = recipient.witness_data {
+                    let script_buf = pay_2_vout.to_script();
+                    witness_recipients.push((script_buf.clone(), witness_data.amount_sat));
+                    // the blinding of a proxy recipient seal is derived from the keys of both
+                    // parties (v1.0-changes-spec.md A.11), so the sender cannot choose it as it
+                    // does for an out-of-band recipient, which has no key
+                    let blinding = match &recipient_vk {
+                        None => witness_data.blinding,
+                        Some(recipient_vk) => {
+                            if witness_data.blinding.is_some() {
+                                return Err(Error::InvalidRecipientData {
+                                    details: s!(
+                                        "cannot provide a blinding for a witness recipient with transport endpoints"
+                                    ),
+                                });
+                            }
+                            Some(derive_shared(operation_sk, recipient_vk)?.seal_blinding)
+                        }
+                    };
+                    let local_witness_data = LocalWitnessData {
+                        amount_sat: witness_data.amount_sat,
+                        blinding,
+                        vout: *recipient_vout,
+                    };
+                    *recipient_vout += 1;
+                    LocalRecipientData::Witness(local_witness_data)
+                } else {
+                    return Err(Error::InvalidRecipientData {
+                        details: s!("missing witness data for a witness recipient"),
+                    });
+                }
+            }
+        };
+
+        Ok(LocalRecipient {
+            recipient_id: recipient.recipient_id.clone(),
+            local_recipient_data,
+            assignment: recipient.assignment.clone(),
+            transport_endpoints,
+            public_key,
+            encryption: recipient.encryption,
+            invoice_expiration,
+        })
+    }
+
     fn setup_transfer_directory(&self, receive_ids: Vec<String>) -> Result<PathBuf, Error> {
         let mut receive_ids_dedup = receive_ids.clone();
         receive_ids_dedup.sort();
@@ -5597,172 +5742,34 @@ pub trait WalletOnline: WalletOffline {
             self.check_schema_support(&schema)?;
 
             let mut original_assignments_needed = AssignmentsCollection::default();
-            for recipient in recipients.clone() {
-                let out_of_band = recipient.transport_endpoints.is_empty();
-                if !out_of_band {
-                    self.check_transport_endpoints(&recipient.transport_endpoints)?;
-                }
-                match (&recipient.assignment, schema) {
-                    (
-                        Assignment::Fungible(amt),
-                        AssetSchema::Nia | AssetSchema::Cfa | AssetSchema::Ifa,
-                    ) => {
-                        if *amt == 0 {
-                            return Err(Error::InvalidAmountZero);
-                        }
-                    }
-                    (Assignment::NonFungible, AssetSchema::Uda) => {}
-                    (Assignment::InflationRight(amt), AssetSchema::Ifa) => {
-                        if *amt == 0 {
-                            return Err(Error::InvalidAmountZero);
-                        }
-                    }
-                    _ => {
-                        return Err(Error::InvalidAssignment);
-                    }
-                }
-                let mut transport_endpoints: Vec<LocalTransportEndpoint> = vec![];
-                let mut found_valid = false;
+            for recipient in recipients {
                 // a proxy recipient posts its ACK to (and gets the signed TX from) the sender
                 // proxy, so one is needed
-                if !out_of_band && sender_transport_endpoint.is_none() {
+                if !recipient.transport_endpoints.is_empty() && sender_transport_endpoint.is_none()
+                {
                     return Err(Error::InvalidTransportEndpoint {
                         details: s!("missing sender transport endpoint"),
                     });
                 }
-                if out_of_band {
-                    if !self.supports_out_of_band_exchange() {
-                        return Err(Error::UnsupportedTransportType);
-                    }
-                    // out-of-band exchange: no transport endpoint is stored (its absence marks
-                    // the transfer as out-of-band)
-                    found_valid = true;
-                } else {
-                    for endpoint_str in &recipient.transport_endpoints {
-                        let transport_endpoint = TransportEndpoint::new(endpoint_str.clone())?;
-                        let mut local_transport_endpoint = LocalTransportEndpoint {
-                            transport_type: transport_endpoint.transport_type,
-                            endpoint: transport_endpoint.endpoint.clone(),
-                            used: false,
-                            usable: false,
-                        };
-                        if check_proxy(&transport_endpoint.endpoint).is_ok() {
-                            local_transport_endpoint.usable = true;
-                            found_valid = true;
-                        }
-                        transport_endpoints.push(local_transport_endpoint);
-                    }
-                }
-
-                if !found_valid {
-                    return Err(Error::InvalidTransportEndpoints {
-                        details: s!("no valid transport endpoints"),
-                    });
-                }
-
-                let xchainnet_beneficiary =
-                    XChainNet::<Beneficiary>::from_str(&recipient.recipient_id)
-                        .map_err(|_| Error::InvalidRecipientID)?;
-
-                if xchainnet_beneficiary.chain_network() != chainnet {
-                    return Err(Error::InvalidRecipientNetwork);
-                }
-
-                // decode and validate the recipient's Ed25519 public key, needed to encrypt data
-                // for and verify the ACK from a proxy recipient; the out-of-band exchange has no
-                // use for it, so it is ignored there
-                let public_key =
-                    if out_of_band {
-                        vec![]
-                    } else {
-                        let public_key_hex = recipient.public_key.as_deref().ok_or_else(|| {
-                            Error::InvalidPubkey {
-                                details: s!("missing recipient public key"),
-                            }
-                        })?;
-                        let public_key =
-                            hex::decode(public_key_hex).map_err(|_| Error::InvalidPubkey {
-                                details: s!("recipient public key is not valid hex"),
-                            })?;
-                        verifying_key_from_bytes(&public_key)?;
-                        public_key
-                    };
-
-                // a transfer to a proxy recipient cannot be created after the invoice expiration
-                let invoice_expiration = if out_of_band {
-                    None
-                } else {
-                    let invoice_expiration = recipient.expiration_timestamp.ok_or_else(|| {
-                        Error::InvalidRecipientData {
-                            details: s!("missing invoice expiration"),
-                        }
-                    })? as i64;
-                    if invoice_expiration <= now_ts {
-                        return Err(Error::InvoiceExpired);
-                    }
+                let local_recipient = self.parse_recipient(
+                    recipient,
+                    schema,
+                    chainnet,
+                    &mut witness_recipients,
+                    &mut recipient_vout,
+                    &operation_sk,
+                    now_ts,
+                )?;
+                if let Some(invoice_expiration) = local_recipient.invoice_expiration {
                     min_invoice_expiration = Some(
                         min_invoice_expiration
                             .map_or(invoice_expiration, |m| std::cmp::min(m, invoice_expiration)),
                     );
-                    Some(invoice_expiration)
-                };
-
-                let local_recipient_data = match xchainnet_beneficiary.into_inner() {
-                    Beneficiary::BlindedSeal(secret_seal) => {
-                        if recipient.witness_data.is_some() {
-                            return Err(Error::InvalidRecipientData {
-                                details: s!("cannot provide witness data for a blinded recipient"),
-                            });
-                        }
-                        LocalRecipientData::Blind(secret_seal)
-                    }
-                    Beneficiary::WitnessVout(pay_2_vout, _) => {
-                        if let Some(ref witness_data) = recipient.witness_data {
-                            let script_buf = pay_2_vout.to_script();
-                            witness_recipients.push((script_buf.clone(), witness_data.amount_sat));
-                            // the blinding of a proxy recipient seal is derived from the keys of
-                            // both parties (v1.0-changes-spec.md A.11), so the sender cannot choose
-                            // it
-                            let blinding = if out_of_band {
-                                witness_data.blinding
-                            } else {
-                                if witness_data.blinding.is_some() {
-                                    return Err(Error::InvalidRecipientData {
-                                        details: s!(
-                                            "cannot provide a blinding for a witness recipient with transport endpoints"
-                                        ),
-                                    });
-                                }
-                                let recipient_vk = verifying_key_from_bytes(&public_key)?;
-                                Some(derive_shared(&operation_sk, &recipient_vk)?.seal_blinding)
-                            };
-                            let local_witness_data = LocalWitnessData {
-                                amount_sat: witness_data.amount_sat,
-                                blinding,
-                                vout: recipient_vout,
-                            };
-                            recipient_vout += 1;
-                            LocalRecipientData::Witness(local_witness_data)
-                        } else {
-                            return Err(Error::InvalidRecipientData {
-                                details: s!("missing witness data for a witness recipient"),
-                            });
-                        }
-                    }
-                };
-
+                }
                 local_recipients
                     .entry(asset_id.clone())
                     .or_default()
-                    .push(LocalRecipient {
-                        recipient_id: recipient.recipient_id,
-                        local_recipient_data,
-                        assignment: recipient.assignment.clone(),
-                        transport_endpoints,
-                        public_key,
-                        encryption: recipient.encryption,
-                        invoice_expiration,
-                    });
+                    .push(local_recipient);
 
                 recipient
                     .assignment
@@ -6240,14 +6247,6 @@ pub trait WalletOnline: WalletOffline {
         Ok(tx.compute_txid().to_string())
     }
 
-    /// Whether a `schema` supports inflation.
-    fn schema_supports_inflation(schema: AssetSchema) -> bool {
-        match schema {
-            AssetSchema::Ifa => true,
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => false,
-        }
-    }
-
     fn inflate_begin_impl(
         &mut self,
         txn: &DbTxn,
@@ -6260,7 +6259,7 @@ pub trait WalletOnline: WalletOffline {
         let asset = txn.check_asset_exists(asset_id.clone())?;
         let schema = asset.schema;
         self.check_schema_support(&schema)?;
-        if !Self::schema_supports_inflation(schema) {
+        if !schema.supports_inflation() {
             return Err(Error::UnsupportedInflation {
                 asset_schema: schema,
             });
@@ -6433,14 +6432,6 @@ pub trait WalletOnline: WalletOffline {
         })
     }
 
-    /// Whether a `schema` supports burning.
-    fn schema_supports_burn(schema: AssetSchema) -> bool {
-        match schema {
-            AssetSchema::Ifa => true,
-            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => false,
-        }
-    }
-
     fn burn_begin_impl(
         &mut self,
         txn: &DbTxn,
@@ -6454,7 +6445,7 @@ pub trait WalletOnline: WalletOffline {
         let asset = txn.check_asset_exists(asset_id.clone())?;
         let schema = asset.schema;
         self.check_schema_support(&schema)?;
-        if !Self::schema_supports_burn(schema) {
+        if !schema.supports_burn() {
             return Err(Error::UnsupportedBurn {
                 asset_schema: schema,
             });

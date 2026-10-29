@@ -3468,6 +3468,77 @@ fn no_change_on_pending_send() {
     assert!(!unspent_1.rgb_allocations.iter().any(|a| !a.settled));
 }
 
+/// Whether an asset of the given schema can be sent with the given assignment.
+#[cfg(feature = "electrum")]
+fn send_assignment_supported(schema: AssetSchema, assignment: &Assignment) -> bool {
+    match schema {
+        AssetSchema::Nia | AssetSchema::Cfa => matches!(assignment, Assignment::Fungible(_)),
+        AssetSchema::Uda => matches!(assignment, Assignment::NonFungible),
+        AssetSchema::Ifa => matches!(
+            assignment,
+            Assignment::Fungible(_) | Assignment::InflationRight(_)
+        ),
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn schema_assignment_combinations() {
+    initialize();
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    // more UTXOs to have free allocation slots
+    party.create_utxos_default();
+
+    let receive_data = rcv_party.blind_receive();
+    // all the assignment kinds, with a zero amount where they have one (the iterator's default),
+    // so that a supported assignment is rejected right after passing the assignment check, before
+    // sending anything
+    let assignments: Vec<Assignment> = Assignment::iter().collect();
+    for schema in AssetSchema::iter() {
+        let asset_id = party.issue_asset_of_schema(schema);
+        for assignment in &assignments {
+            let recipient_map = HashMap::from([(
+                asset_id.clone(),
+                vec![Recipient {
+                    assignment: assignment.clone(),
+                    recipient_id: receive_data.recipient_id.clone(),
+                    public_key: Some(receive_data.public_key.clone()),
+                    expiration_timestamp: Some(receive_data.expiration_timestamp),
+                    encryption: Encryption::Optional,
+                    witness_data: None,
+                    transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                }],
+            )]);
+            let supported = send_assignment_supported(schema, assignment);
+            let has_amount = matches!(
+                assignment,
+                Assignment::Fungible(_) | Assignment::InflationRight(_)
+            );
+            if supported && !has_amount {
+                // there's no way to fail right after the assignment check, a successful send is
+                // covered by the other tests
+                continue;
+            }
+            let result = party.send_begin_result(&recipient_map);
+            let context = format!("schema {schema:?}, assignment {assignment:?}");
+            if supported {
+                assert!(
+                    matches!(result, Err(Error::InvalidAmountZero)),
+                    "{context}: {result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::InvalidAssignment)),
+                    "{context}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]

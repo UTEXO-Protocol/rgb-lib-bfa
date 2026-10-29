@@ -698,15 +698,16 @@ fn fail() {
     let result = party_nia.burn_begin_result(&asset_ifa.asset_id, 10, None);
     assert_matches!(result, Err(Error::UnsupportedSchema { asset_schema: _ }));
     // - burn not supported
-    let asset_nia = party.issue_asset_nia(None);
-    let asset_cfa = party.issue_asset_cfa(None, None);
-    let asset_uda = party.issue_asset_uda(None, None, vec![]);
-    let unsupported_asset_ids = [
-        (asset_nia.asset_id, AssetSchema::Nia),
-        (asset_cfa.asset_id, AssetSchema::Cfa),
-        (asset_uda.asset_id, AssetSchema::Uda),
-    ];
-    for (asset_id, schema) in unsupported_asset_ids {
+    party.create_utxos_default(); // more UTXOs to have free allocation slots
+    for schema in AssetSchema::iter() {
+        let supported = match schema {
+            AssetSchema::Ifa => true,
+            AssetSchema::Nia | AssetSchema::Uda | AssetSchema::Cfa => false,
+        };
+        if supported {
+            continue;
+        }
+        let asset_id = party.issue_asset_of_schema(schema);
         let result = party.burn_result(&asset_id, 10, None);
         assert_matches!(result, Err(Error::UnsupportedBurn { asset_schema }) if asset_schema == schema);
     }

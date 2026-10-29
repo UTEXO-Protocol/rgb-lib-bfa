@@ -525,7 +525,8 @@ use crate::{
         read_fascia, setup_logger, str_to_xpub,
     },
     wallet::{
-        Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint, WalletDescriptors,
+        Balance, LocalRgbAllocation, LocalUnspent, NUM_KNOWN_SCHEMAS, Outpoint,
+        RGB_STATE_ASSET_OWNER, RGB_STATE_INFLATION_ALLOWANCE, WalletDescriptors,
     },
 };
 #[cfg(all(test, feature = "wallet"))]
