@@ -87,7 +87,9 @@ jobs:
               url."https://x-access-token:${RGB_UPSTREAM_TOKEN}@github.com/UTEXO-Protocol/${r}-s-bfa.git".insteadOf \
               "ssh://git@github.com/rgb-tools-devs/${r}.git"
           done
-          sed -n '/^\[patch\.crates-io\]/,$p' Cargo.toml >> bindings/uniffi/Cargo.toml
+          # upstream may already ship the patch table: a second one fails the build
+          grep -q '^\[patch\.crates-io\]' bindings/uniffi/Cargo.toml ||
+            sed -n '/^\[patch\.crates-io\]/,$p' Cargo.toml >> bindings/uniffi/Cargo.toml
 
       - name: Build uniffi library
         working-directory: bindings/uniffi
