@@ -341,6 +341,7 @@ use rgbstd::{
 #[cfg(feature = "_online")]
 use rgbstd::{
     contract::FilterIncludeAll,
+    daggy::NodeIndex,
     indexers::AnyResolver,
     validation::{OpsDag, SchemaRules, ValidationConfig, ValidationError, Validity, Warning},
 };
