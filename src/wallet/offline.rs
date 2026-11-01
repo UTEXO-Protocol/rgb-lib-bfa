@@ -1200,6 +1200,7 @@ pub trait WalletOffline: WalletBackup {
         expiration_timestamp: i64,
         transport_endpoints: Vec<String>,
         recipient_type: RecipientType,
+        external_script: Option<ScriptBuf>,
         encryption: Option<Encryption>,
     ) -> Result<ReceiveDataInternal, Error> {
         let encryption = encryption.unwrap_or(Encryption::Required);
@@ -1238,12 +1239,21 @@ pub trait WalletOffline: WalletBackup {
                 let recipient_type_full = RecipientTypeFull::Blind { unblinded_utxo };
                 (beneficiary, recipient_type_full, Some(blind_seal), None)
             }
-            RecipientType::Witness => {
-                let script_pubkey = self.get_new_address()?.script_pubkey();
-                let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
-                let recipient_type_full = RecipientTypeFull::Witness { vout: None };
-                (beneficiary, recipient_type_full, None, Some(script_pubkey))
-            }
+            RecipientType::Witness => match external_script {
+                // the paid output is not a wallet UTXO, so there is no witness script to watch
+                Some(script_pubkey) => (
+                    beneficiary_from_script_buf(script_pubkey),
+                    RecipientTypeFull::External { vout: None },
+                    None,
+                    None,
+                ),
+                None => {
+                    let script_pubkey = self.get_new_address()?.script_pubkey();
+                    let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
+                    let recipient_type_full = RecipientTypeFull::Witness { vout: None };
+                    (beneficiary, recipient_type_full, None, Some(script_pubkey))
+                }
+            },
         };
 
         #[cfg(test)]
@@ -2456,7 +2466,9 @@ pub trait WalletOffline: WalletBackup {
             } else {
                 match transfer.recipient_type.as_ref().unwrap() {
                     RecipientTypeFull::Blind { .. } => TransferKind::ReceiveBlind,
-                    RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
+                    RecipientTypeFull::Witness { .. } | RecipientTypeFull::External { .. } => {
+                        TransferKind::ReceiveWitness
+                    }
                 }
             }
         } else {

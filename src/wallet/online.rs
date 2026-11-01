@@ -2979,10 +2979,12 @@ pub trait WalletOnline: WalletOffline {
         // pending
         let receive_outpoint = match &transfer.recipient_type {
             Some(RecipientTypeFull::Blind { unblinded_utxo }) => unblinded_utxo.clone(),
-            Some(RecipientTypeFull::Witness { .. }) => Outpoint {
-                txid: txid.clone(),
-                vout: vout.ok_or(InternalError::Unexpected)?,
-            },
+            Some(RecipientTypeFull::Witness { .. }) | Some(RecipientTypeFull::External { .. }) => {
+                Outpoint {
+                    txid: txid.clone(),
+                    vout: vout.ok_or(InternalError::Unexpected)?,
+                }
+            }
             _ => return Err(InternalError::Unexpected.into()),
         };
         let held = self.count_utxo_asset_allocations(txn, &receive_outpoint, &asset_id)?;
@@ -3237,7 +3239,7 @@ pub trait WalletOnline: WalletOffline {
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
-                txn.get_txo(unblinded_utxo)?.expect("utxo must exist").idx
+                Some(txn.get_txo(unblinded_utxo)?.expect("utxo must exist").idx)
             }
             Some(RecipientTypeFull::Witness { .. }) => {
                 let mut updated_transfer: DbTransferActMod = transfer.clone().into();
@@ -3253,19 +3255,29 @@ pub trait WalletOnline: WalletOffline {
                     pending_witness: ActiveValue::Set(true),
                     ..Default::default()
                 };
-                txn.set_txo(db_utxo)?
+                Some(txn.set_txo(db_utxo)?)
+            }
+            // the paid output is not a wallet UTXO: the stash gets the allocation, nothing else
+            Some(RecipientTypeFull::External { .. }) => {
+                let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+                updated_transfer.recipient_type =
+                    ActiveValue::Set(Some(RecipientTypeFull::External { vout }));
+                txn.update_transfer(&mut updated_transfer)?;
+                None
             }
             _ => return Err(InternalError::Unexpected.into()),
         };
-        for assignment in receiving.into_values() {
-            let db_coloring = DbColoringActMod {
-                txo_idx: ActiveValue::Set(utxo_idx),
-                asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
-                r#type: ActiveValue::Set(ColoringType::Receive),
-                assignment: ActiveValue::Set(assignment),
-                ..Default::default()
-            };
-            txn.set_coloring(db_coloring)?;
+        if let Some(utxo_idx) = utxo_idx {
+            for assignment in receiving.into_values() {
+                let db_coloring = DbColoringActMod {
+                    txo_idx: ActiveValue::Set(utxo_idx),
+                    asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
+                    r#type: ActiveValue::Set(ColoringType::Receive),
+                    assignment: ActiveValue::Set(assignment),
+                    ..Default::default()
+                };
+                txn.set_coloring(db_coloring)?;
+            }
         }
 
         // if the consignment contains unsafe history set status to WaitingSafeHeight and stop here

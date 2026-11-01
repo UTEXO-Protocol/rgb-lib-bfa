@@ -1532,6 +1532,7 @@ impl MultisigWallet {
             expiration_timestamp as i64,
             transport_endpoints,
             recipient_type,
+            None,
             encryption,
         )?;
 
