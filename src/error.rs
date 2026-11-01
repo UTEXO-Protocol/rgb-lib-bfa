@@ -467,6 +467,13 @@ pub enum Error {
     #[error("The provided recipient ID is neither a blinded UTXO or a script")]
     InvalidRecipientID,
 
+    /// The provided script is invalid or not usable for the requested operation
+    #[error("Invalid script: {details}")]
+    InvalidScript {
+        /// Error details
+        details: String,
+    },
+
     /// The provided recipient map is invalid
     #[error("The provided recipient map is invalid")]
     InvalidRecipientMap,

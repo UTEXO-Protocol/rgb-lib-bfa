@@ -240,6 +240,9 @@ pub enum RecipientTypeFull {
     Blind { unblinded_utxo: Outpoint },
     /// Receive via witness TX
     Witness { vout: Option<u32> },
+    /// Receive via witness TX paying a script the wallet does not own: the allocation is kept in
+    /// the RGB stash only, no UTXO or balance is tracked for it
+    External { vout: Option<u32> },
 }
 
 #[cfg(feature = "wallet")]

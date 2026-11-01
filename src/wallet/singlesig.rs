@@ -666,6 +666,7 @@ impl Wallet {
             expiration_timestamp as i64,
             transport_endpoints,
             RecipientType::Blind,
+            None,
             encryption,
         )?;
         let batch_transfer_idx =
@@ -748,6 +749,7 @@ impl Wallet {
             expiration_timestamp as i64,
             transport_endpoints,
             RecipientType::Witness,
+            None,
             encryption,
         )?;
         let batch_transfer_idx =
@@ -755,6 +757,65 @@ impl Wallet {
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Witness receive completed");
+        Ok(ReceiveData {
+            invoice: receive_data_internal.invoice_string,
+            recipient_id: receive_data_internal.recipient_id,
+            expiration_timestamp: receive_data_internal.expiration_timestamp as u64,
+            batch_transfer_idx,
+            public_key: hex::encode(&receive_data_internal.recipient_pubkey),
+        })
+    }
+
+    /// Like [`witness_receive`](Wallet::witness_receive), but for a script the wallet does not
+    /// own (e.g. an HTLC lock), given as hex.
+    ///
+    /// The transfer is fetched, validated and accepted by `refresh` as any witness receive, with
+    /// the paid output checked against the invoice script. Since the output is not a wallet UTXO
+    /// it is not tracked and does not count towards the balance: the allocation is only imported
+    /// into the RGB stash, where it can be read with `contract_assignments_for_outpoints` and
+    /// spent by coloring a PSBT that spends the output.
+    pub fn witness_receive_external(
+        &mut self,
+        online: Option<Online>,
+        script_pubkey: String,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
+        info!(
+            self.logger(),
+            "Receiving via witness TX on external script '{script_pubkey}' for asset '{:?}'...",
+            asset_id,
+        );
+        let script_pubkey =
+            ScriptBuf::from_hex(&script_pubkey).map_err(|e| Error::InvalidScript {
+                details: e.to_string(),
+            })?;
+        if self.bdk_wallet().is_mine(script_pubkey.clone()) {
+            return Err(Error::InvalidScript {
+                details: s!("script belongs to this wallet, use witness_receive"),
+            });
+        }
+        let txn = self.database().begin_transaction()?;
+        let receive_data_internal = self.create_receive_data(
+            &txn,
+            online,
+            asset_id,
+            assignment,
+            expiration_timestamp as i64,
+            transport_endpoints,
+            RecipientType::Witness,
+            Some(script_pubkey),
+            encryption,
+        )?;
+        let batch_transfer_idx =
+            self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "External witness receive completed");
         Ok(ReceiveData {
             invoice: receive_data_internal.invoice_string,
             recipient_id: receive_data_internal.recipient_id,

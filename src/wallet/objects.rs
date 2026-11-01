@@ -2437,7 +2437,7 @@ impl DbTransfer {
                     _ => unreachable!("beneficiary is blinded"),
                 }
             }
-            RecipientTypeFull::Witness { .. } => {
+            RecipientTypeFull::Witness { .. } | RecipientTypeFull::External { .. } => {
                 let script_pubkey = script_buf_from_recipient_id(recipient_id)?
                     .expect("witness recipient ID should yield a script");
                 Ok(ReceiveMatcher::Witness(script_pubkey, blinding))

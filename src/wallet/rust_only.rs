@@ -299,6 +299,55 @@ impl Wallet {
         Ok(())
     }
 
+    /// Inspect arbitrary outpoints for assignments of a given contract.
+    ///
+    /// Results are returned in the same order as `outpoints`, including duplicate entries.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn contract_assignments_for_outpoints(
+        &self,
+        contract_id: ContractId,
+        outpoints: Vec<Outpoint>,
+    ) -> Result<Vec<(Outpoint, Vec<Assignment>)>, Error> {
+        let parsed: Vec<(Outpoint, OutPoint)> = outpoints
+            .into_iter()
+            .map(|outpoint| {
+                let vout = outpoint.vout;
+                let txid = bdk_wallet::bitcoin::Txid::from_str(&outpoint.txid)
+                    .map_err(|_| Error::InvalidTxid)?;
+                Ok((outpoint, OutPoint { txid, vout }))
+            })
+            .collect::<Result<_, Error>>()?;
+        let txn = self.database().begin_transaction()?;
+        let stock = self.rgb_stock(&txn)?;
+        stock.genesis(contract_id)?;
+        let state = stock
+            .contract_assignments_for(contract_id, parsed.iter().map(|(_, outpoint)| *outpoint))?;
+        let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
+        for (seal, opout_state_map) in state {
+            let btc_outpoint = OutPoint {
+                txid: bdk_wallet::bitcoin::Txid::from_str(&seal.txid.to_string()).map_err(
+                    |_| Error::Internal {
+                        details: s!("invalid seal txid in contract assignments"),
+                    },
+                )?,
+                vout: seal.vout.into_u32(),
+            };
+            let assignments = by_outpoint.entry(btc_outpoint).or_default();
+            for (opout, state) in opout_state_map {
+                assignments.push(Assignment::from_opout_and_state(opout, &state));
+            }
+        }
+        Ok(parsed
+            .into_iter()
+            .map(|(outpoint, btc_outpoint)| {
+                let assignments = by_outpoint.get(&btc_outpoint).cloned().unwrap_or_default();
+                (outpoint, assignments)
+            })
+            .collect())
+    }
+
     /// Accept an RGB transfer using a consignment received out-of-band.
     ///
     /// Returns the consignment, the received assignments and the hex-encoded digests of the media
