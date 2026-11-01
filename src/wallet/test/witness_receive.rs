@@ -218,13 +218,15 @@ fn external_script_success() {
     )]);
     let txid = party_send.send(recipient_map, FEE_RATE, None).txid;
 
-    party_recv.wait_for_refresh(Some(&asset_id));
+    // the invoice names no asset, so the receive is not covered by an asset-filtered refresh
+    party_recv.wait_for_refresh(None);
     assert!(party_recv.check_test_transfer_status_recipient(
         &receive_data.recipient_id,
         TransferStatus::WaitingConfirmations
     ));
+    party_send.wait_for_refresh(Some(&asset_id));
     mine(false);
-    party_recv.wait_for_refresh(Some(&asset_id));
+    party_recv.wait_for_refresh(None);
     assert!(
         party_recv.check_test_transfer_status_recipient(
             &receive_data.recipient_id,
