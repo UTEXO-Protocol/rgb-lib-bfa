@@ -154,3 +154,137 @@ fn fail() {
         .unwrap_err();
     assert_matches!(result, Error::InvalidExpiration);
 }
+
+/// A witness receive on a script the wallet does not own: the transfer settles with the
+/// allocation in the stash only, no UTXO or balance, and the allocation can be read on the paid
+/// outpoint.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn external_script_success() {
+    initialize();
+
+    let amount = 66;
+    let mut party_send = get_funded_party!();
+    let mut party_recv = get_funded_party!();
+    let mut party_ext = get_empty_party!();
+    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.clone();
+
+    // a script of a third wallet stands in for the HTLC lock
+    let script_pubkey = BdkAddress::from_str(&party_ext.get_address())
+        .unwrap()
+        .assume_checked()
+        .script_pubkey();
+    let receive_data = party_recv
+        .wallet
+        .witness_receive_external(
+            Some(party_recv.online),
+            script_pubkey.to_hex_string(),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        crate::utils::script_buf_from_recipient_id(receive_data.recipient_id.clone()).unwrap(),
+        Some(script_pubkey.clone())
+    );
+    // a wallet script is refused
+    let own_script = BdkAddress::from_str(&party_recv.get_address())
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+        .to_hex_string();
+    let result = party_recv.wallet.witness_receive_external(
+        Some(party_recv.online),
+        own_script,
+        None,
+        Assignment::Any,
+        default_rcv_expiration(),
+        TRANSPORT_ENDPOINTS.clone(),
+        MIN_CONFIRMATIONS,
+        None,
+    );
+    assert_matches!(result, Err(Error::InvalidScript { .. }));
+
+    let recipient_map = HashMap::from([(
+        asset_id.clone(),
+        vec![Recipient {
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: Some(WitnessData {
+                amount_sat: 1000,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(amount),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Invoice::new(receive_data.invoice.clone())
+                .unwrap()
+                .invoice_data()
+                .encryption,
+        }],
+    )]);
+    let txid = party_send.send(recipient_map, FEE_RATE, None).txid;
+
+    party_recv.wait_for_refresh(Some(&asset_id));
+    assert!(party_recv.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingConfirmations
+    ));
+    mine(false);
+    party_recv.wait_for_refresh(Some(&asset_id));
+    assert!(
+        party_recv.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        )
+    );
+
+    // nothing is the wallet's: no UTXO on the witness TX, nothing in the balance
+    assert!(
+        party_recv
+            .list_unspents(false)
+            .iter()
+            .all(|u| u.utxo.outpoint.txid != txid)
+    );
+    assert_eq!(
+        party_recv.get_asset_balance(&asset_id),
+        Balance {
+            settled: 0,
+            future: 0,
+            spendable: 0,
+        }
+    );
+    // the allocation sits in the stash, on the external outpoint
+    let transfer = party_recv.get_test_transfer_recipient(&receive_data.recipient_id);
+    let Some(RecipientTypeFull::External { vout: Some(vout) }) = transfer.recipient_type else {
+        panic!("external recipient with a vout expected");
+    };
+    assert_eq!(
+        party_recv
+            .wallet
+            .contract_assignments_for_outpoints(
+                ContractId::from_str(&asset_id).unwrap(),
+                vec![Outpoint {
+                    txid: txid.clone(),
+                    vout,
+                }],
+            )
+            .unwrap(),
+        vec![(
+            Outpoint {
+                txid: txid.clone(),
+                vout,
+            },
+            vec![Assignment::Fungible(amount)]
+        )]
+    );
+
+    party_send.wait_for_refresh(Some(&asset_id));
+    assert!(party_send.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+}

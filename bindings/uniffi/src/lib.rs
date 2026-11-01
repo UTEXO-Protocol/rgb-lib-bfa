@@ -1457,6 +1457,29 @@ impl Wallet {
         )
     }
 
+    fn witness_receive_external(
+        &self,
+        online: Option<Online>,
+        script_pubkey: String,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, RgbLibError> {
+        self._get_wallet().witness_receive_external(
+            online,
+            script_pubkey,
+            asset_id,
+            assignment.into(),
+            expiration_timestamp,
+            transport_endpoints,
+            min_confirmations,
+            encryption,
+        )
+    }
+
     fn finalize_psbt(&self, signed_psbt: String) -> Result<String, RgbLibError> {
         self._get_wallet().finalize_psbt(signed_psbt, None)
     }

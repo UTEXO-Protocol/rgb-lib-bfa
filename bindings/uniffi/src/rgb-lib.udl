@@ -98,6 +98,7 @@ interface RgbLibError {
   InvalidPubkey(string details);
   InvalidRecipientData(string details);
   InvalidRecipientID();
+  InvalidScript(string details);
   InvalidRecipientMap();
   InvalidRecipientNetwork();
   InvalidRejectListUrl(string details);
@@ -1124,6 +1125,14 @@ interface Wallet {
   ReceiveData witness_receive(
     Online? online, string? asset_id, Assignment assignment, u64 expiration_timestamp,
     sequence<string> transport_endpoints, u8 min_confirmations, Encryption? encryption);
+
+  // Witness receive on a script the wallet does not own (e.g. an HTLC lock), hex-encoded.
+  // The allocation is imported into the stash only: no UTXO or balance is tracked for it.
+  [Throws=RgbLibError]
+  ReceiveData witness_receive_external(
+    Online? online, string script_pubkey, string? asset_id, Assignment assignment,
+    u64 expiration_timestamp, sequence<string> transport_endpoints, u8 min_confirmations,
+    Encryption? encryption);
 
   [Throws=RgbLibError]
   string finalize_psbt(string signed_psbt);
