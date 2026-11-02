@@ -8,8 +8,10 @@ use std::{
 };
 
 use rgb_lib::{
-    AssetSchema, Assignment as RgbLibAssignment, CloseMethod, Encryption, Error as RgbLibError,
-    TransferStatus, TransportType, WalletTransactionType,
+    AssetSchema, Assignment as RgbLibAssignment, CloseMethod, ConsignmentExt, ContractId,
+    Encryption, Error as RgbLibError, FileContent, RgbTransfer, TransferStatus, TransportType,
+    WalletTransactionType,
+    bitcoin::psbt::Psbt,
     keys::{Keys, WitnessVersion},
     no_wallet::{
         BundleFilter as RgbLibBundleFilter, ConsignmentInspection as RgbLibConsignmentInspection,
@@ -43,10 +45,91 @@ use rgb_lib::{
         ValidatedWitness as RgbLibValidatedWitness, ValidationOptions,
         ValidationWarning as RgbLibValidationWarning, Wallet as RgbLibWallet, WalletData,
         WalletDescriptors, WitnessData, WitnessValidationStatus as RgbLibWitnessValidationStatus,
+        rust_only::{
+            AssetColoringInfo as RgbLibAssetColoringInfo, ColoringInfo as RgbLibColoringInfo,
+        },
     },
 };
 
 uniffi::include_scaffolding!("rgb-lib");
+
+pub struct AssetColoringInfo {
+    pub asset_id: String,
+    pub output_map: HashMap<u32, u64>,
+    pub static_blinding: Option<u64>,
+}
+
+pub struct ColoringInfo {
+    pub assets: Vec<AssetColoringInfo>,
+    pub static_blinding: Option<u64>,
+    pub nonce: Option<u64>,
+}
+
+impl TryFrom<ColoringInfo> for RgbLibColoringInfo {
+    type Error = RgbLibError;
+
+    fn try_from(coloring_info: ColoringInfo) -> Result<Self, RgbLibError> {
+        let mut asset_info_map = HashMap::new();
+        for asset in coloring_info.assets {
+            let contract_id = ContractId::from_str(&asset.asset_id).map_err(|_| {
+                RgbLibError::InvalidColoringInfo {
+                    details: format!("invalid asset ID {}", asset.asset_id),
+                }
+            })?;
+            if asset_info_map
+                .insert(
+                    contract_id,
+                    RgbLibAssetColoringInfo {
+                        output_map: asset.output_map,
+                        static_blinding: asset.static_blinding,
+                    },
+                )
+                .is_some()
+            {
+                return Err(RgbLibError::InvalidColoringInfo {
+                    details: format!("duplicate asset ID {}", asset.asset_id),
+                });
+            }
+        }
+        Ok(RgbLibColoringInfo {
+            asset_info_map,
+            static_blinding: coloring_info.static_blinding,
+            nonce: coloring_info.nonce,
+        })
+    }
+}
+
+pub struct OutpointAssignments {
+    pub outpoint: Outpoint,
+    pub assignments: Vec<Assignment>,
+}
+
+pub struct PreparedSweep {
+    pub psbt: String,
+    pub batch_transfer_idx: i32,
+    pub handed_off: bool,
+    pub consignment_paths: Vec<String>,
+}
+
+fn save_sweep_consignments(
+    wallet: &RgbLibWallet,
+    batch_transfer_idx: i32,
+    transfers: &[RgbTransfer],
+) -> Result<Vec<String>, RgbLibError> {
+    let dir = wallet
+        .get_wallet_dir()
+        .join("prepared_sweeps")
+        .join(batch_transfer_idx.to_string());
+    std::fs::create_dir_all(&dir)?;
+    transfers
+        .iter()
+        .map(|transfer| {
+            let path = dir.join(format!("{}.rgb", transfer.contract_id()));
+            transfer.save_file(&path)?;
+            Ok(path.to_string_lossy().to_string())
+        })
+        .collect()
+}
 
 // temporary solution needed because the UDL Enum and Remote attributes are incompatible with each other
 pub enum BitcoindAuth {
@@ -1456,6 +1539,93 @@ impl Wallet {
             min_confirmations,
             encryption,
         )
+    }
+
+    fn color_psbt_and_prepare_consume(
+        &self,
+        psbt: String,
+        coloring_info: ColoringInfo,
+        min_confirmations: u8,
+    ) -> Result<PreparedSweep, RgbLibError> {
+        let mut psbt = Psbt::from_str(&psbt)?;
+        let coloring_info = coloring_info.try_into()?;
+        let mut wallet = self._get_wallet();
+        let result = wallet.color_psbt_and_prepare_consume(
+            &mut psbt,
+            coloring_info,
+            min_confirmations,
+            None,
+        )?;
+        Ok(PreparedSweep {
+            psbt: psbt.to_string(),
+            batch_transfer_idx: result.batch_transfer_idx,
+            handed_off: false,
+            consignment_paths: save_sweep_consignments(
+                &wallet,
+                result.batch_transfer_idx,
+                &result.transfers,
+            )?,
+        })
+    }
+
+    fn list_prepared_sweeps(&self) -> Result<Vec<PreparedSweep>, RgbLibError> {
+        let wallet = self._get_wallet();
+        wallet
+            .list_prepared_sweeps()?
+            .into_iter()
+            .map(|sweep| {
+                Ok(PreparedSweep {
+                    psbt: sweep.psbt,
+                    batch_transfer_idx: sweep.batch_transfer_idx,
+                    handed_off: sweep.handed_off,
+                    consignment_paths: save_sweep_consignments(
+                        &wallet,
+                        sweep.batch_transfer_idx,
+                        &sweep.transfers,
+                    )?,
+                })
+            })
+            .collect()
+    }
+
+    fn contract_assignments_for_outpoints(
+        &self,
+        asset_id: String,
+        outpoints: Vec<Outpoint>,
+    ) -> Result<Vec<OutpointAssignments>, RgbLibError> {
+        let contract_id =
+            ContractId::from_str(&asset_id).map_err(|_| RgbLibError::AssetNotFound { asset_id })?;
+        Ok(self
+            ._get_wallet()
+            .contract_assignments_for_outpoints(contract_id, outpoints)?
+            .into_iter()
+            .map(|(outpoint, assignments)| OutpointAssignments {
+                outpoint,
+                assignments: assignments.into_iter().map(Assignment::from).collect(),
+            })
+            .collect())
+    }
+
+    fn mark_prepared_sweep_handed_off(
+        &self,
+        batch_transfer_idx: i32,
+        txid: String,
+    ) -> Result<(), RgbLibError> {
+        self._get_wallet()
+            .mark_prepared_sweep_handed_off(batch_transfer_idx, txid)
+    }
+
+    fn cancel_prepared_sweep(&self, batch_transfer_idx: i32) -> Result<(), RgbLibError> {
+        self._get_wallet().cancel_prepared_sweep(batch_transfer_idx)
+    }
+
+    fn consume_transfer_fascia(
+        &self,
+        online: Online,
+        batch_transfer_idx: i32,
+    ) -> Result<(), RgbLibError> {
+        self._get_wallet()
+            .consume_transfer_fascia(online, batch_transfer_idx)
     }
 
     fn finalize_psbt(&self, signed_psbt: String) -> Result<String, RgbLibError> {
