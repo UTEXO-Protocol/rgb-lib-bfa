@@ -2765,16 +2765,21 @@ pub trait WalletOnline: WalletOffline {
         Ok(Some((valid_consignment, validation_status, receiving)))
     }
 
-    /// Whether a received mint pays the amount requested by the invoice, if it requests one: the
-    /// lock on the external chain has to match the amount minted, so a mint of another amount
-    /// than the agreed one is refused before the lock is made.
-    fn mint_pays_requested(transfer: &DbTransfer, receiving: &HashMap<Opout, Assignment>) -> bool {
-        match transfer.requested_assignment {
-            Some(Assignment::Fungible(requested)) => {
-                receiving.values().map(|a| a.main_amount()).sum::<u64>() == requested
+    /// Whether a received mint pays this recipient all it mints, and the amount requested by the
+    /// invoice if it requests one: the lock on the external chain has to match the whole amount
+    /// minted (see [`ReceivedMint::amount`]), so a mint that pays part of it elsewhere, or of
+    /// another amount than the agreed one, is refused before the lock is made.
+    fn mint_pays_requested(
+        transfer: &DbTransfer,
+        receiving: &HashMap<Opout, Assignment>,
+        minted: u64,
+    ) -> bool {
+        let received = receiving.values().map(|a| a.main_amount()).sum::<u64>();
+        received == minted
+            && match transfer.requested_assignment {
+                Some(Assignment::Fungible(requested)) => received == requested,
+                _ => true,
             }
-            _ => true,
-        }
     }
 
     fn save_received_mint(
@@ -3135,7 +3140,7 @@ pub trait WalletOnline: WalletOffline {
                             updated_batch_transfer,
                         );
                     };
-                    if !Self::mint_pays_requested(transfer, &receiving) {
+                    if !Self::mint_pays_requested(transfer, &receiving, received_mint.amount) {
                         return self.refuse_consignment(
                             txn,
                             &mode,
@@ -3172,7 +3177,7 @@ pub trait WalletOnline: WalletOffline {
             );
         };
         if let Some(received_mint) = &received_mint {
-            if !Self::mint_pays_requested(transfer, &receiving) {
+            if !Self::mint_pays_requested(transfer, &receiving, received_mint.amount) {
                 return self.refuse_consignment(
                     txn,
                     &mode,
