@@ -604,3 +604,234 @@ fn external_script_past_lookahead() {
         vec![Assignment::Fungible(amount)]
     );
 }
+
+/// HTLC claim and refund: the lock output on an external script is spent with a prepared sweep,
+/// by the receiver (claim) or by the sender (refund), to a witness receive of the spending wallet.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn external_script_claim_and_refund() {
+    use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+    use bdk_wallet::bitcoin::{
+        Sequence, TxIn, Txid, Witness, absolute::LockTime, transaction::Version,
+    };
+
+    initialize();
+
+    let amount = 66;
+    let lock_sats = 1000;
+    let mut party_send = get_funded_party!();
+    let mut party_recv = get_funded_party!();
+    let mut party_ext = get_empty_party!();
+    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.clone();
+    let contract_id = ContractId::from_str(&asset_id).unwrap();
+
+    // two locks on scripts of a third wallet, which stands in for the HTLC
+    let mut locks = vec![];
+    for _ in 0..2 {
+        let lock_script = BdkAddress::from_str(&party_ext.get_address())
+            .unwrap()
+            .assume_checked()
+            .script_pubkey();
+        let receive_data = party_recv
+            .wallet
+            .witness_receive_external(
+                Some(party_recv.online),
+                lock_script.to_hex_string(),
+                None,
+                Assignment::Any,
+                default_rcv_expiration(),
+                TRANSPORT_ENDPOINTS.clone(),
+                MIN_CONFIRMATIONS,
+                None,
+            )
+            .unwrap();
+        let recipient_map = HashMap::from([(
+            asset_id.clone(),
+            vec![Recipient {
+                recipient_id: receive_data.recipient_id.clone(),
+                witness_data: Some(WitnessData {
+                    amount_sat: lock_sats,
+                    blinding: None,
+                }),
+                assignment: Assignment::Fungible(amount),
+                transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+                public_key: Some(receive_data.public_key.clone()),
+                expiration_timestamp: Some(receive_data.expiration_timestamp),
+                encryption: Invoice::new(receive_data.invoice.clone())
+                    .unwrap()
+                    .invoice_data()
+                    .encryption,
+            }],
+        )]);
+        let txid = party_send.send(recipient_map, FEE_RATE, None).txid;
+        party_recv.wait_for_refresh(None);
+        party_send.wait_for_refresh(Some(&asset_id));
+        mine(false);
+        party_recv.wait_for_refresh(None);
+        party_send.wait_for_refresh(Some(&asset_id));
+        let transfer = party_recv.get_test_transfer_recipient(&receive_data.recipient_id);
+        let Some(RecipientTypeFull::External { vout: Some(vout) }) = transfer.recipient_type else {
+            panic!("external recipient with a vout expected");
+        };
+        locks.push((
+            OutPoint {
+                txid: Txid::from_str(&txid).unwrap(),
+                vout,
+            },
+            lock_script,
+        ));
+    }
+    assert_eq!(
+        party_send.get_asset_balance(&asset_id).settled,
+        AMOUNT - 2 * amount
+    );
+
+    let coloring = ColoringInfo {
+        asset_info_map: HashMap::from([(
+            contract_id,
+            AssetColoringInfo {
+                output_map: HashMap::from([(0, amount)]),
+                static_blinding: None,
+            },
+        )]),
+        static_blinding: None,
+        nonce: None,
+    };
+    let indexer = build_indexer(&IndexerConfig::Electrum {
+        url: ELECTRUM_URL.to_string(),
+    })
+    .unwrap();
+    // the sweep projects a transfer row on the same recipient, so look at the incoming batch
+    let incoming_settled = |party: &SinglesigParty, recipient_id: &str| {
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let asset_transfers = txn.iter_asset_transfers().unwrap();
+        let batch_transfers = txn.iter_batch_transfers().unwrap();
+        let settled = txn
+            .iter_transfers()
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.recipient_id.as_deref() == Some(recipient_id))
+            .map(|t| t.related_transfers(&asset_transfers, &batch_transfers).1)
+            .find(|b| b.incoming)
+            .unwrap()
+            .status
+            == TransferStatus::Settled;
+        txn.commit().unwrap();
+        settled
+    };
+    // spend a lock to a witness receive of the spending wallet, as an HTLC claim or refund would
+    let spend_lock = |party: &mut SinglesigParty, lock: &(OutPoint, ScriptBuf)| {
+        let receive_data = party
+            .wallet
+            .witness_receive(
+                None,
+                None,
+                Assignment::Any,
+                default_rcv_expiration(),
+                vec![],
+                MIN_CONFIRMATIONS,
+                None,
+            )
+            .unwrap();
+        let to = script_buf_from_recipient_id(receive_data.recipient_id.clone())
+            .unwrap()
+            .unwrap();
+        let tx = BdkTransaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: lock.0,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(lock_sats - 400),
+                script_pubkey: to,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: BdkAmount::from_sat(lock_sats),
+            script_pubkey: lock.1.clone(),
+        });
+        let prepared = party
+            .wallet
+            .color_psbt_and_prepare_consume(&mut psbt, coloring.clone(), MIN_CONFIRMATIONS, None)
+            .unwrap();
+        assert_eq!(prepared.transfers.len(), 1);
+        // the spender is its own counterparty: the consignment is provided out of band
+        let proof_dir = tempfile::tempdir().unwrap();
+        let proof = proof_dir.path().join("sweep.rgb");
+        prepared.transfers[0].save_file(&proof).unwrap();
+        party
+            .wallet
+            .provide_out_of_band_consignment(party.online, proof.to_str().unwrap().into(), vec![])
+            .unwrap();
+        let batch = prepared.batch_transfer_idx;
+        let txid = psbt.unsigned_tx.compute_txid().to_string();
+        party
+            .wallet
+            .mark_prepared_sweep_handed_off(batch, txid.clone())
+            .unwrap();
+        // the lock script owner signs the lock input
+        let signed = party_ext
+            .wallet
+            .sign_psbt(
+                psbt.to_string(),
+                Some(SignOptions {
+                    trust_witness_utxo: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
+        indexer.broadcast(&tx).unwrap();
+        // the mempool is not enough to consume
+        assert!(
+            party
+                .wallet
+                .consume_transfer_fascia(party.online, batch)
+                .is_err()
+        );
+        mine_tx(&txid);
+        party
+            .wallet
+            .consume_transfer_fascia(party.online, batch)
+            .unwrap();
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let status = txn
+            .get_batch_transfer_or_fail(batch, &txn.iter_batch_transfers().unwrap())
+            .unwrap()
+            .status;
+        txn.commit().unwrap();
+        assert_eq!(status, TransferStatus::Settled);
+        for _ in 0..3 {
+            party.wait_for_refresh(None);
+            if incoming_settled(party, &receive_data.recipient_id) {
+                break;
+            }
+        }
+        assert!(incoming_settled(party, &receive_data.recipient_id));
+        assert!(party.list_unspents(true).iter().any(|u| {
+            u.utxo.outpoint.txid == txid
+                && u.rgb_allocations.iter().any(|a| {
+                    a.asset_id.as_deref() == Some(&asset_id)
+                        && a.assignment == Assignment::Fungible(amount)
+                })
+        }));
+    };
+
+    // claim by the receiver
+    spend_lock(&mut party_recv, &locks[0]);
+    assert_eq!(party_recv.get_asset_balance(&asset_id).settled, amount);
+
+    // refund by the sender
+    spend_lock(&mut party_send, &locks[1]);
+    assert_eq!(
+        party_send.get_asset_balance(&asset_id).settled,
+        AMOUNT - amount
+    );
+}
