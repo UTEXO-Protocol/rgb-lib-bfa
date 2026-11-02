@@ -326,6 +326,34 @@ dictionary ReceiveData {
   string public_key;
 };
 
+// Coloring of an externally built PSBT, see rgb_lib::wallet::rust_only::ColoringInfo.
+// Output map keys are the indices before the OP_RETURN output is inserted: with a Taproot
+// output the OP_RETURN goes first and the keys shift by one.
+dictionary AssetColoringInfo {
+  string asset_id;
+  record<u32, u64> output_map;
+  u64? static_blinding;
+};
+
+dictionary ColoringInfo {
+  sequence<AssetColoringInfo> assets;
+  u64? static_blinding;
+  u64? nonce;
+};
+
+dictionary OutpointAssignments {
+  Outpoint outpoint;
+  sequence<Assignment> assignments;
+};
+
+// A prepared sweep: its colored PSBT, protected batch and consignment files
+dictionary PreparedSweep {
+  string psbt;
+  i32 batch_transfer_idx;
+  boolean handed_off;
+  sequence<string> consignment_paths;
+};
+
 interface RecipientInfo {
   [Throws=RgbLibError]
   constructor(string recipient_id);
@@ -1133,6 +1161,32 @@ interface Wallet {
     Online? online, string script_pubkey, string? asset_id, Assignment assignment,
     u64 expiration_timestamp, sequence<string> transport_endpoints, u8 min_confirmations,
     Encryption? encryption);
+
+  // Color an externally built PSBT (e.g. an HTLC claim or refund) and reserve its batch without
+  // consuming RGB state. The consignments are saved under the wallet directory; a payment to a
+  // witness receive of this wallet is accepted by providing them out of band.
+  [Throws=RgbLibError]
+  PreparedSweep color_psbt_and_prepare_consume(
+    string psbt, ColoringInfo coloring_info, u8 min_confirmations);
+
+  [Throws=RgbLibError]
+  sequence<PreparedSweep> list_prepared_sweeps();
+
+  // RGB assignments of a contract on outpoints the wallet may not own, e.g. an HTLC lock
+  [Throws=RgbLibError]
+  sequence<OutpointAssignments> contract_assignments_for_outpoints(
+    string asset_id, sequence<Outpoint> outpoints);
+
+  // Required before signing or handing the PSBT to an external signer; forbids cancellation
+  [Throws=RgbLibError]
+  void mark_prepared_sweep_handed_off(i32 batch_transfer_idx, string txid);
+
+  [Throws=RgbLibError]
+  void cancel_prepared_sweep(i32 batch_transfer_idx);
+
+  // Consume the RGB state once the sweep has the required confirmations
+  [Throws=RgbLibError]
+  void consume_transfer_fascia(Online online, i32 batch_transfer_idx);
 
   [Throws=RgbLibError]
   string finalize_psbt(string signed_psbt);
