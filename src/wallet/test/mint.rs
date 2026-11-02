@@ -991,6 +991,207 @@ fn received_mint_amount() {
     assert_eq!(mint.amount, AMOUNT);
 }
 
+// mint_begin toward several recipients, as a malicious minter would: the schema allows a mint
+// several asset outputs, its lock matching their sum. Mirrors the parts of mint_begin_impl a
+// valid mint needs, minus its checks
+#[cfg(feature = "electrum")]
+fn mint_begin_recipients(
+    party: &mut SinglesigParty,
+    asset_id: &str,
+    recipients: Vec<Recipient>,
+) -> MintBeginResult {
+    let wallet = &mut party.wallet;
+    let txn = wallet.database().begin_transaction().unwrap();
+    let asset = txn.check_asset_exists(asset_id.to_string()).unwrap();
+    let schema = asset.schema;
+    let operation_sk = gen_ed25519();
+    let operation_secret_key = operation_sk.to_bytes().to_vec();
+    let (fee_rate_checked, unspents, input_unspents, mut stock) =
+        wallet.get_transfer_begin_data(&txn, FEE_RATE).unwrap();
+    let assignments_needed = AssignmentsCollection {
+        mint: 1,
+        ..Default::default()
+    };
+    let asset_spend = wallet
+        .select_rgb_inputs(
+            asset_id.to_string(),
+            &assignments_needed,
+            input_unspents.clone(),
+            &mut SelectedInputs::default(),
+        )
+        .unwrap();
+    let chainnet: ChainNet = wallet.bitcoin_network().into();
+    let mut witness_recipients = vec![];
+    let mut recipient_vout = 1;
+    let now_ts = now().unix_timestamp();
+    let local_recipients: Vec<LocalRecipient> = recipients
+        .iter()
+        .map(|r| {
+            wallet
+                .parse_recipient(
+                    r,
+                    schema,
+                    chainnet,
+                    &mut witness_recipients,
+                    &mut recipient_vout,
+                    &operation_sk,
+                    now_ts,
+                    true,
+                )
+                .unwrap()
+        })
+        .collect();
+    let transfer_info = InfoAssetTransfer {
+        asset_info: AssetInfo {
+            contract_id: ContractId::from_str(asset_id).unwrap(),
+            schema,
+            reject_list_url: asset.reject_list_url,
+        },
+        recipients: local_recipients.clone(),
+        asset_spend,
+        change: AssignmentsCollection::default(),
+        original_assignments_needed: assignments_needed.clone(),
+        assignments_needed,
+        assignments_spent: HashMap::new(),
+        main_transition: TypeOfTransition::Mint,
+        beneficiaries_blinded: vec![],
+        beneficiaries_witness: vec![],
+        burn_reason: None,
+        linked_to_contract: None,
+        before_block: Some(default_before_block()),
+    };
+    let transfer_dir = wallet
+        .setup_transfer_directory(
+            local_recipients
+                .iter()
+                .map(|lr| lr.recipient_id.clone())
+                .collect(),
+        )
+        .unwrap();
+    let begin_op_data = wallet
+        .prepare_single_asset_psbt(
+            &txn,
+            transfer_info.clone(),
+            transfer_dir,
+            unspents,
+            &input_unspents,
+            &witness_recipients,
+            fee_rate_checked,
+            MIN_CONFIRMATIONS,
+            None,
+            Some(PROXY_ENDPOINT.clone()),
+            Some(operation_secret_key.clone()),
+            &mut stock,
+            false,
+        )
+        .unwrap();
+    let (_, transfer_dir, info_contents, fascia) =
+        wallet.get_transfer_end_data(&begin_op_data.psbt).unwrap();
+    wallet
+        .gen_consignments(&txn, &fascia, &info_contents.transfers, &transfer_dir)
+        .unwrap();
+    let asset_transfer_dir = wallet.get_asset_transfer_dir(&transfer_dir, asset_id);
+    let sender_sk = ed25519_from_seed(&operation_secret_key.try_into().unwrap());
+    let consignment_hash =
+        hash_file(&wallet.get_send_consignment_path_impl(&asset_transfer_dir)).unwrap();
+    let medias = wallet
+        .get_asset_medias(&txn, asset.media_idx, None)
+        .unwrap();
+    wallet
+        .post_transfer_data(
+            &mut local_recipients.clone(),
+            asset_transfer_dir,
+            medias,
+            &sender_sk,
+            &hex::encode(sender_sk.verifying_key().to_bytes()),
+            Some(&PROXY_ENDPOINT),
+            &consignment_hash,
+            false,
+        )
+        .unwrap();
+    wallet.update_backup_info(&txn, false).unwrap();
+    wallet.persist_and_commit(txn).unwrap();
+    MintBeginResult {
+        psbt: begin_op_data.psbt.to_string(),
+        batch_transfer_idx: begin_op_data.batch_transfer_idx.unwrap(),
+        details: MintDetails {
+            fascia_path: begin_op_data
+                .transfer_dir
+                .join(FASCIA_FILE)
+                .to_string_lossy()
+                .to_string(),
+            min_confirmations: MIN_CONFIRMATIONS,
+            entropy: begin_op_data.info_batch_transfer.entropy,
+            opid: begin_op_data.opid.unwrap(),
+        },
+    }
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+#[serial(evm)]
+fn mint_extra_output() {
+    initialize();
+
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let mut thief_party = get_funded_party!();
+    let asset = party.issue_asset_bfa(4, bridge_contract.address.clone(), None);
+
+    let recipient = |receive_data: &ReceiveData, amount: u64| Recipient {
+        assignment: Assignment::Fungible(amount),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+
+    // the recipient is paid what its invoice asks (if it asks an amount), the minter also pays
+    // itself (on another wallet) an extra output: the lock would be for both, so the recipient
+    // refuses the mint before making it
+    for requested in [Assignment::Fungible(AMOUNT), Assignment::Any] {
+        let receive_data = rcv_party
+            .wallet
+            .blind_receive(
+                Some(rcv_party.online),
+                None,
+                requested,
+                default_rcv_expiration(),
+                TRANSPORT_ENDPOINTS.clone(),
+                MIN_CONFIRMATIONS,
+                None,
+            )
+            .unwrap();
+        let thief_receive_data = thief_party.blind_receive();
+        mint_begin_recipients(
+            &mut party,
+            &asset.asset_id,
+            vec![
+                recipient(&receive_data, AMOUNT),
+                recipient(&thief_receive_data, AMOUNT_SMALL),
+            ],
+        );
+        rcv_party.refresh_all();
+        assert!(rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        ));
+        assert!(
+            rcv_party
+                .wallet
+                .get_received_mint(receive_data.recipient_id.clone())
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
