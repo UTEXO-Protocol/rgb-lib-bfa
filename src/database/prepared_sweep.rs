@@ -1,5 +1,6 @@
 //! Typed access to the protected external-sweep ownership journal.
 use super::*;
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 #[cfg(feature = "_online")]
 pub(crate) const MAX_SWEEP_PAYLOAD: usize = 32 * 1024 * 1024;

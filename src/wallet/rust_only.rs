@@ -63,9 +63,9 @@ impl Wallet {
         coloring_info: ColoringInfo,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
         let txn = self.database().begin_transaction()?;
-        let result = self.color_psbt_in_txn(&txn, psbt, coloring_info)?;
+        let (fascia, beneficiaries, _) = self.color_psbt_in_txn(&txn, psbt, coloring_info)?;
         txn.commit()?;
-        Ok(result)
+        Ok((fascia, beneficiaries))
     }
 
     /// Share the caller's admission/reservation transaction when preparing an external sweep.
@@ -74,7 +74,7 @@ impl Wallet {
         txn: &DbTxn,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
-    ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+    ) -> Result<(Fascia, AssetBeneficiariesMap, Option<u64>), Error> {
         info!(self.logger(), "Coloring PSBT...");
         let mut transaction = match psbt.clone().extract_tx() {
             Ok(tx) => tx,
@@ -235,11 +235,13 @@ impl Wallet {
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         psbt.set_as_unmodifiable();
         let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+        // the commitment entropy leaves the PSBT with the rest of the RGB data
+        let entropy = psbt.outputs.iter().find_map(|o| o.mpc_entropy());
         strip_rgb_data(psbt);
         check_psbt_parsable(psbt)?;
 
         info!(self.logger(), "Color PSBT completed");
-        Ok((fascia, asset_beneficiaries))
+        Ok((fascia, asset_beneficiaries, entropy))
     }
 
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
@@ -254,7 +256,7 @@ impl Wallet {
         info!(self.logger(), "Coloring PSBT and consuming...");
         let txn = self.database().begin_transaction()?;
         txn.ensure_no_prepared_sweep_mutation(&psbt.unsigned_tx)?;
-        let (fascia, asset_beneficiaries) =
+        let (fascia, asset_beneficiaries, _) =
             self.color_psbt_in_txn(&txn, psbt, coloring_info.clone())?;
 
         let witness_txid = psbt.get_txid();
