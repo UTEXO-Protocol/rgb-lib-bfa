@@ -694,7 +694,7 @@ pub trait WalletOnline: WalletOffline {
         );
 
         let reserved: HashSet<BdkOutPoint> = self
-            .get_reserved_vanilla_outpoints(txn)?
+            .get_unspendable_bdk_outpoints(txn)?
             .into_iter()
             .collect();
         let (inputs, usable_btc_amount) = self.internal_unspents().fold(
@@ -3594,13 +3594,23 @@ pub trait WalletOnline: WalletOffline {
                 };
                 Some(txn.set_txo(db_utxo)?)
             }
-            // the paid output is not a wallet UTXO: the stash gets the allocation, nothing else
+            // the paid output is not the wallet's to spend: its TXO is recorded spent, so the
+            // received allocation is listed on the transfer but never counts in the balance
             Some(RecipientTypeFull::External { .. }) => {
                 let mut updated_transfer: DbTransferActMod = transfer.clone().into();
                 updated_transfer.recipient_type =
                     ActiveValue::Set(Some(RecipientTypeFull::External { vout }));
                 txn.update_transfer(&mut updated_transfer)?;
-                None
+                let db_utxo = DbTxoActMod {
+                    txid: ActiveValue::Set(txid.clone()),
+                    vout: ActiveValue::Set(vout.unwrap()),
+                    btc_amount: ActiveValue::Set(s!("0")),
+                    spent: ActiveValue::Set(true),
+                    exists: ActiveValue::Set(false),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                };
+                Some(txn.set_txo(db_utxo)?)
             }
             _ => return Err(InternalError::Unexpected.into()),
         };

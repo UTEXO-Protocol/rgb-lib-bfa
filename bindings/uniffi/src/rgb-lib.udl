@@ -98,10 +98,10 @@ interface RgbLibError {
   InvalidPubkey(string details);
   InvalidRecipientData(string details);
   InvalidRecipientID();
-  InvalidScript(string details);
   InvalidRecipientMap();
   InvalidRecipientNetwork();
   InvalidRejectListUrl(string details);
+  InvalidScript(string details);
   InvalidTicker(string details);
   InvalidTransportEndpoint(string details);
   InvalidTransportEndpoints(string details);

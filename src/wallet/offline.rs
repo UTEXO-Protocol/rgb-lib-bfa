@@ -1325,6 +1325,15 @@ pub trait WalletOffline: WalletBackup {
         let beneficiary = XChainNet::with(network, beneficiary);
         let recipient_id = beneficiary.to_string();
         debug!(self.logger(), "Recipient ID: {recipient_id}");
+        // the receive files are keyed by recipient ID, so a script can only be received on once
+        if matches!(recipient_type_full, RecipientTypeFull::External { .. })
+            && txn
+                .iter_transfers()?
+                .iter()
+                .any(|t| t.recipient_id.as_deref() == Some(&recipient_id))
+        {
+            return Err(Error::RecipientIDAlreadyUsed);
+        }
         let (schema, contract_id) = if let Some(aid) = asset_id.clone() {
             let asset = txn.check_asset_exists(aid.clone())?;
             let contract_id = ContractId::from_str(&aid).expect("invalid contract ID");
@@ -2522,7 +2531,8 @@ pub trait WalletOffline: WalletBackup {
 
         let receive_utxo = match &transfer.recipient_type {
             Some(RecipientTypeFull::Blind { unblinded_utxo }) => Some(unblinded_utxo.clone()),
-            Some(RecipientTypeFull::Witness { vout }) => coloring_info
+            Some(RecipientTypeFull::Witness { vout })
+            | Some(RecipientTypeFull::External { vout }) => coloring_info
                 .receive_candidates
                 .iter()
                 .filter(|t| t.vout == vout.unwrap())

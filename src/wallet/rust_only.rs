@@ -318,26 +318,22 @@ impl Wallet {
             .into_iter()
             .map(|outpoint| {
                 let vout = outpoint.vout;
-                let txid = bdk_wallet::bitcoin::Txid::from_str(&outpoint.txid)
-                    .map_err(|_| Error::InvalidTxid)?;
+                let txid = Txid::from_str(&outpoint.txid).map_err(|_| Error::InvalidTxid)?;
                 Ok((outpoint, OutPoint { txid, vout }))
             })
             .collect::<Result<_, Error>>()?;
         let txn = self.database().begin_transaction()?;
         let stock = self.rgb_stock(&txn)?;
-        stock.genesis(contract_id)?;
+        stock
+            .genesis(contract_id)
+            .map_err(|_| Error::AssetNotFound {
+                asset_id: contract_id.to_string(),
+            })?;
         let state = stock
             .contract_assignments_for(contract_id, parsed.iter().map(|(_, outpoint)| *outpoint))?;
         let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
         for (seal, opout_state_map) in state {
-            let btc_outpoint = OutPoint {
-                txid: bdk_wallet::bitcoin::Txid::from_str(&seal.txid.to_string()).map_err(
-                    |_| Error::Internal {
-                        details: s!("invalid seal txid in contract assignments"),
-                    },
-                )?,
-                vout: seal.vout.into_u32(),
-            };
+            let btc_outpoint = seal.to_outpoint();
             let assignments = by_outpoint.entry(btc_outpoint).or_default();
             for (opout, state) in opout_state_map {
                 assignments.push(Assignment::from_opout_and_state(opout, &state));
