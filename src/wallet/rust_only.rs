@@ -46,6 +46,8 @@ pub fn load_fascia(path: &Path) -> Result<Fascia, Error> {
     read_fascia(path)
 }
 
+pub use crate::no_wallet::validate_consignment_with_resolver;
+
 /// Rust-only APIs of the wallet.
 impl Wallet {
     /// Color a PSBT.
@@ -279,7 +281,12 @@ impl Wallet {
         Ok(transfers)
     }
 
-    /// Create consignments for a PSBT created with the [`send_begin`](Wallet::send_begin) method.
+    /// Create consignments for a PSBT created with the
+    #[cfg_attr(
+        feature = "_online",
+        doc = "[`send_begin`](Wallet::send_begin) method."
+    )]
+    #[cfg_attr(not(feature = "_online"), doc = "`send_begin` method.")]
     ///
     /// <div class="warning">This method is meant for special usage and is normally not needed, use
     /// it only if you know what you're doing</div>
@@ -343,7 +350,7 @@ impl Wallet {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            ClaimResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         ) {
             Ok(consignment) => consignment,
@@ -492,7 +499,7 @@ impl Wallet {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            ClaimResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         )?;
         let valid_contract = valid_transfer.clone().into_valid_contract();

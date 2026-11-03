@@ -17,9 +17,9 @@ use rgb_lib::{
     no_wallet::BundleFilter,
     utils::BitcoinNetwork,
     wallet::{
-        AssetFilter, BitcoindAuth, Online, OnlineOptions, Recipient, RefreshFilter,
-        RgbWalletOpsOffline, RgbWalletOpsOnline, SinglesigKeys, SyncOptions, TransferScope, Wallet,
-        WalletData,
+        AssetFilter, BitcoindAuth, IndexerConfig, Online, OnlineOptions, Recipient, RefreshFilter,
+        RgbWalletOpsOffline, RgbWalletOpsOnline, SinglesigKeys, SyncOptions, TransferScope,
+        ValidationOptions, Wallet, WalletData,
     },
 };
 
@@ -755,6 +755,24 @@ pub extern "C" fn rgblib_sync(
     options: *const c_char,
 ) -> CResultString {
     sync(wallet, online, options).into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_validate_consignment(
+    consignment_path: *const c_char,
+    indexer_config: *const c_char,
+    evm_rpc_urls: *const c_char,
+    min_confirmations: *const c_char,
+    options: *const c_char,
+) -> CResultString {
+    validate_consignment(
+        consignment_path,
+        indexer_config,
+        evm_rpc_urls,
+        min_confirmations,
+        options,
+    )
+    .into()
 }
 
 #[unsafe(no_mangle)]
