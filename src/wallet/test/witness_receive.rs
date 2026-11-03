@@ -140,6 +140,36 @@ fn fail() {
         )
         .unwrap_err();
     assert_matches!(result, Error::InvalidExpiration);
+
+    // external script: not hex, not an address (OP_TRUE, OP_RETURN, empty, P2TR with an invalid
+    // key), a vanilla script and a colored script of the wallet
+    let bad_p2tr = format!("5120{}", "ff".repeat(32));
+    let vanilla = BdkAddress::from_str(&wallet.get_address().unwrap())
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+        .to_hex_string();
+    let colored = wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::External, 0)
+        .address
+        .script_pubkey()
+        .to_hex_string();
+    for script in ["zz", "51", "6a", "", &bad_p2tr, &vanilla, &colored] {
+        let result = wallet
+            .witness_receive_external(
+                None,
+                script.to_string(),
+                None,
+                Assignment::Any,
+                default_rcv_expiration(),
+                vec![],
+                MIN_CONFIRMATIONS,
+                None,
+            )
+            .unwrap_err();
+        assert_matches!(result, Error::InvalidScript { .. });
+    }
 }
 
 /// A witness receive on a script the wallet does not own: the transfer settles with the
@@ -149,6 +179,8 @@ fn fail() {
 #[test]
 #[parallel]
 fn external_script_success() {
+    use bdk_wallet::bitcoin::{Sequence, TxIn, Witness, absolute::LockTime, transaction::Version};
+
     initialize();
 
     let amount = 66;
@@ -177,27 +209,9 @@ fn external_script_success() {
         )
         .unwrap();
     assert_eq!(
-        crate::utils::script_buf_from_recipient_id(receive_data.recipient_id.clone()).unwrap(),
+        script_buf_from_recipient_id(receive_data.recipient_id.clone()).unwrap(),
         Some(script_pubkey.clone())
     );
-    // a wallet script is refused
-    let own_script = BdkAddress::from_str(&party_recv.get_address())
-        .unwrap()
-        .assume_checked()
-        .script_pubkey()
-        .to_hex_string();
-    let result = party_recv.wallet.witness_receive_external(
-        Some(party_recv.online),
-        own_script,
-        None,
-        Assignment::Any,
-        default_rcv_expiration(),
-        TRANSPORT_ENDPOINTS.clone(),
-        MIN_CONFIRMATIONS,
-        None,
-    );
-    assert_matches!(result, Err(Error::InvalidScript { .. }));
-
     let recipient_map = HashMap::from([(
         asset_id.clone(),
         vec![Recipient {
@@ -254,6 +268,20 @@ fn external_script_success() {
     let Some(RecipientTypeFull::External { vout: Some(vout) }) = transfer.recipient_type else {
         panic!("external recipient with a vout expected");
     };
+    let listed = party_recv
+        .list_transfers(Some(&asset_id))
+        .into_iter()
+        .find(|t| t.recipient_id.as_deref() == Some(&receive_data.recipient_id))
+        .unwrap();
+    assert_eq!(listed.kind, TransferKind::ReceiveWitness);
+    assert_eq!(listed.assignments, vec![Assignment::Fungible(amount)]);
+    assert_eq!(
+        listed.receive_utxo,
+        Some(Outpoint {
+            txid: txid.clone(),
+            vout,
+        })
+    );
     assert_eq!(
         party_recv
             .wallet
@@ -276,4 +304,290 @@ fn external_script_success() {
 
     party_send.wait_for_refresh(Some(&asset_id));
     assert!(party_send.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+
+    // the allocation can be spent: the lock is colored to a witness receive of the receiver, with
+    // the consignment provided out of band and the lock owner signing the input
+    let claim = party_recv
+        .wallet
+        .witness_receive(
+            None,
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            vec![],
+            MIN_CONFIRMATIONS,
+            None,
+        )
+        .unwrap();
+    let tx = BdkTransaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_str(&txid).unwrap(),
+                vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: BdkAmount::from_sat(600),
+            script_pubkey: script_buf_from_recipient_id(claim.recipient_id.clone())
+                .unwrap()
+                .unwrap(),
+        }],
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+    let coloring = ColoringInfo {
+        asset_info_map: HashMap::from([(
+            ContractId::from_str(&asset_id).unwrap(),
+            AssetColoringInfo {
+                output_map: HashMap::from([(0, amount)]),
+                static_blinding: None,
+            },
+        )]),
+        static_blinding: None,
+        nonce: None,
+    };
+    let transfers = party_recv
+        .wallet
+        .color_psbt_and_consume(&mut psbt, coloring)
+        .unwrap();
+    // coloring rebuilds the PSBT around the OP_RETURN output, so the input data goes after it
+    psbt.inputs[0].witness_utxo = Some(TxOut {
+        value: BdkAmount::from_sat(1000),
+        script_pubkey,
+    });
+    let proof_dir = tempfile::tempdir().unwrap();
+    let proof = proof_dir.path().join("claim.rgb");
+    transfers[0].save_file(&proof).unwrap();
+    party_recv
+        .wallet
+        .provide_out_of_band_consignment(party_recv.online, proof.to_str().unwrap().into(), vec![])
+        .unwrap();
+    let signed = party_ext
+        .wallet
+        .sign_psbt(
+            psbt.to_string(),
+            Some(SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    let claim_tx = Psbt::from_str(&signed).unwrap().extract_tx().unwrap();
+    build_indexer(&IndexerConfig::Electrum {
+        url: ELECTRUM_URL.to_string(),
+    })
+    .unwrap()
+    .broadcast(&claim_tx)
+    .unwrap();
+    mine(false);
+    party_recv.wait_for_refresh(None);
+    assert!(
+        party_recv
+            .check_test_transfer_status_recipient(&claim.recipient_id, TransferStatus::Settled)
+    );
+    assert_eq!(party_recv.get_asset_balance(&asset_id).settled, amount);
+}
+
+/// An external receive on a script already received on is refused, and one failed or expiring
+/// unpaid leaves nothing behind.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn external_script_fail() {
+    initialize();
+
+    // let the expired receive be failed as soon as its expiration has passed
+    MOCK_CLOCK_SKEW_MARGIN.replace(Some(0));
+
+    let mut party = get_funded_party!();
+    let mut party_ext = get_empty_party!();
+    let receive = |party: &mut SinglesigParty, script: &str, expiration: u64| {
+        party.wallet.witness_receive_external(
+            Some(party.online),
+            script.to_string(),
+            None,
+            Assignment::Any,
+            expiration,
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            None,
+        )
+    };
+    let leftovers = |party: &SinglesigParty| {
+        let txn = party.wallet.database().begin_transaction().unwrap();
+        let txos = txn.iter_txos().unwrap().len();
+        let scripts = txn.iter_pending_witness_scripts().unwrap().len();
+        txn.commit().unwrap();
+        (txos, scripts)
+    };
+    let before = leftovers(&party);
+
+    // an unknown contract is the caller's mistake, not a wallet fault
+    let unknown = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E";
+    let result = party
+        .wallet
+        .contract_assignments_for_outpoints(ContractId::from_str(unknown).unwrap(), vec![]);
+    assert!(matches!(result, Err(Error::AssetNotFound { asset_id }) if asset_id == unknown));
+
+    // a receive failed by fail_transfers leaves nothing behind
+    let failed_script = BdkAddress::from_str(&party_ext.get_address())
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+        .to_hex_string();
+    let failed = receive(&mut party, &failed_script, default_rcv_expiration()).unwrap();
+    assert!(party.fail_transfers_single(failed.batch_transfer_idx));
+    assert!(
+        party.check_test_transfer_status_recipient(&failed.recipient_id, TransferStatus::Failed)
+    );
+    assert_eq!(leftovers(&party), before);
+
+    // a script can be received on once, as the receive files are keyed by recipient ID
+    let script = BdkAddress::from_str(&party_ext.get_address())
+        .unwrap()
+        .assume_checked()
+        .script_pubkey()
+        .to_hex_string();
+    let expiration_secs = 3;
+    let receive_data = receive(
+        &mut party,
+        &script,
+        (now().unix_timestamp() + expiration_secs) as u64,
+    )
+    .unwrap();
+    assert_matches!(
+        receive(&mut party, &script, default_rcv_expiration()),
+        Err(Error::RecipientIDAlreadyUsed)
+    );
+
+    // the receive expires unpaid
+    std::thread::sleep(std::time::Duration::from_millis(
+        expiration_secs as u64 * 1000 + 2000,
+    ));
+    assert!(party.fail_transfers_all());
+    assert!(
+        party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
+    );
+    assert_eq!(leftovers(&party), before);
+    assert!(
+        !party
+            .wallet
+            .get_transfers_dir()
+            .join(receive_data.recipient_id.replace(':', "_"))
+            .exists()
+    );
+    assert_matches!(
+        receive(&mut party, &script, default_rcv_expiration()),
+        Err(Error::RecipientIDAlreadyUsed)
+    );
+}
+
+/// A wallet script past the BDK lookahead is not detected as the wallet's, so it can be received
+/// on as an external script. Once the wallet reveals it, the paid output is a vanilla UTXO, but a
+/// vanilla send cannot spend it, which would burn the allocation.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn external_script_past_lookahead() {
+    initialize();
+
+    let amount = 66;
+    let index = 1000;
+    let mut party_send = get_funded_party!();
+    let mut party_recv = get_funded_party!();
+    let asset = party_send.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.clone();
+
+    let script_pubkey = party_recv
+        .wallet
+        .bdk_wallet()
+        .peek_address(KeychainKind::Internal, index)
+        .address
+        .script_pubkey();
+    let receive_data = party_recv
+        .wallet
+        .witness_receive_external(
+            Some(party_recv.online),
+            script_pubkey.to_hex_string(),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            None,
+        )
+        .unwrap();
+    let recipient_map = HashMap::from([(
+        asset_id.clone(),
+        vec![Recipient {
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: Some(WitnessData {
+                amount_sat: 2_500,
+                blinding: None,
+            }),
+            assignment: Assignment::Fungible(amount),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Invoice::new(receive_data.invoice.clone())
+                .unwrap()
+                .invoice_data()
+                .encryption,
+        }],
+    )]);
+    let txid = party_send.send(recipient_map, FEE_RATE, None).txid;
+    party_recv.wait_for_refresh(None);
+    party_send.wait_for_refresh(Some(&asset_id));
+    mine(false);
+    party_recv.wait_for_refresh(None);
+    party_send.wait_for_refresh(Some(&asset_id));
+    let transfer = party_recv.get_test_transfer_recipient(&receive_data.recipient_id);
+    let Some(RecipientTypeFull::External { vout: Some(vout) }) = transfer.recipient_type else {
+        panic!("external recipient with a vout expected");
+    };
+
+    // with the vanilla funds drained, the wallet reveals the script: the paid output is then its
+    // only vanilla UTXO, but a vanilla send cannot spend it
+    party_recv.drain_to(&party_send.get_address());
+    mine(false);
+    party_recv
+        .wallet
+        .bdk_wallet_mut()
+        .reveal_addresses_to(KeychainKind::Internal, index)
+        .last();
+    let result = party_recv.send_btc_result(&party_send.get_address(), 500);
+    assert_matches!(result, Err(Error::InsufficientBitcoins { .. }));
+    let result =
+        party_recv
+            .wallet
+            .create_utxos(party_recv.online, false, Some(1), None, FEE_RATE, false);
+    assert_matches!(result, Err(Error::InsufficientBitcoins { .. }));
+    assert!(party_recv.wallet.bdk_wallet().list_unspent().any(|o| {
+        o.outpoint
+            == OutPoint {
+                txid: Txid::from_str(&txid).unwrap(),
+                vout,
+            }
+    }));
+    assert_eq!(
+        party_recv
+            .wallet
+            .contract_assignments_for_outpoints(
+                ContractId::from_str(&asset_id).unwrap(),
+                vec![Outpoint {
+                    txid: txid.clone(),
+                    vout,
+                }],
+            )
+            .unwrap()[0]
+            .1,
+        vec![Assignment::Fungible(amount)]
+    );
 }

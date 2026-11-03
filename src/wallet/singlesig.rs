@@ -797,9 +797,10 @@ impl Wallet {
     ///
     /// The transfer is fetched, validated and accepted by `refresh` as any witness receive, with
     /// the paid output checked against the invoice script. Since the output is not a wallet UTXO
-    /// it is not tracked and does not count towards the balance: the allocation is only imported
-    /// into the RGB stash, where it can be read with `contract_assignments_for_outpoints` and
-    /// spent by coloring a PSBT that spends the output.
+    /// it is not listed as unspent and does not count towards the balance: the received
+    /// allocation is listed on the transfer and imported into the RGB stash, where it can be read
+    /// with `contract_assignments_for_outpoints` and spent by coloring a PSBT that spends the
+    /// output.
     pub fn witness_receive_external(
         &mut self,
         online: Option<Online>,
@@ -820,6 +821,9 @@ impl Wallet {
             ScriptBuf::from_hex(&script_pubkey).map_err(|e| Error::InvalidScript {
                 details: e.to_string(),
             })?;
+        AddressPayload::from_script(&script_pubkey).map_err(|e| Error::InvalidScript {
+            details: e.to_string(),
+        })?;
         if self.bdk_wallet().is_mine(script_pubkey.clone()) {
             return Err(Error::InvalidScript {
                 details: s!("script belongs to this wallet, use witness_receive"),
