@@ -611,7 +611,6 @@ fn external_script_past_lookahead() {
 #[test]
 #[parallel]
 fn external_script_claim_and_refund() {
-    use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
     use bdk_wallet::bitcoin::{
         Sequence, TxIn, Txid, Witness, absolute::LockTime, transaction::Version,
     };
