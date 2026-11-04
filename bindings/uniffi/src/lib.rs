@@ -17,26 +17,26 @@ use rgb_lib::{
     },
     utils::BitcoinNetwork,
     wallet::{
-        Address as RgbLibAddress, AssetCFA, AssetFilter as RgbLibAssetFilter, AssetIFA, AssetNIA,
-        AssetUDA, Assets, AssignmentsCollection, Balance, BitcoindAuth as RgbLibBitcoindAuth,
-        BlockTime, BtcBalance, BurnBeginResult, BurnDetails, Cosigner as CosignerData,
-        DatabaseType, EmbeddedMedia, HubInfo, IndexerConfig as RgbLibIndexerConfig,
-        IndexerProtocol, InflateBeginResult, InflateDetails, InitOperationResult,
-        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, LinkBeginResult, LinkDetails,
-        Media, Metadata, MultisigKeys, MultisigOnlineOptions,
-        MultisigVotingStatus as RgbLibMultisigVotingStatus, MultisigWallet as RgbLibMultisigWallet,
-        Online, OnlineOptions as RgbLibOnlineOptions, Operation as RgbLibOperation,
-        OperationInfo as RgbLibOperationInfo, OperationResult, Outpoint, PendingVanillaTx,
-        ProofOfReserves, PsbtInputInfo, PsbtInspection, PsbtOutputInfo, ReceiveData,
-        Recipient as RgbLibRecipient, RecipientInfo as RgbLibRecipientInfo, RecipientType,
-        RefreshFilter, RefreshTransferStatus, RefreshedTransfer,
-        RespondToOperation as RgbLibRespondToOperation, RgbAllocation as RgbLibRgbAllocation,
-        RgbInputInfo as RgbLibRgbInputInfo, RgbInspection as RgbLibRgbInspection,
-        RgbOperationInfo as RgbLibRgbOperationInfo, RgbOutputInfo as RgbLibRgbOutputInfo,
-        RgbTransitionInfo as RgbLibRgbTransitionInfo, RgbWalletOpsOffline, RgbWalletOpsOnline,
-        SendBeginResult, SendDetails, SinglesigKeys, SyncKeychain as RgbLibSyncKeychain,
-        SyncOptions as RgbLibSyncOptions, SyncStrategy, Token, TokenLight, Transaction,
-        TransactionType, Transfer as RgbLibTransfer, TransferKind,
+        Address as RgbLibAddress, AssetBFA, AssetCFA, AssetFilter as RgbLibAssetFilter, AssetIFA,
+        AssetNIA, AssetUDA, Assets, AssignmentsCollection, Balance,
+        BitcoindAuth as RgbLibBitcoindAuth, BlockTime, BtcBalance, BurnBeginResult, BurnDetails,
+        Cosigner as CosignerData, DatabaseType, EmbeddedMedia, EvmChain, HubInfo,
+        IndexerConfig as RgbLibIndexerConfig, IndexerProtocol, InflateBeginResult, InflateDetails,
+        InitOperationResult, Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData,
+        LinkBeginResult, LinkDetails, Media, Metadata, MintBeginResult, MintDetails, MultisigKeys,
+        MultisigOnlineOptions, MultisigVotingStatus as RgbLibMultisigVotingStatus,
+        MultisigWallet as RgbLibMultisigWallet, Online, OnlineOptions as RgbLibOnlineOptions,
+        Operation as RgbLibOperation, OperationInfo as RgbLibOperationInfo, OperationResult,
+        Outpoint, PendingVanillaTx, ProofOfReserves, PsbtInputInfo, PsbtInspection, PsbtOutputInfo,
+        ReceiveData, ReceivedMint, Recipient as RgbLibRecipient,
+        RecipientInfo as RgbLibRecipientInfo, RecipientType, RefreshFilter, RefreshTransferStatus,
+        RefreshedTransfer, RespondToOperation as RgbLibRespondToOperation,
+        RgbAllocation as RgbLibRgbAllocation, RgbInputInfo as RgbLibRgbInputInfo,
+        RgbInspection as RgbLibRgbInspection, RgbOperationInfo as RgbLibRgbOperationInfo,
+        RgbOutputInfo as RgbLibRgbOutputInfo, RgbTransitionInfo as RgbLibRgbTransitionInfo,
+        RgbWalletOpsOffline, RgbWalletOpsOnline, SendBeginResult, SendDetails, SinglesigKeys,
+        SyncKeychain as RgbLibSyncKeychain, SyncOptions as RgbLibSyncOptions, SyncStrategy, Token,
+        TokenLight, Transaction, TransactionType, Transfer as RgbLibTransfer, TransferKind,
         TransferScope as RgbLibTransferScope, TransferTransportEndpoint,
         TransitionGlobal as RgbLibTransitionGlobal, TransportEndpoint as RgbLibTransportEndpoint,
         TypeOfTransition, Unspent as RgbLibUnspent, UserRole, Utxo, Wallet as RgbLibWallet,
@@ -84,6 +84,7 @@ pub struct OnlineOptions {
     pub vanilla_sync_lookback: u32,
     pub failed_witness_receive_grace_secs: u32,
     pub proxy_auth_keys: HashMap<String, String>,
+    pub evm_chains: HashMap<u64, EvmChain>,
 }
 impl From<OnlineOptions> for RgbLibOnlineOptions {
     fn from(orig: OnlineOptions) -> Self {
@@ -93,6 +94,7 @@ impl From<OnlineOptions> for RgbLibOnlineOptions {
             vanilla_sync_lookback: orig.vanilla_sync_lookback,
             failed_witness_receive_grace_secs: orig.failed_witness_receive_grace_secs,
             proxy_auth_keys: orig.proxy_auth_keys,
+            evm_chains: orig.evm_chains,
         }
     }
 }
@@ -170,6 +172,7 @@ pub enum Assignment {
     NonFungible,
     InflationRight { amount: u64 },
     LinkRight,
+    MintRight,
     Any,
 }
 impl From<RgbLibAssignment> for Assignment {
@@ -179,6 +182,7 @@ impl From<RgbLibAssignment> for Assignment {
             RgbLibAssignment::NonFungible => Assignment::NonFungible,
             RgbLibAssignment::InflationRight(amount) => Assignment::InflationRight { amount },
             RgbLibAssignment::LinkRight => Assignment::LinkRight,
+            RgbLibAssignment::MintRight => Assignment::MintRight,
             RgbLibAssignment::Any => Assignment::Any,
         }
     }
@@ -190,6 +194,7 @@ impl From<Assignment> for RgbLibAssignment {
             Assignment::NonFungible => RgbLibAssignment::NonFungible,
             Assignment::InflationRight { amount } => RgbLibAssignment::InflationRight(amount),
             Assignment::LinkRight => RgbLibAssignment::LinkRight,
+            Assignment::MintRight => RgbLibAssignment::MintRight,
             Assignment::Any => RgbLibAssignment::Any,
         }
     }
@@ -505,12 +510,16 @@ impl From<BundleFilter> for RgbLibBundleFilter {
 }
 pub enum TransitionMetadata {
     AllowedInflation { amount: u64 },
+    BeforeBlock { block: u64 },
 }
 impl From<RgbLibTransitionMetadata> for TransitionMetadata {
     fn from(orig: RgbLibTransitionMetadata) -> Self {
         match orig {
             RgbLibTransitionMetadata::AllowedInflation(amount) => {
                 TransitionMetadata::AllowedInflation { amount }
+            }
+            RgbLibTransitionMetadata::BeforeBlock(block) => {
+                TransitionMetadata::BeforeBlock { block }
             }
         }
     }
@@ -520,6 +529,9 @@ impl From<TransitionMetadata> for RgbLibTransitionMetadata {
         match orig {
             TransitionMetadata::AllowedInflation { amount } => {
                 RgbLibTransitionMetadata::AllowedInflation(amount)
+            }
+            TransitionMetadata::BeforeBlock { block } => {
+                RgbLibTransitionMetadata::BeforeBlock(block)
             }
         }
     }
@@ -1616,6 +1628,32 @@ impl Wallet {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn issue_asset_bfa(
+        &self,
+        ticker: String,
+        name: String,
+        precision: u8,
+        mint_rights: u8,
+        chain_id: u64,
+        contract_address: String,
+        reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
+    ) -> Result<AssetBFA, RgbLibError> {
+        self._get_wallet().issue_asset_bfa(
+            ticker,
+            name,
+            precision,
+            mint_rights,
+            chain_id,
+            contract_address,
+            reject_list_address,
+            link_right,
+            linked_from_contract,
+        )
+    }
+
     fn link(
         &self,
         online: Online,
@@ -1697,6 +1735,35 @@ impl Wallet {
             .into_iter()
             .map(|u| u.into())
             .collect())
+    }
+
+    fn mint_begin(
+        &self,
+        online: Online,
+        asset_id: String,
+        recipient: Recipient,
+        before_block: u64,
+        fee_rate: u64,
+        min_confirmations: u8,
+        sender_transport_endpoint: String,
+    ) -> Result<MintBeginResult, RgbLibError> {
+        self._get_wallet().mint_begin(
+            online,
+            asset_id,
+            recipient.into(),
+            before_block,
+            fee_rate,
+            min_confirmations,
+            sender_transport_endpoint,
+        )
+    }
+
+    fn mint_end(
+        &self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, RgbLibError> {
+        self._get_wallet().mint_end(online, signed_psbt)
     }
 
     fn refresh(
@@ -1815,6 +1882,10 @@ impl Wallet {
 
     fn sync(&self, online: Online, options: SyncOptions) -> Result<(), RgbLibError> {
         self._get_wallet().sync(online, options.into())
+    }
+
+    fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, RgbLibError> {
+        self._get_wallet().get_received_mint(recipient_id)
     }
 
     fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, RgbLibError> {
@@ -2232,6 +2303,10 @@ impl MultisigWallet {
         Ok(wallet
             .respond_to_operation(online, operation_idx, respond_to_operation.into())?
             .into())
+    }
+
+    fn get_received_mint(&self, recipient_id: String) -> Result<Option<ReceivedMint>, RgbLibError> {
+        self._get_wallet().get_received_mint(recipient_id)
     }
 
     fn inspect_psbt(&self, psbt: String) -> Result<PsbtInspection, RgbLibError> {

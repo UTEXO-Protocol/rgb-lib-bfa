@@ -193,6 +193,69 @@ fn success() {
     );
 }
 
+/// A BFA asset can be issued with its link right too, which its holder can spend to link the
+/// asset to another contract, leaving its mint rights untouched.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn bfa_success() {
+    initialize();
+
+    let mut party = get_funded_party!();
+
+    // the contracts the asset is linked from and to
+    let linked_from = party.issue_asset_nia(None).asset_id;
+    let linked_to = party.issue_asset_nia(None).asset_id;
+
+    // issue with the link right
+    let asset = party
+        .wallet
+        .issue_asset_bfa(
+            TICKER.to_string(),
+            NAME.to_string(),
+            PRECISION,
+            1,
+            ANVIL_CHAIN_ID,
+            FAKE_EVM_ADDRESS.to_string(),
+            None,
+            true,
+            Some(linked_from.clone()),
+        )
+        .unwrap();
+    let metadata = party.get_asset_metadata(&asset.asset_id);
+    assert_eq!(metadata.linked_from_contract, Some(linked_from.clone()));
+    assert_eq!(metadata.linked_to_contract, None);
+    assert_eq!(link_rights(&mut party, &asset.asset_id), 1);
+    let issuance = party.list_transfers(Some(&asset.asset_id));
+    assert!(issuance[0].assignments.contains(&Assignment::LinkRight));
+    assert!(issuance[0].assignments.contains(&Assignment::MintRight));
+
+    // link, spending the link right
+    let res = link_result(&mut party, &asset.asset_id, &linked_to).unwrap();
+    mine(false);
+    assert!(party.refresh_asset(&asset.asset_id));
+    let transfer = party
+        .list_transfers(Some(&asset.asset_id))
+        .into_iter()
+        .find(|t| t.txid.as_ref() == Some(&res.txid))
+        .unwrap();
+    assert_eq!(transfer.kind, TransferKind::Link);
+    assert_eq!(transfer.status, TransferStatus::Settled);
+    assert_eq!(link_rights(&mut party, &asset.asset_id), 0);
+    let mint_rights = party
+        .list_unspents(false)
+        .iter()
+        .flat_map(|u| u.rgb_allocations.iter())
+        .filter(|a| {
+            a.asset_id.as_deref() == Some(&asset.asset_id) && a.assignment == Assignment::MintRight
+        })
+        .count();
+    assert_eq!(mint_rights, 1);
+    let metadata = party.get_asset_metadata(&asset.asset_id);
+    assert_eq!(metadata.linked_from_contract, Some(linked_from));
+    assert_eq!(metadata.linked_to_contract, Some(linked_to));
+}
+
 /// The link right can be sent beside other assignments of the asset, here to a witness recipient
 /// while an amount goes to a blind one: the link right is moved by a transfer of link rights
 /// beside the transfer moving the amount.
@@ -312,6 +375,18 @@ fn fail() {
         PRECISION,
         vec![AMOUNT],
         vec![],
+        None,
+        true,
+        Some(s!("invalid")),
+    );
+    assert_matches!(result, Err(Error::InvalidContractId { contract_id }) if contract_id == "invalid");
+    let result = party.wallet.issue_asset_bfa(
+        TICKER.to_string(),
+        NAME.to_string(),
+        PRECISION,
+        1,
+        ANVIL_CHAIN_ID,
+        FAKE_EVM_ADDRESS.to_string(),
         None,
         true,
         Some(s!("invalid")),
