@@ -478,13 +478,18 @@ impl Wallet {
     /// Color and durably reserve an externally signed sweep, without consuming RGB state.
     ///
     /// Output keys use the legacy pre-OP_RETURN indices (Taproot paths shift them by one).
-    /// All inputs must be unsigned native SegWit and every owned assignment must be preserved.
+    /// `input_outpoints` are the inputs to sweep: the PSBT inputs carrying RGB assignments must
+    /// be exactly those, and every asset output must pay a pending receive or a colored script of
+    /// this wallet. All inputs must be unsigned native SegWit and every assignment preserved.
     /// The protected batch never expires. Use `None` for expiration and at least one confirmation.
     /// Recover an interrupted caller receipt with [`Self::list_prepared_sweeps`].
+    /// A handed-off sweep can be replaced by another one spending its inputs, paying a new
+    /// receive: the one that confirms settles and the other is released as lost.
     pub fn color_psbt_and_prepare_consume(
         &mut self,
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
+        input_outpoints: Vec<Outpoint>,
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
     ) -> Result<ColorPrepareResult, Error> {
@@ -493,6 +498,7 @@ impl Wallet {
             &txn,
             psbt,
             coloring_info,
+            input_outpoints,
             min_confirmations,
             expiration_timestamp,
         )?;
@@ -506,6 +512,7 @@ impl Wallet {
         txn: &DbTxn,
         psbt: &Psbt,
         coloring_info: ColoringInfo,
+        input_outpoints: Vec<Outpoint>,
         min_confirmations: u8,
         expiration_timestamp: Option<u64>,
     ) -> Result<(Psbt, ColorPrepareResult), Error> {
@@ -519,16 +526,42 @@ impl Wallet {
         }
         let (mut working, shift) = unsigned_layout(psbt)?;
         let inputs = input_set(&working);
+        let mut sweeping = HashSet::new();
+        for outpoint in &input_outpoints {
+            let txid = Txid::from_str(&outpoint.txid).map_err(|_| Error::InvalidTxid)?;
+            let outpoint = OutPoint::new(txid, outpoint.vout);
+            if !inputs.contains(&outpoint) || !sweeping.insert(outpoint) {
+                return Err(invalid("sweep outpoints must be distinct PSBT inputs"));
+            }
+        }
+        if sweeping.is_empty() {
+            return Err(invalid("sweep outpoints must be distinct PSBT inputs"));
+        }
         if txn.prepared_sweep_active_batches()?.len() >= 64 {
             return Err(invalid("too many active prepared sweeps"));
         }
-        if txn.iter_reserved_txos()?.iter().any(|reservation| {
-            inputs.contains(&OutPoint::from(Outpoint {
-                txid: reservation.txid.clone(),
+        // the inputs of a handed-off sweep may be spent again by a replacement (e.g. one paying a
+        // higher fee): they stay reserved by the first sweep, the one that confirms settles and
+        // the other is released as lost
+        let mut shared = HashSet::new();
+        for reservation in txn.iter_reserved_txos()? {
+            let outpoint = OutPoint::from(Outpoint {
+                txid: reservation.txid,
                 vout: reservation.vout,
-            }))
-        }) {
-            return Err(invalid("sweep inputs overlap another reserved operation"));
+            });
+            if !inputs.contains(&outpoint) {
+                continue;
+            }
+            let handed_off = match reservation.reserved_for_colored {
+                Some(batch) if txn.is_prepared_rgb_sweep(batch)? => {
+                    txn.prepared_sweep_read(batch)?.1 == "handed_off"
+                }
+                _ => false,
+            };
+            if !handed_off {
+                return Err(invalid("sweep inputs overlap another reserved operation"));
+            }
+            shared.insert(outpoint);
         }
         let stock = self.rgb_stock(txn)?;
         let assigning: BTreeSet<ContractId> = stock
@@ -588,14 +621,13 @@ impl Wallet {
                 }
                 AddressPayload::from_script(&output.script_pubkey)
                     .map_err(|_| invalid("sweep output must pay a standard script"))?;
-                if self
+                let own_colored = self
                     .bdk_wallet()
                     .derivation_of_spk(output.script_pubkey.clone())
-                    .is_some_and(|(keychain, _)| keychain == KeychainKind::Internal)
-                    && !receives.contains(&output.script_pubkey.to_hex_string())
-                {
+                    .is_some_and(|(keychain, _)| keychain == KeychainKind::External);
+                if !(own_colored || receives.contains(&output.script_pubkey.to_hex_string())) {
                     return Err(invalid(
-                        "sweep cannot assign assets to a vanilla wallet output",
+                        "sweep must assign assets to a pending receive or a colored script of this wallet",
                     ));
                 }
                 total = total
@@ -608,6 +640,12 @@ impl Wallet {
                 ));
             }
             spent.insert(*contract, by_outpoint);
+        }
+        let colored: HashSet<OutPoint> = spent.values().flat_map(|c| c.keys().copied()).collect();
+        if colored != sweeping {
+            return Err(invalid(
+                "sweep PSBT colored inputs differ from the sweep outpoints",
+            ));
         }
         for (input, txin) in working.inputs.iter().zip(&working.unsigned_tx.input) {
             if let Some(local) = self.bdk_wallet().get_utxo(txin.previous_output)
@@ -670,7 +708,21 @@ impl Wallet {
             incoming: ActiveValue::Set(false),
             ..Default::default()
         })?;
-        self.reserve_colored_txos(txn, &working, batch)?;
+        let reservations: Vec<DbReservedTxoActMod> = working
+            .unsigned_tx
+            .input
+            .iter()
+            .filter(|input| !shared.contains(&input.previous_output))
+            .map(|input| DbReservedTxoActMod {
+                txid: ActiveValue::Set(input.previous_output.txid.to_string()),
+                vout: ActiveValue::Set(input.previous_output.vout),
+                reserved_for_colored: ActiveValue::Set(Some(batch)),
+                ..Default::default()
+            })
+            .collect();
+        if !reservations.is_empty() {
+            txn.set_reserved_txos(reservations)?;
+        }
         persist_projection(
             self,
             txn,
@@ -797,9 +849,14 @@ impl Wallet {
         if self.indexer().get_tx_confirmations(&txid)?.unwrap_or(0)
             < u64::from(stored.min_confirmations)
         {
-            return Err(invalid(
-                "prepared sweep witness is not sufficiently confirmed",
-            ));
+            let txn = self.database().begin_transaction()?;
+            let lost = release_lost_sweep(self, &txn, batch)?;
+            txn.commit()?;
+            return Err(invalid(if lost {
+                "prepared sweep lost to a confirmed conflicting transaction"
+            } else {
+                "prepared sweep witness is not sufficiently confirmed"
+            }));
         }
         let witness_id = RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?;
         let (transaction, position) = match self
@@ -861,6 +918,66 @@ impl Wallet {
     }
 }
 
+/// A handed-off sweep whose input was spent by another confirmed transaction can never confirm:
+/// fail its batch, release its reservations and unbind its receive.
+fn release_lost_sweep<W: WalletOnline + ?Sized>(
+    wallet: &W,
+    txn: &DbTxn,
+    batch: i32,
+) -> Result<bool, Error> {
+    let (txid, phase, payload) = txn.prepared_sweep_read(batch)?;
+    if phase != "handed_off" {
+        return Ok(false);
+    }
+    let (_, psbt, _, _) = StoredSweep::decode(&payload, &txid)?;
+    if wallet.indexer().get_tx_confirmations(&txid)?.unwrap_or(0) > 0 {
+        return Ok(false);
+    }
+    // the sweep itself is not mined, so a confirmed spend of an input is another transaction's
+    let mut lost = false;
+    for txin in &psbt.unsigned_tx.input {
+        if wallet.indexer().output_spent_on_chain(&txin.previous_output)? {
+            lost = true;
+            break;
+        }
+    }
+    if !lost {
+        return Ok(false);
+    }
+    let batch_transfers = txn.iter_batch_transfers()?;
+    let transfer = txn.get_batch_transfer_or_fail(batch, &batch_transfers)?;
+    let mut transfer: DbBatchTransferActMod = transfer.into();
+    transfer.status = ActiveValue::Set(TransferStatus::Failed);
+    txn.update_batch_transfer(&mut transfer)?;
+    txn.del_reserved_txos_for_batch_transfer(batch)?;
+    txn.prepared_sweep_phase(batch, "handed_off", "cancelled")?;
+    // a receive still waiting is unbound, one already holding the sweep consignment is failed
+    for receive in batch_transfers
+        .into_iter()
+        .filter(|b| b.incoming && b.txid.as_deref() == Some(&txid))
+    {
+        if receive.status == TransferStatus::WaitingCounterparty {
+            let mut receive: DbBatchTransferActMod = receive.into();
+            receive.txid = ActiveValue::Set(None);
+            txn.update_batch_transfer(&mut receive)?;
+        } else {
+            wallet.fail_batch_transfer(txn, &receive)?;
+        }
+    }
+    wallet.update_backup_info(txn, false)?;
+    Ok(true)
+}
+
+pub(super) fn release_lost_sweeps<W: WalletOnline + ?Sized>(
+    wallet: &W,
+    txn: &DbTxn,
+) -> Result<(), Error> {
+    for batch in txn.prepared_sweep_active_batches()? {
+        release_lost_sweep(wallet, txn, batch)?;
+    }
+    Ok(())
+}
+
 fn output_assignment(schema: AssetSchema, amount: u64) -> Assignment {
     if schema == AssetSchema::Uda {
         Assignment::NonFungible
@@ -891,19 +1008,22 @@ fn persist_projection(
             transition_type: ActiveValue::Set(Some(TypeOfTransition::Transfer)),
             ..Default::default()
         })?;
+        // an input the wallet does not hold (e.g. an HTLC lock) is not an outgoing allocation
         for (outpoint, assignments) in inputs {
-            if let Some(txo) = txn.get_txo(&Outpoint::from(*outpoint))? {
-                for assignment in assignments {
-                    txn.set_coloring(DbColoringActMod {
-                        asset_transfer_idx: ActiveValue::Set(asset),
-                        txo_idx: ActiveValue::Set(txo.idx),
-                        r#type: ActiveValue::Set(ColoringType::Input),
-                        assignment: ActiveValue::Set(assignment.clone()),
-                        ..Default::default()
-                    })?;
-                }
-            } else if wallet.bdk_wallet().get_utxo(*outpoint).is_some() {
-                return Err(invalid("wallet sweep input is missing its colored TXO row"));
+            if wallet.bdk_wallet().get_utxo(*outpoint).is_none() {
+                continue;
+            }
+            let txo = txn
+                .get_txo(&Outpoint::from(*outpoint))?
+                .ok_or_else(|| invalid("wallet sweep input is missing its colored TXO row"))?;
+            for assignment in assignments {
+                txn.set_coloring(DbColoringActMod {
+                    asset_transfer_idx: ActiveValue::Set(asset),
+                    txo_idx: ActiveValue::Set(txo.idx),
+                    r#type: ActiveValue::Set(ColoringType::Input),
+                    assignment: ActiveValue::Set(assignment.clone()),
+                    ..Default::default()
+                })?;
             }
         }
         for (index, amount) in &coloring.asset_info_map[contract].output_map {
@@ -1129,19 +1249,22 @@ mod tests {
     #[cfg(feature = "bitcoind")]
     mod funded {
         use super::*;
-        use crate::wallet::channel_funding_tests::Fixture;
+        use crate::wallet::prepared_sweep_fixture::Fixture;
         use bdk_wallet::{descriptor::IntoWalletDescriptor, signer::SignersContainer};
         use sea_orm::ConnectionTrait;
         use serde_json::json;
         use serial_test::serial;
 
-        fn sweep(
-            wallet: &mut Wallet,
-            online: Online,
-            target: &mut Wallet,
-            asset: &str,
-        ) -> (Psbt, ColoringInfo) {
-            let receive = target
+        fn inputs(psbt: &Psbt) -> Vec<Outpoint> {
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .map(|input| input.previous_output.into())
+                .collect()
+        }
+
+        fn sweep(wallet: &mut Wallet, online: Online, asset: &str) -> (Psbt, ColoringInfo) {
+            let receive = wallet
                 .witness_receive(
                     None,
                     None,
@@ -1246,9 +1369,10 @@ mod tests {
                 .unwrap();
             let (mut rejected, coloring) = sweep_to_script(&mut wallet, online, script, &asset);
             let original = rejected.clone();
+            let outpoints = inputs(&rejected);
             assert!(
                 wallet
-                    .color_psbt_and_prepare_consume(&mut rejected, coloring, 1, None)
+                    .color_psbt_and_prepare_consume(&mut rejected, coloring, outpoints, 1, None)
                     .is_err()
             );
             assert_eq!(rejected, original);
@@ -1272,8 +1396,15 @@ mod tests {
             let (mut psbt, coloring) = sweep_to_script(&mut wallet, online, script, &asset);
             let old_input = psbt.unsigned_tx.input[0].previous_output;
             let original = psbt.clone();
+            let outpoints = inputs(&psbt);
             let first = wallet
-                .color_psbt_and_prepare_consume(&mut psbt, coloring.clone(), 1, None)
+                .color_psbt_and_prepare_consume(
+                    &mut psbt,
+                    coloring.clone(),
+                    outpoints.clone(),
+                    1,
+                    None,
+                )
                 .unwrap();
             let incoming = receive.batch_transfer_idx;
             assert!(matches!(
@@ -1308,7 +1439,7 @@ mod tests {
             psbt = original;
             psbt.unsigned_tx.lock_time = LockTime::from_height(1).unwrap();
             let prepared = wallet
-                .color_psbt_and_prepare_consume(&mut psbt, coloring, 1, None)
+                .color_psbt_and_prepare_consume(&mut psbt, coloring, outpoints, 1, None)
                 .unwrap();
             let batch = prepared.batch_transfer_idx;
             let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -1448,8 +1579,15 @@ mod tests {
                 .unwrap();
             let (mut next_psbt, next_coloring) =
                 sweep_to_script(&mut wallet, online, script, &asset);
+            let next_outpoints = inputs(&next_psbt);
             let next = wallet
-                .color_psbt_and_prepare_consume(&mut next_psbt, next_coloring, 1, None)
+                .color_psbt_and_prepare_consume(
+                    &mut next_psbt,
+                    next_coloring,
+                    next_outpoints,
+                    1,
+                    None,
+                )
                 .unwrap();
             let next_txid = next_psbt.unsigned_tx.compute_txid().to_string();
             let current = RgbTxid::from_str(&next_txid).unwrap();
@@ -1494,10 +1632,16 @@ mod tests {
         fn prepared_sweep_funded_reopen_confirmed_consume_is_atomic_and_idempotent() {
             let fixture = Fixture::new();
             let (_directory, mut wallet, online, asset) = fixture.colored_wallet();
-            let (_target_dir, mut target, _) = fixture.wallet(false);
-            let (mut psbt, coloring) = sweep(&mut wallet, online, &mut target, &asset);
+            let (mut psbt, coloring) = sweep(&mut wallet, online, &asset);
+            let outpoints = inputs(&psbt);
             let prepared = wallet
-                .color_psbt_and_prepare_consume(&mut psbt, coloring.clone(), 1, None)
+                .color_psbt_and_prepare_consume(
+                    &mut psbt,
+                    coloring.clone(),
+                    outpoints.clone(),
+                    1,
+                    None,
+                )
                 .unwrap();
             let batch = prepared.batch_transfer_idx;
             let txid = psbt.unsigned_tx.compute_txid().to_string();
@@ -1507,7 +1651,13 @@ mod tests {
             );
             assert!(
                 wallet
-                    .color_psbt_and_prepare_consume(&mut psbt.clone(), coloring.clone(), 1, None)
+                    .color_psbt_and_prepare_consume(
+                        &mut psbt.clone(),
+                        coloring.clone(),
+                        outpoints,
+                        1,
+                        None,
+                    )
                     .is_err()
             );
             assert!(wallet.consume_transfer_fascia(online, batch).is_err());
@@ -1705,8 +1855,7 @@ mod tests {
          {
             let fixture = Fixture::new();
             let (_directory, mut wallet, online, asset) = fixture.colored_wallet();
-            let (_target_dir, mut target, _) = fixture.wallet(false);
-            let (psbt, coloring) = sweep(&mut wallet, online, &mut target, &asset);
+            let (psbt, coloring) = sweep(&mut wallet, online, &asset);
             sql(&wallet, "PRAGMA journal_mode=WAL");
             let txn = wallet.database().begin_transaction().unwrap();
             assert!(txn.get_asset(asset.clone()).unwrap().is_some()); // pin the real read snapshot
@@ -1718,7 +1867,7 @@ mod tests {
             // reject upgrading its stale read snapshot to a write; no production race hook exists.
             assert!(
                 wallet
-                    .prepare_sweep_in_txn(&txn, &psbt, coloring, 1, None)
+                    .prepare_sweep_in_txn(&txn, &psbt, coloring, inputs(&psbt), 1, None)
                     .is_err()
             );
             drop(txn);
@@ -1732,7 +1881,7 @@ mod tests {
             let fixture = Fixture::new();
             let (_directory, mut wallet, online, asset) = fixture.colored_wallet();
             let (_target_dir, mut target, _) = fixture.wallet(false);
-            let (psbt, coloring) = sweep(&mut wallet, online, &mut target, &asset);
+            let (psbt, coloring) = sweep(&mut wallet, online, &asset);
             let colored_input = psbt.unsigned_tx.input[0].previous_output;
             let vanilla_input = wallet.internal_unspents().next().unwrap().outpoint;
             let destination = psbt.unsigned_tx.output[0].script_pubkey.clone();
@@ -1744,8 +1893,26 @@ mod tests {
                 .drain_to(destination)
                 .fee_rate(FeeRate::from_sat_per_vb_u32(2));
             let mut mixed = builder.finish().unwrap();
+            // the vanilla input is not the one to sweep
+            assert!(
+                wallet
+                    .color_psbt_and_prepare_consume(
+                        &mut mixed,
+                        coloring.clone(),
+                        vec![vanilla_input.into()],
+                        1,
+                        None,
+                    )
+                    .is_err()
+            );
             let prepared = wallet
-                .color_psbt_and_prepare_consume(&mut mixed, coloring, 1, None)
+                .color_psbt_and_prepare_consume(
+                    &mut mixed,
+                    coloring,
+                    vec![colored_input.into()],
+                    1,
+                    None,
+                )
                 .unwrap();
             assert_eq!(batch_state(&wallet, prepared.batch_transfer_idx).2, 2);
             assert_eq!(
@@ -1789,11 +1956,12 @@ mod tests {
         fn prepared_sweep_funded_rejections_and_unsigned_cancel_preserve_assets() {
             let fixture = Fixture::new();
             let (_directory, mut wallet, online, asset) = fixture.colored_wallet();
-            let (_target_dir, mut target, _) = fixture.wallet(false);
-            let (mut psbt, coloring) = sweep(&mut wallet, online, &mut target, &asset);
+            let (mut psbt, coloring) = sweep(&mut wallet, online, &asset);
             let original = psbt.clone();
-            for case in 0..5 {
+            let outpoints = inputs(&psbt);
+            for case in 0..7 {
                 let mut request = coloring.clone();
+                let mut request_outpoints = outpoints.clone();
                 let entry = request.asset_info_map.values_mut().next().unwrap();
                 match case {
                     0 => {
@@ -1809,11 +1977,14 @@ mod tests {
                         request.asset_info_map.clear();
                     }
                     4 => {}
+                    5 => request_outpoints.clear(),
+                    6 => request_outpoints[0].vout += 1,
                     _ => unreachable!(),
                 }
                 let result = wallet.color_psbt_and_prepare_consume(
                     &mut psbt,
                     request,
+                    request_outpoints,
                     1,
                     (case == 4).then_some(1),
                 );
@@ -1822,7 +1993,7 @@ mod tests {
                 assert!(wallet.list_prepared_sweeps().unwrap().is_empty());
             }
             let prepared = wallet
-                .color_psbt_and_prepare_consume(&mut psbt, coloring, 1, None)
+                .color_psbt_and_prepare_consume(&mut psbt, coloring, outpoints, 1, None)
                 .unwrap();
             let batch = prepared.batch_transfer_idx;
             assert!(matches!(
@@ -1840,6 +2011,12 @@ mod tests {
                 wallet.delete_transfers(Some(batch), false),
                 Err(Error::CannotDeleteBatchTransfer)
             ));
+            // a bulk delete skips the cancelled sweep instead of failing
+            assert!(!wallet.delete_transfers(None, false).unwrap());
+            assert_eq!(
+                batch_state(&wallet, batch),
+                ("cancelled".into(), TransferStatus::Failed, 0)
+            );
             assert_eq!(
                 wallet.get_asset_balance(asset.clone()).unwrap().settled,
                 100
@@ -1853,10 +2030,16 @@ mod tests {
             let old_payload = txn.prepared_sweep_read(batch).unwrap().2;
             txn.commit().unwrap();
             let old: StoredSweep = serde_json::from_slice(&old_payload).unwrap();
-            let (mut second_psbt, second_coloring) =
-                sweep(&mut wallet, online, &mut target, &asset);
+            let (mut second_psbt, second_coloring) = sweep(&mut wallet, online, &asset);
+            let second_outpoints = inputs(&second_psbt);
             let second = wallet
-                .color_psbt_and_prepare_consume(&mut second_psbt, second_coloring, 1, None)
+                .color_psbt_and_prepare_consume(
+                    &mut second_psbt,
+                    second_coloring,
+                    second_outpoints,
+                    1,
+                    None,
+                )
                 .unwrap();
             let second_batch = second.batch_transfer_idx;
             let txn = wallet.database().begin_transaction().unwrap();

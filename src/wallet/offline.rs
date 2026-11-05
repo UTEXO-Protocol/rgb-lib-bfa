@@ -1638,13 +1638,13 @@ pub trait WalletOffline: WalletBackup {
                 &db_data.txos,
             )?
         } else {
-            // delete all failed transfers
-            let mut batch_transfers: Vec<DbBatchTransfer> = db_data
-                .batch_transfers
-                .clone()
-                .into_iter()
-                .filter(|t| t.failed())
-                .collect();
+            // delete all failed transfers, except a cancelled sweep, kept as its tombstone
+            let mut batch_transfers = Vec::new();
+            for batch_transfer in db_data.batch_transfers.clone() {
+                if batch_transfer.failed() && !txn.is_protected_sweep_batch(&batch_transfer)? {
+                    batch_transfers.push(batch_transfer);
+                }
+            }
             for batch_transfer in batch_transfers.iter_mut() {
                 let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers);
                 if no_asset_only {
