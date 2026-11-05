@@ -25,7 +25,6 @@ pub(crate) mod test;
 pub use crate::database::enums::TypeOfTransition;
 #[cfg(feature = "_validation")]
 pub use crate::no_wallet::{BitcoindAuth, IndexerConfig, IndexerProtocol};
-#[cfg(feature = "validation")]
 pub use crate::no_wallet::{
     ConsignmentValidation, ValidatedWitness, ValidationOptions, ValidationWarning,
     WitnessValidationStatus,
@@ -52,9 +51,9 @@ pub use objects::{
 };
 #[cfg(feature = "_online")]
 pub use objects::{
-    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, MintBeginResult, MintDetails,
-    OnlineOptions, OperationResult, RefreshFilter, RefreshResult, RefreshTransferStatus,
-    RefreshedTransfer, SendBeginResult, SendDetails,
+    BurnBeginResult, BurnDetails, InflateBeginResult, InflateDetails, LinkBeginResult, LinkDetails,
+    MintBeginResult, MintDetails, OnlineOptions, OperationResult, RefreshFilter, RefreshResult,
+    RefreshTransferStatus, RefreshedTransfer, SendBeginResult, SendDetails,
 };
 pub use offline::RgbWalletOpsOffline;
 #[cfg(feature = "_online")]
@@ -75,10 +74,11 @@ pub(crate) use indexer::BitcoindClient;
 pub(crate) use indexer::Indexer;
 #[cfg(feature = "_online")]
 pub(crate) use objects::{
-    AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, FailTransfersOutcome,
-    LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData, PrepareRgbPsbtResult,
-    PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher, ReceiveMode,
-    ReceivedConsignmentMeta, RefreshResultTrait, TryFailBatchTransferOutcome,
+    AssetInfo, AssetSpend, BeginOperationData, BtcChange, CleanAckOutcome, ConsignmentPayment,
+    FailTransfersOutcome, LocalRecipient, LocalRecipientData, LocalWitnessData, OnlineData,
+    PaymentSeal, PrepareRgbPsbtResult, PrepareTransferPsbtResult, ProxyReceiveData, ReceiveMatcher,
+    ReceiveMode, ReceivedConsignmentMeta, RefreshResultTrait, SelectedInputs,
+    TryFailBatchTransferOutcome,
 };
 pub(crate) use objects::{
     InfoAssetTransfer, InfoBatchTransfer, IssueData, IssuedAssetDetails, LocalAssetData,
@@ -112,12 +112,6 @@ pub(crate) const PROXY_CLOCK_SKEW_MARGIN_SECS: u32 = 300;
 #[cfg(feature = "_online")]
 pub(crate) const INVOICE_EXPIRATION_MARGIN_SECS: u32 = 2 * PROXY_CLOCK_SKEW_MARGIN_SECS;
 
-/// Minimum time, in seconds, the recipient's invoice must have left when a mint begins: the lock
-/// has to be included on the external chain by the invoice expiration, so a shorter window would
-/// leave too little time to make it.
-#[cfg(feature = "_online")]
-pub(crate) const MIN_MINT_LOCK_WINDOW_SECS: u32 = 60 * 60;
-
 /// Minimum retention grace, in seconds, a recipient requires from the sender proxy
 /// (`retention_grace_secs`) to ACK a transfer: it's the time a released signed TX can still be
 /// retrieved after the operation expiration, so a recipient offline for longer might miss it. A
@@ -132,21 +126,6 @@ pub(crate) const MIN_SENDER_RETENTION_GRACE_SECS: u32 = 86400;
 #[cfg(feature = "_online")]
 pub(crate) const CONFIRMATION_MARGIN_SECS: u32 = 86400;
 
-/// Time, in seconds, a mint whose lock was included on the external chain by its expiration is
-/// still waited for past it, for the lock to be finalized. It only applies when such a lock
-/// exists, so it can be generous enough for the slowest finality (and for finality stalls) of any
-/// external chain.
-#[cfg(feature = "_online")]
-pub(crate) const MINT_FINALITY_GRACE_SECS: i64 = 24 * 60 * 60;
-
-/// Time, in seconds, the block a received mint commits to (`after_block`, the latest finalized
-/// external chain block when the mint began) may precede the creation of the recipient's invoice.
-/// It covers the finality lag of the external chain (about 13 minutes on Ethereum, longer on some
-/// L2s) and clock skew. An earlier block would only make the recipient scan more of the external
-/// chain for the lock.
-#[cfg(feature = "_online")]
-pub(crate) const MINT_AFTER_BLOCK_GRACE_SECS: i64 = 60 * 60;
-
 /// Maximum proof of work difficulty (leading zero bits) the wallet accepts to compute when posting
 /// a consignment; a proxy requiring more cannot be used to create transfers.
 #[cfg(feature = "_online")]
@@ -154,6 +133,7 @@ pub(crate) const MAX_POW_DIFFICULTY: u32 = 28;
 
 pub(crate) const RGB_STATE_ASSET_OWNER: &str = "assetOwner";
 pub(crate) const RGB_STATE_INFLATION_ALLOWANCE: &str = "inflationAllowance";
+pub(crate) const RGB_STATE_LINK_RIGHT: &str = "linkRight";
 pub(crate) const RGB_STATE_MINT_RIGHT: &str = "mintRight";
 pub(crate) const RGB_GLOBAL_BRIDGE_LOCATION: &str = "bridgeLocation";
 pub(crate) const RGB_GLOBAL_REJECT_LIST: &str = "rejectList";

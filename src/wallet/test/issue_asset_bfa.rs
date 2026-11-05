@@ -11,7 +11,20 @@ fn success() {
     let before_timestamp = now().unix_timestamp();
     let bak_info_before = party.db_backup_info();
     let num_rights = 3;
-    let asset = party.issue_asset_bfa(num_rights, FAKE_EVM_ADDRESS.to_string(), None);
+    let asset = party
+        .wlt_mut()
+        .issue_asset_bfa(
+            UNICODE_TICKER.to_string(),
+            NAME.to_string(),
+            PRECISION,
+            num_rights,
+            ANVIL_CHAIN_ID,
+            FAKE_EVM_ADDRESS.to_string(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
     let bak_info_after = party.db_backup_info();
     assert!(bak_info_after.last_operation_timestamp > bak_info_before.last_operation_timestamp);
 
@@ -20,7 +33,7 @@ fn success() {
     assert!(
         bfa_asset_list
             .into_iter()
-            .any(|a| a.asset_id == asset.asset_id)
+            .any(|a| a.asset_id == asset.asset_id && a.ticker == UNICODE_TICKER)
     );
 
     // add a pending operation to an UTXO so spendable balance will be != settled / future
@@ -29,7 +42,7 @@ fn success() {
 
     // checks
     let balance = party.get_asset_balance(&asset.asset_id);
-    assert_eq!(asset.ticker, TICKER.to_string());
+    assert_eq!(asset.ticker, UNICODE_TICKER.to_string());
     assert_eq!(asset.name, NAME.to_string());
     assert_eq!(asset.details, None);
     assert_eq!(asset.precision, PRECISION);
@@ -123,81 +136,27 @@ fn fail() {
         ANVIL_CHAIN_ID,
         FAKE_EVM_ADDRESS.to_string(),
         None,
-    );
-    assert!(matches!(result, Err(Error::InvalidTicker { details: m }) if m == EMPTY_MSG));
-
-    // invalid ticker: too long
-    let result = party.wlt().issue_asset_bfa(
-        s!("ABCDEFGHI"),
-        NAME.to_string(),
-        PRECISION,
-        1,
-        ANVIL_CHAIN_ID,
-        FAKE_EVM_ADDRESS.to_string(),
-        None,
-    );
-    assert!(matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_TOO_LONG_MSG));
-
-    // invalid ticker: lowercase
-    let result = party.wlt().issue_asset_bfa(
-        s!("TiCkEr"),
-        NAME.to_string(),
-        PRECISION,
-        1,
-        ANVIL_CHAIN_ID,
-        FAKE_EVM_ADDRESS.to_string(),
+        false,
         None,
     );
     assert!(
-        matches!(result, Err(Error::InvalidTicker { details: m }) if m == "ticker needs to be all uppercase")
+        matches!(result, Err(Error::InvalidTicker { details: m }) if m == "ticker must contain at least one character.")
     );
 
-    // invalid ticker: with space
-    let invalid_ticker = "TICKER WITH SPACE";
+    // invalid ticker: too long (length is counted in characters, not bytes)
     let result = party.wlt().issue_asset_bfa(
-        invalid_ticker.to_string(),
+        UNICODE_TICKER.repeat(3),
         NAME.to_string(),
         PRECISION,
         1,
         ANVIL_CHAIN_ID,
         FAKE_EVM_ADDRESS.to_string(),
         None,
-    );
-    assert!(
-        matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_NOT_ASCII_MSG
-            .replace("{0}", invalid_ticker).replace("{1}", " ").replace("{2}", "6"))
-    );
-
-    // invalid ticker: unicode characters
-    let invalid_ticker = "TICKERWITH℧NICODE";
-    let result = party.wlt().issue_asset_bfa(
-        invalid_ticker.to_string(),
-        NAME.to_string(),
-        PRECISION,
-        1,
-        ANVIL_CHAIN_ID,
-        FAKE_EVM_ADDRESS.to_string(),
+        false,
         None,
     );
     assert!(
-        matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_NOT_ASCII_MSG
-            .replace("{0}", invalid_ticker).replace("{1}", "℧").replace("{2}", "10"))
-    );
-
-    // invalid ticker: starting with a number
-    let invalid_ticker = "1TICKER";
-    let result = party.wlt().issue_asset_bfa(
-        invalid_ticker.to_string(),
-        NAME.to_string(),
-        PRECISION,
-        1,
-        ANVIL_CHAIN_ID,
-        FAKE_EVM_ADDRESS.to_string(),
-        None,
-    );
-    assert!(
-        matches!(result, Err(Error::InvalidTicker { details: m }) if m == IDENT_NOT_START_MSG
-            .replace("{0}", invalid_ticker).replace("{1}", "1"))
+        matches!(result, Err(Error::InvalidTicker { details: m }) if m == "ticker has 9 characters, while at most 8 are allowed.")
     );
 
     // invalid name: empty
@@ -208,6 +167,8 @@ fn fail() {
         1,
         ANVIL_CHAIN_ID,
         FAKE_EVM_ADDRESS.to_string(),
+        None,
+        false,
         None,
     );
     assert!(matches!(result, Err(Error::InvalidName { details: m }) if m == EMPTY_MSG));
@@ -221,6 +182,8 @@ fn fail() {
         ANVIL_CHAIN_ID,
         FAKE_EVM_ADDRESS.to_string(),
         None,
+        false,
+        None,
     );
     assert!(matches!(result, Err(Error::InvalidName { details: m }) if m == IDENT_TOO_LONG_MSG));
 
@@ -233,6 +196,8 @@ fn fail() {
         1,
         ANVIL_CHAIN_ID,
         FAKE_EVM_ADDRESS.to_string(),
+        None,
+        false,
         None,
     );
     assert!(
@@ -248,6 +213,8 @@ fn fail() {
         1,
         ANVIL_CHAIN_ID,
         FAKE_EVM_ADDRESS.to_string(),
+        None,
+        false,
         None,
     );
     assert!(matches!(

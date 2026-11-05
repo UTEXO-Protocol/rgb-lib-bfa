@@ -10,6 +10,7 @@ fn validate(
         &IndexerConfig::Electrum {
             url: ELECTRUM_URL.to_string(),
         },
+        &HashMap::new(),
         min_confirmations,
         &validation_options(offchain_txid),
     )
@@ -19,7 +20,6 @@ fn validation_options(offchain_txid: Option<&str>) -> ValidationOptions {
     ValidationOptions {
         bitcoin_network: BitcoinNetwork::Regtest,
         offchain_txid: offchain_txid.map(str::to_string),
-        evm_rpc_urls: HashMap::new(),
     }
 }
 
@@ -165,6 +165,7 @@ fn success() {
         let other_validation = validate_consignment(
             &consignment_path,
             &indexer_config,
+            &HashMap::new(),
             None,
             &validation_options(None),
         )
@@ -238,6 +239,7 @@ fn fail() {
         &IndexerConfig::Electrum {
             url: ELECTRUM_URL.to_string(),
         },
+        &HashMap::new(),
         None,
         &ValidationOptions {
             bitcoin_network: BitcoinNetwork::Testnet,
@@ -317,6 +319,8 @@ fn with_resolver() {
             validate_consignment_with_resolver(
                 &consignment_path,
                 resolver,
+                None,
+                None,
                 safe_height.and_then(NonZeroU32::new),
                 &validation_options(offchain_txid),
             )
@@ -382,6 +386,8 @@ fn with_resolver() {
         &consignment_path,
         &resolver,
         None,
+        None,
+        None,
         &ValidationOptions {
             bitcoin_network: BitcoinNetwork::Testnet,
             ..validation_options(Some(&txid))
@@ -399,6 +405,7 @@ fn with_resolver() {
 }
 
 #[test]
+#[parallel]
 #[serial(evm)]
 fn mint() {
     initialize();
@@ -423,7 +430,7 @@ fn mint() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -437,43 +444,106 @@ fn mint() {
         .get_send_consignment_path(&asset.asset_id, &txid)
         .to_string_lossy()
         .to_string();
-    // validate the mint, scanning for its event at most the given number of blocks (if any)
-    // instead of MAX_MINT_SCAN_BLOCKS
-    let validate_mint = |evm_rpc_urls: HashMap<u64, String>, max_scan_blocks: Option<u64>| {
-        MOCK_MAX_MINT_SCAN_BLOCKS.replace(max_scan_blocks);
-        let result = validate_consignment(
+    let validate_mint = |evm_rpc_urls: HashMap<u64, String>| {
+        validate_consignment(
             &consignment_path,
             &IndexerConfig::Electrum {
                 url: ELECTRUM_URL.to_string(),
             },
+            &evm_rpc_urls,
             None,
-            &ValidationOptions {
-                evm_rpc_urls,
-                ..validation_options(Some(&txid))
-            },
-        );
-        MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-        result
+            &validation_options(Some(&txid)),
+        )
     };
     let evm_rpc_urls = HashMap::from([(ANVIL_CHAIN_ID, EVM_RPC_URL.to_string())]);
 
     // no EVM RPC URL for the bridge's chain
-    let result = validate_mint(HashMap::new(), None);
+    let result = validate_mint(HashMap::new());
     assert_matches!(result, Err(Error::NoEvmRpcUrl { chain_id }) if chain_id == ANVIL_CHAIN_ID);
 
     // the funds haven't been locked yet
-    let result = validate_mint(evm_rpc_urls.clone(), None);
+    let result = validate_mint(evm_rpc_urls.clone());
     assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
+
+    // a custom anchor resolver is trusted in place of the EVM RPC endpoint
+    struct MockAnchorResolver {
+        chain_id: u64,
+        confirmed: bool,
+    }
+    impl ResolveAnchor for MockAnchorResolver {
+        fn evm_chain_id(&self) -> Result<u64, AnchorResolverError> {
+            Ok(self.chain_id)
+        }
+        fn is_confirmed(
+            &self,
+            _: &BridgeLocation,
+            _: &ExternalAnchor,
+        ) -> Result<bool, AnchorResolverError> {
+            Ok(self.confirmed)
+        }
+    }
+    let indexer_resolver = get_resolver(
+        &IndexerConfig::Electrum {
+            url: ELECTRUM_URL.to_string(),
+        },
+        BitcoinNetwork::Regtest,
+    )
+    .unwrap();
+    let reject_list_resolver = RemoteRejectListResolver {
+        evm_rpc_urls: &evm_rpc_urls,
+    };
+    let validate_with_resolvers =
+        |anchor_resolver: Option<&MockAnchorResolver>,
+         reject_list_resolver: Option<&RemoteRejectListResolver>| {
+            validate_consignment_with_resolver(
+                &consignment_path,
+                &ChainResolver {
+                    inner: &indexer_resolver,
+                },
+                anchor_resolver.map(|r| r as &dyn ResolveAnchor),
+                reject_list_resolver.map(|r| r as &dyn ResolveRejectList),
+                None,
+                &validation_options(Some(&txid)),
+            )
+        };
+    let validate_with_anchor_resolver = |anchor_resolver: &MockAnchorResolver| {
+        validate_with_resolvers(Some(anchor_resolver), Some(&reject_list_resolver))
+    };
+    let validation = validate_with_anchor_resolver(&MockAnchorResolver {
+        chain_id: ANVIL_CHAIN_ID,
+        confirmed: true,
+    })
+    .unwrap();
+    assert_eq!(validation.asset_schema, AssetSchema::Bfa);
+    let result = validate_with_anchor_resolver(&MockAnchorResolver {
+        chain_id: ANVIL_CHAIN_ID,
+        confirmed: false,
+    });
+    assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
+    let result = validate_with_anchor_resolver(&MockAnchorResolver {
+        chain_id: ANVIL_CHAIN_ID + 1,
+        confirmed: true,
+    });
+    assert_matches!(result, Err(Error::EvmChainIdMismatch { expected, actual }) if expected == ANVIL_CHAIN_ID && actual == ANVIL_CHAIN_ID + 1);
+    // the resolvers are needed for a consignment with external anchors and a reject list
+    let result = validate_with_resolvers(None, Some(&reject_list_resolver));
+    assert_matches!(result, Err(Error::NoAnchorResolver));
+    let confirming_resolver = MockAnchorResolver {
+        chain_id: ANVIL_CHAIN_ID,
+        confirmed: true,
+    };
+    let result = validate_with_resolvers(Some(&confirming_resolver), None);
+    assert_matches!(result, Err(Error::NoRejectListResolver));
 
     // the lock isn't finalized yet
     erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
     bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    let result = validate_mint(evm_rpc_urls.clone(), None);
+    let result = validate_mint(evm_rpc_urls.clone());
     assert_matches!(result, Err(Error::MintEventNotFound { .. }));
 
     // the lock is finalized
     evm_mine(EVM_FINALITY_DEPTH);
-    let validation = validate_mint(evm_rpc_urls.clone(), None).unwrap();
+    let validation = validate_mint(evm_rpc_urls.clone()).unwrap();
     assert!(validation.is_transfer);
     assert_eq!(validation.asset_id, asset.asset_id);
     assert_eq!(validation.asset_schema, AssetSchema::Bfa);
@@ -487,21 +557,14 @@ fn mint() {
     );
     assert!(validation.warnings.is_empty());
 
-    // the lock is outside the scanned blocks: the event follows the block the mint commits to, so
-    // it's never within 0 blocks from it, and the mint will never be confirmed (unlike when it
-    // wasn't found yet above)
-    let result = validate_mint(evm_rpc_urls.clone(), Some(0));
-    assert_matches!(result, Err(Error::MintEventOutOfScanWindow { opid, max_scan_blocks: 0 }) if opid == res.details.opid);
-    validate_mint(evm_rpc_urls.clone(), Some(1000)).unwrap();
-
     // the minted allocation rejected by the reject list contract, once finalized
     let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
-    let terminals = terminal_opouts(&consignment);
-    assert_eq!(terminals.len(), 1);
-    let terminal = terminals.into_iter().next().unwrap();
+    let terminal_ops = consignment.terminal_ops();
+    assert_eq!(terminal_ops.len(), 1);
+    let terminal = Opout::new(*terminal_ops.iter().next().unwrap(), OS_ASSET, 0);
     reject_list_append(&reject_list_contract.address, &[(terminal, true)]);
     evm_mine(EVM_FINALITY_DEPTH);
-    let result = validate_mint(evm_rpc_urls, None);
+    let result = validate_mint(evm_rpc_urls);
     assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![terminal.to_string()]);
 }
 
@@ -542,10 +605,9 @@ fn reject_list() {
         .to_string_lossy()
         .to_string();
     let consignment = RgbTransfer::load_file(&consignment_path).unwrap();
-    let terminals = terminal_opouts(&consignment);
-    assert_eq!(terminals.len(), 1);
-    let terminal = terminals.into_iter().next().unwrap().to_string();
-    let issuance = consignment
+    // the transfer is the terminal operation: its inputs (the issuance) and its outputs (the
+    // blinded terminal and the revealed change) are checked against the reject list
+    let transfer = consignment
         .bundles
         .iter()
         .next()
@@ -554,13 +616,25 @@ fn reject_list() {
         .known_transitions
         .iter()
         .next()
-        .unwrap()
+        .unwrap();
+    assert_eq!(consignment.terminal_ops(), BTreeSet::from([transfer.opid]));
+    let issuance = transfer
         .transition
         .inputs()
         .into_iter()
         .next()
         .unwrap()
         .to_string();
+    let asset_assigns = transfer.transition.assignments.get(&OS_ASSET).unwrap();
+    assert_eq!(asset_assigns.len_u16(), 2);
+    let (concealed, revealed): (Vec<u16>, Vec<u16>) = (0..2)
+        .partition(|no| matches!(asset_assigns.seal_at(*no), Some(BuilderSeal::Concealed(_))));
+    let terminal = Opout::new(transfer.opid, OS_ASSET, concealed[0]).to_string();
+    let change = Opout::new(transfer.opid, OS_ASSET, revealed[0]).to_string();
+    let mut all_checked = vec![terminal.clone(), change.clone(), issuance.clone()];
+    all_checked.sort();
+    let mut inputs_and_change = vec![change.clone(), issuance.clone()];
+    inputs_and_change.sort();
 
     // nothing rejected
     validate(&consignment_path, Some(&txid), None).unwrap();
@@ -574,12 +648,61 @@ fn reject_list() {
     write_opouts_to_reject_list(list_name, &[terminal.clone(), format!("!{terminal}")]);
     validate(&consignment_path, Some(&txid), None).unwrap();
 
-    // a rejected ancestor of the terminal
+    // a rejected ancestor: the issuance itself, the terminal and the change are all tainted
     write_opouts_to_reject_list(list_name, std::slice::from_ref(&issuance));
     let result = validate(&consignment_path, Some(&txid), None);
-    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == vec![terminal.clone()]);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == all_checked);
 
-    // a rejected ancestor shielded by the allowed terminal
-    write_opouts_to_reject_list(list_name, &[issuance, format!("!{terminal}")]);
-    validate(&consignment_path, Some(&txid), None).unwrap();
+    // an allowed terminal shields itself only: the operation's input and change stay tainted, so
+    // the consignment is refused (a wallet receiving the terminal would accept it, as it checks
+    // the assignments it receives)
+    write_opouts_to_reject_list(list_name, &[issuance.clone(), format!("!{terminal}")]);
+    let result = validate(&consignment_path, Some(&txid), None);
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == inputs_and_change);
+
+    // a custom reject list resolver is trusted in place of the reject list server
+    struct MockRejectListResolver(Vec<(Opout, bool)>);
+    impl ResolveRejectList for MockRejectListResolver {
+        fn get_reject_list(&self, source: &RejectListSource) -> Result<RejectList, Error> {
+            assert_matches!(source, RejectListSource::Url(url) if url.ends_with("validate_consignment.list"));
+            Ok(RejectList::from_decisions(self.0.clone()))
+        }
+    }
+    let indexer_resolver = get_resolver(
+        &IndexerConfig::Electrum {
+            url: ELECTRUM_URL.to_string(),
+        },
+        BitcoinNetwork::Regtest,
+    )
+    .unwrap();
+    let validate_with_resolver = |reject_list_resolver: Option<&MockRejectListResolver>| {
+        validate_consignment_with_resolver(
+            &consignment_path,
+            &ChainResolver {
+                inner: &indexer_resolver,
+            },
+            None,
+            reject_list_resolver.map(|r| r as &dyn ResolveRejectList),
+            None,
+            &validation_options(Some(&txid)),
+        )
+    };
+    let terminal = Opout::from_str(&terminal).unwrap();
+    let issuance = Opout::from_str(&issuance).unwrap();
+    validate_with_resolver(Some(&MockRejectListResolver(vec![]))).unwrap();
+    let result = validate_with_resolver(Some(&MockRejectListResolver(vec![(issuance, false)])));
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == all_checked);
+    let result = validate_with_resolver(Some(&MockRejectListResolver(vec![
+        (issuance, false),
+        (terminal, true),
+    ])));
+    assert_matches!(result, Err(Error::ConsignmentRejected { opouts }) if opouts == inputs_and_change);
+    let result = validate_with_resolver(Some(&MockRejectListResolver(vec![
+        (terminal, true),
+        (terminal, false),
+    ])));
+    assert_matches!(result, Err(Error::ConsignmentRejected { .. }));
+    // the reject list resolver is needed for an asset with a reject list
+    let result = validate_with_resolver(None);
+    assert_matches!(result, Err(Error::NoRejectListResolver));
 }

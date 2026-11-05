@@ -23,8 +23,8 @@ use rgb_lib::{
         ConsignmentValidation as RgbLibConsignmentValidation, Cosigner as CosignerData,
         DatabaseType, EmbeddedMedia, HubInfo, IndexerConfig as RgbLibIndexerConfig,
         IndexerProtocol, InflateBeginResult, InflateDetails, InitOperationResult,
-        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, Media, Metadata,
-        MintBeginResult, MintDetails, MultisigKeys, MultisigOnlineOptions,
+        Invoice as RgbLibInvoice, InvoiceData as RgbLibInvoiceData, LinkBeginResult, LinkDetails,
+        Media, Metadata, MintBeginResult, MintDetails, MultisigKeys, MultisigOnlineOptions,
         MultisigVotingStatus as RgbLibMultisigVotingStatus, MultisigWallet as RgbLibMultisigWallet,
         Online, OnlineOptions as RgbLibOnlineOptions, Operation as RgbLibOperation,
         OperationInfo as RgbLibOperationInfo, OperationResult, Outpoint, PendingVanillaTx,
@@ -155,6 +155,7 @@ pub enum Assignment {
     Fungible { amount: u64 },
     NonFungible,
     InflationRight { amount: u64 },
+    LinkRight,
     MintRight,
     Any,
 }
@@ -164,6 +165,7 @@ impl From<RgbLibAssignment> for Assignment {
             RgbLibAssignment::Fungible(amount) => Assignment::Fungible { amount },
             RgbLibAssignment::NonFungible => Assignment::NonFungible,
             RgbLibAssignment::InflationRight(amount) => Assignment::InflationRight { amount },
+            RgbLibAssignment::LinkRight => Assignment::LinkRight,
             RgbLibAssignment::MintRight => Assignment::MintRight,
             RgbLibAssignment::Any => Assignment::Any,
         }
@@ -175,6 +177,7 @@ impl From<Assignment> for RgbLibAssignment {
             Assignment::Fungible { amount } => RgbLibAssignment::Fungible(amount),
             Assignment::NonFungible => RgbLibAssignment::NonFungible,
             Assignment::InflationRight { amount } => RgbLibAssignment::InflationRight(amount),
+            Assignment::LinkRight => RgbLibAssignment::LinkRight,
             Assignment::MintRight => RgbLibAssignment::MintRight,
             Assignment::Any => RgbLibAssignment::Any,
         }
@@ -514,6 +517,7 @@ pub enum TransitionGlobal {
     BurnedAsset { amount: u64 },
     BurnedInflation { amount: u64 },
     BurnReason { reason: String },
+    LinkedToContract { contract_id: String },
 }
 impl From<RgbLibTransitionGlobal> for TransitionGlobal {
     fn from(orig: RgbLibTransitionGlobal) -> Self {
@@ -526,6 +530,9 @@ impl From<RgbLibTransitionGlobal> for TransitionGlobal {
                 TransitionGlobal::BurnedInflation { amount }
             }
             RgbLibTransitionGlobal::BurnReason(reason) => TransitionGlobal::BurnReason { reason },
+            RgbLibTransitionGlobal::LinkedToContract(contract_id) => {
+                TransitionGlobal::LinkedToContract { contract_id }
+            }
         }
     }
 }
@@ -540,6 +547,9 @@ impl From<TransitionGlobal> for RgbLibTransitionGlobal {
                 RgbLibTransitionGlobal::BurnedInflation(amount)
             }
             TransitionGlobal::BurnReason { reason } => RgbLibTransitionGlobal::BurnReason(reason),
+            TransitionGlobal::LinkedToContract { contract_id } => {
+                RgbLibTransitionGlobal::LinkedToContract(contract_id)
+            }
         }
     }
 }
@@ -559,7 +569,7 @@ impl From<BundleFilter> for RgbLibBundleFilter {
 }
 pub enum TransitionMetadata {
     AllowedInflation { amount: u64 },
-    AfterBlock { block: u64 },
+    BeforeBlock { block: u64 },
 }
 impl From<RgbLibTransitionMetadata> for TransitionMetadata {
     fn from(orig: RgbLibTransitionMetadata) -> Self {
@@ -567,7 +577,9 @@ impl From<RgbLibTransitionMetadata> for TransitionMetadata {
             RgbLibTransitionMetadata::AllowedInflation(amount) => {
                 TransitionMetadata::AllowedInflation { amount }
             }
-            RgbLibTransitionMetadata::AfterBlock(block) => TransitionMetadata::AfterBlock { block },
+            RgbLibTransitionMetadata::BeforeBlock(block) => {
+                TransitionMetadata::BeforeBlock { block }
+            }
         }
     }
 }
@@ -577,7 +589,9 @@ impl From<TransitionMetadata> for RgbLibTransitionMetadata {
             TransitionMetadata::AllowedInflation { amount } => {
                 RgbLibTransitionMetadata::AllowedInflation(amount)
             }
-            TransitionMetadata::AfterBlock { block } => RgbLibTransitionMetadata::AfterBlock(block),
+            TransitionMetadata::BeforeBlock { block } => {
+                RgbLibTransitionMetadata::BeforeBlock(block)
+            }
         }
     }
 }
@@ -1192,12 +1206,14 @@ fn inspect_consignment(
 fn validate_consignment(
     consignment_path: String,
     indexer_config: IndexerConfig,
+    evm_rpc_urls: HashMap<u64, String>,
     min_confirmations: Option<u8>,
     options: ValidationOptions,
 ) -> Result<ConsignmentValidation, RgbLibError> {
     rgb_lib::no_wallet::validate_consignment(
         &consignment_path,
         &indexer_config.into(),
+        &evm_rpc_urls,
         min_confirmations,
         &options,
     )
@@ -1578,6 +1594,50 @@ impl Wallet {
         self._get_wallet().burn_end(online, signed_psbt)
     }
 
+    fn link(
+        &self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, RgbLibError> {
+        self._get_wallet().link(
+            online,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+        )
+    }
+
+    fn link_begin(
+        &self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, RgbLibError> {
+        self._get_wallet().link_begin(
+            online,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            dry_run,
+        )
+    }
+
+    fn link_end(
+        &self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, RgbLibError> {
+        self._get_wallet().link_end(online, signed_psbt)
+    }
+
     fn inflate(
         &self,
         online: Online,
@@ -1627,6 +1687,7 @@ impl Wallet {
         online: Online,
         asset_id: String,
         recipient: Recipient,
+        before_block: u64,
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: String,
@@ -1635,6 +1696,7 @@ impl Wallet {
             online,
             asset_id,
             recipient.into(),
+            before_block,
             fee_rate,
             min_confirmations,
             sender_transport_endpoint,
@@ -1691,6 +1753,7 @@ impl Wallet {
             .issue_asset_cfa(name, details, precision, amounts, file_path)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -1699,6 +1762,8 @@ impl Wallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetIFA, RgbLibError> {
         self._get_wallet().issue_asset_ifa(
             ticker,
@@ -1707,9 +1772,12 @@ impl Wallet {
             amounts,
             inflation_amounts,
             reject_list_url,
+            link_right,
+            linked_from_contract,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn issue_asset_bfa(
         &self,
         ticker: String,
@@ -1719,6 +1787,8 @@ impl Wallet {
         chain_id: u64,
         contract_address: String,
         reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetBFA, RgbLibError> {
         self._get_wallet().issue_asset_bfa(
             ticker,
@@ -1728,6 +1798,8 @@ impl Wallet {
             chain_id,
             contract_address,
             reject_list_address,
+            link_right,
+            linked_from_contract,
         )
     }
 

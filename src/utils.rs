@@ -360,7 +360,7 @@ pub fn script_buf_from_recipient_id(recipient_id: String) -> Result<Option<Scrip
 ///
 /// This is only the URL recorded in the DB and reported in the asset metadata: a reject list kept
 /// by an EVM contract has no URL, so it gives `None` here, but it is still enforced, as the reject
-/// list of a BFA asset is read off its contract when needed (see `asset_reject_list_source`).
+/// list of a BFA asset is read off its genesis when needed (see `genesis_reject_list_source`).
 pub(crate) fn bfa_reject_list_url(location: Option<RejectListLocation>) -> Option<String> {
     match location? {
         RejectListLocation::Url(url) => Some(url.to_string()),
@@ -655,6 +655,40 @@ pub(crate) fn read_fascia(path: &Path) -> Result<Fascia, Error> {
     })
 }
 
+/// Remove the RGB data (operations, consumers and commitment data) from the given PSBT, once they
+/// are committed: the commitment is in its TX and the operations are in the fascia, so they aren't
+/// needed to sign it and broadcast its TX, and, spending UTXOs with many allocations, they could
+/// make the PSBT too large to be parsed back (see [`check_psbt_parsable`]).
+#[cfg(feature = "wallet")]
+pub(crate) fn strip_rgb_data(psbt: &mut Psbt) {
+    let is_rgb = |key: &bdk_wallet::bitcoin::psbt::raw::ProprietaryKey| {
+        [
+            &PSBT_RGB_PREFIX[..],
+            &PSBT_MPC_PREFIX[..],
+            &PSBT_OPRET_PREFIX[..],
+            &PSBT_TAPRET_PREFIX[..],
+        ]
+        .contains(&key.prefix.as_slice())
+    };
+    psbt.proprietary.retain(|key, _| !is_rgb(key));
+    for input in &mut psbt.inputs {
+        input.proprietary.retain(|key, _| !is_rgb(key));
+    }
+    for output in &mut psbt.outputs {
+        output.proprietary.retain(|key, _| !is_rgb(key));
+    }
+}
+
+/// Check that the given PSBT can be parsed back, which fails if its global map exceeds
+/// MAX_VEC_SIZE bytes. Such a PSBT can't be signed by an external signer nor be read back to
+/// broadcast its TX.
+#[cfg(feature = "wallet")]
+pub(crate) fn check_psbt_parsable(psbt: &Psbt) -> Result<(), Error> {
+    Psbt::deserialize(&psbt.serialize())
+        .map(|_| ())
+        .map_err(|_| Error::PsbtTooLarge)
+}
+
 /// Write a fascia file atomically, so a crash mid-write cannot leave a torn one behind.
 #[cfg(any(feature = "_online", feature = "rgb_fs_store_migration"))]
 pub(crate) fn write_fascia(path: &Path, fascia: &Fascia) -> Result<(), Error> {
@@ -940,7 +974,7 @@ impl<'txn> RgbStock<'txn> {
         secret_seals: impl AsRef<[SecretSeal]>,
         opids: impl IntoIterator<Item = OpId>,
         fascia: &Fascia,
-    ) -> Result<(RgbTransfer, OpoutsDagData, RetrievedSpvProofs), Error> {
+    ) -> Result<(RgbTransfer, OpsDag, RetrievedSpvProofs), Error> {
         self.stock
             .transfer_from_fascia_with_dag(contract_id, outputs, secret_seals, opids, fascia, None)
             .map_err(Error::from)

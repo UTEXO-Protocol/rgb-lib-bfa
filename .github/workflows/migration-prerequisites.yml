@@ -2,7 +2,7 @@ name: Contract and snapshot prerequisites
 
 on:
   pull_request:
-    branches: [bfa, master]
+    branches: [bfa, bfa-1ae1c160, master]
   workflow_dispatch:
 
 permissions:
@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-        features: [wallet, bitcoind, validation]
+        features: [wallet, bitcoind, walletless]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     env:
@@ -24,6 +24,15 @@ jobs:
       FEATURES: ${{ matrix.features }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Authenticate pinned RGB sources
+        env:
+          RGB_READ_TOKEN: ${{ secrets.RGB_UPSTREAM_TOKEN || secrets.ORG_READ_TOKEN }}
+        run: |
+          test -n "$RGB_READ_TOKEN" || { echo "::error::An existing RGB source read token is required."; exit 1; }
+          git config --global url."https://x-access-token:${RGB_READ_TOKEN}@github.com/UTEXO-Protocol/".insteadOf "https://github.com/UTEXO-Protocol/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: '1.94.0'
@@ -45,7 +54,8 @@ jobs:
             cargo test --locked --no-default-features --features bitcoind --lib api::evm::tests -- --test-threads=1
           else
             # Wallet-less validation must remain independent of wallet/storage features.
-            cargo test --locked --no-default-features --features validation --lib -- --test-threads=1
+            cargo test --locked --no-default-features --lib -- --test-threads=1
+            cargo test --locked --no-default-features --features bitcoind_validation,electrum_validation,esplora_validation --lib -- --test-threads=1
           fi
 
   funded-funding-and-sweeps:
@@ -62,6 +72,15 @@ jobs:
       RGB_FUNDING_TEST_RPC_PASSWORD: default_password
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Authenticate pinned RGB sources
+        env:
+          RGB_READ_TOKEN: ${{ secrets.RGB_UPSTREAM_TOKEN || secrets.ORG_READ_TOKEN }}
+        run: |
+          test -n "$RGB_READ_TOKEN" || { echo "::error::An existing RGB source read token is required."; exit 1; }
+          git config --global url."https://x-access-token:${RGB_READ_TOKEN}@github.com/UTEXO-Protocol/".insteadOf "https://github.com/UTEXO-Protocol/"
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: '1.94.0'

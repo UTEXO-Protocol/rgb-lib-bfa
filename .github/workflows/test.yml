@@ -60,6 +60,9 @@ jobs:
           SKIP_INIT=1 cargo test --profile reldebug --no-default-features --features electrum go_online::fail
           SKIP_INIT=1 cargo test --profile reldebug --no-default-features --features electrum send::min_confirmations_electrum
           SKIP_INIT=1 cargo test --profile reldebug --no-default-features --features electrum send::min_relay_fee_electrum
+          SKIP_INIT=1 cargo test --profile reldebug --no-default-features --features electrum send::utxo_allocations_limit_across_inputs_full -- --ignored
+          SKIP_INIT=1 cargo test --profile reldebug --no-default-features --features electrum send::send_many_allocations_full -- --ignored
+          SKIP_INIT=1 cargo test --profile reldebug --no-default-features --features electrum send::change_utxo_allocations_limit_full -- --ignored
       - name: Test with esplora feature
         run: |
           cargo test --profile reldebug --no-default-features --features esplora get_fee_estimation::success_esplora -- --ignored
@@ -69,9 +72,6 @@ jobs:
       - name: Test with no default features
         run: |
           cargo test --profile reldebug --no-default-features
-      - name: Test with the validation feature
-        run: |
-          cargo test --profile reldebug --no-default-features --features validation
       - name: Test with indexer validation features
         run: |
           cargo test --profile reldebug --no-default-features --features bitcoind_validation,electrum_validation,esplora_validation

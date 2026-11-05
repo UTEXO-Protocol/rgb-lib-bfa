@@ -1229,6 +1229,8 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
             ANVIL_CHAIN_ID,
             contract_address,
             reject_list_address,
+            false,
+            None,
         )
     }
 
@@ -1292,6 +1294,8 @@ impl<T: OfflineSigParty<W = Wallet>> SinglesigWalletParty for T {
             amounts,
             inflation_amounts,
             reject_list_url,
+            false,
+            None,
         )
     }
 
@@ -1626,10 +1630,22 @@ impl SinglesigParty {
         asset_id: &str,
         recipient: Recipient,
     ) -> Result<MintBeginResult, Error> {
+        self.mint_begin_before_result(online, asset_id, recipient, default_before_block())
+    }
+
+    #[cfg(feature = "electrum")]
+    pub(crate) fn mint_begin_before_result(
+        &mut self,
+        online: Online,
+        asset_id: &str,
+        recipient: Recipient,
+        before_block: u64,
+    ) -> Result<MintBeginResult, Error> {
         self.wallet.mint_begin(
             online,
             asset_id.to_string(),
             recipient,
+            before_block,
             FEE_RATE,
             MIN_CONFIRMATIONS,
             PROXY_ENDPOINT.clone(),

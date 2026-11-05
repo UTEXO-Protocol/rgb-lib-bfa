@@ -66,7 +66,12 @@ impl RejectListClient {
                 "reject list too large: more than {MAX_REJECT_LIST_SIZE} bytes"
             )));
         }
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        // a reject list is made of opouts, which are ASCII: a lossy conversion of anything else
+        // could take up to 3 times the size bound, each invalid byte becoming U+FFFD
+        if !body.is_ascii() {
+            return Err(Self::req_err("reject list is not ASCII"));
+        }
+        Ok(String::from_utf8(body).expect("ASCII is valid UTF-8"))
     }
 }
 
@@ -108,6 +113,14 @@ mod tests {
             assert_matches!(result, Error::RejectListService { ref details } if details.contains(&status.to_string()));
             mock.assert();
         }
+
+        // a body that is not ASCII is refused
+        let mut server = mockito::Server::new();
+        let mock = server.mock("GET", "/").with_body("é").create();
+        let client = RejectListClient::new(&server.url()).unwrap();
+        let result = client.get_reject_list().unwrap_err();
+        assert_matches!(result, Error::RejectListService { ref details } if details == "reject list is not ASCII");
+        mock.assert();
 
         // URLs other than http(s) ones are refused
         for url in ["file:///etc/passwd", "ftp://127.0.0.1/list", "not a url"] {

@@ -531,6 +531,15 @@ impl Wallet {
     ///
     /// The `inflation_amounts` can be empty. If provided the sum of its elements plus the sum of
     /// `amounts` cannot exceed the maximum `u64` value.
+    ///
+    /// If `link_right` is true, the asset is issued with its link right, on a separate UTXO, which
+    /// can be spent once to link the asset to another contract (see
+    #[cfg_attr(feature = "_online", doc = "[`link`](Wallet::link)).")]
+    #[cfg_attr(not(feature = "_online"), doc = "`link`).")]
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
+    /// the one it replaces).
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_ifa(
         &self,
         ticker: String,
@@ -539,6 +548,8 @@ impl Wallet {
         amounts: Vec<u64>,
         inflation_amounts: Vec<u64>,
         reject_list_url: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetIFA, Error> {
         info!(self.logger(), "Issuing IFA...");
         let txn = self.database().begin_transaction()?;
@@ -550,6 +561,8 @@ impl Wallet {
             amounts,
             inflation_amounts,
             reject_list_url,
+            link_right,
+            linked_from_contract,
         )?;
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
@@ -581,6 +594,15 @@ impl Wallet {
     ///
     /// At least 1 mint right needs to be requested via `mint_rights`. Each one will be issued
     /// as a separate allocation (on a separate UTXO that needs to be already available).
+    ///
+    /// If `link_right` is true, the asset is issued with its link right, on a separate UTXO, which
+    /// can be spent once to link the asset to another contract (see
+    #[cfg_attr(feature = "_online", doc = "[`link`](Wallet::link)).")]
+    #[cfg_attr(not(feature = "_online"), doc = "`link`).")]
+    ///
+    /// The optional `linked_from_contract` is the ID of the contract the asset is linked from (e.g.
+    /// the one it replaces).
+    #[allow(clippy::too_many_arguments)]
     pub fn issue_asset_bfa(
         &self,
         ticker: String,
@@ -590,6 +612,8 @@ impl Wallet {
         chain_id: u64,
         contract_address: String,
         reject_list_address: Option<String>,
+        link_right: bool,
+        linked_from_contract: Option<String>,
     ) -> Result<AssetBFA, Error> {
         info!(self.logger(), "Issuing BFA...");
         let txn = self.database().begin_transaction()?;
@@ -602,6 +626,8 @@ impl Wallet {
             chain_id,
             contract_address,
             reject_list_address,
+            link_right,
+            linked_from_contract,
         )?;
         let res = self.finalize_offline_issuance(&txn, &issue_data)?;
         self.update_backup_info(&txn, false)?;
@@ -1656,6 +1682,134 @@ impl Wallet {
         Ok(res)
     }
 
+    /// Link an RGB asset to the contract with ID `linked_to_contract` (e.g. one replacing it),
+    /// spending its link right.
+    ///
+    /// This calls [`link_begin`](Wallet::link_begin), signs the resulting PSBT and finally
+    /// calls [`link_end`](Wallet::link_end).
+    ///
+    /// A wallet with private keys is required.
+    pub fn link(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+    ) -> Result<OperationResult, Error> {
+        info!(
+            self.logger(),
+            "Linking to contract: {}...", linked_to_contract
+        );
+        self.check_xprv()?;
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let mut begin_op_data = self.link_begin_impl(
+            &txn,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            true,
+        )?;
+        self.sign_psbt_impl(&mut begin_op_data.psbt, None)?;
+        let res = self.link_end_impl(&txn, &begin_op_data.psbt)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link completed");
+        Ok(res)
+    }
+
+    /// Prepare the PSBT to link an RGB asset to the contract with ID `linked_to_contract` (e.g. one
+    /// replacing it), with the provided `fee_rate` (in sat/vB).
+    ///
+    /// The link spends the link right of the asset, which the wallet needs to hold, and commits the
+    /// contract it links to (`linkedToContract`), which can't be the asset's own one. As the asset
+    /// has at most one link right, an asset can be linked only once.
+    ///
+    /// If `dry_run` is true, the wallet does not persist the transfer in
+    /// [`TransferStatus::Initiated`]. The returned [`LinkBeginResult::batch_transfer_idx`] is None
+    /// in that case. The PSBT and on-disk transfer data under the wallet directory are still
+    /// produced. [`link_end`](Wallet::link_end) can still complete the operation and will persist
+    /// the transfer.
+    ///
+    /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
+    /// to be fed to the [`link_end`](Wallet::link_end) function for broadcasting.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a PSBT ready to be signed and operation details.
+    pub fn link_begin(
+        &mut self,
+        online: Online,
+        asset_id: String,
+        linked_to_contract: String,
+        fee_rate: u64,
+        min_confirmations: u8,
+        dry_run: bool,
+    ) -> Result<LinkBeginResult, Error> {
+        info!(
+            self.logger(),
+            "Linking (begin) to contract: {}...", linked_to_contract
+        );
+        self.check_online(online)?;
+        let txn = self.database().begin_transaction()?;
+        let begin_operation_data = self.link_begin_impl(
+            &txn,
+            asset_id,
+            linked_to_contract,
+            fee_rate,
+            min_confirmations,
+            dry_run,
+        )?;
+        if !dry_run {
+            self.update_backup_info(&txn, false)?;
+        }
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link (begin) completed");
+        Ok(LinkBeginResult {
+            psbt: begin_operation_data.psbt.to_string(),
+            batch_transfer_idx: begin_operation_data.batch_transfer_idx,
+            details: LinkDetails {
+                fascia_path: begin_operation_data
+                    .transfer_dir
+                    .join(FASCIA_FILE)
+                    .to_string_lossy()
+                    .to_string(),
+                min_confirmations,
+                entropy: begin_operation_data.info_batch_transfer.entropy,
+            },
+        })
+    }
+
+    /// Complete the link operation by broadcasting the provided PSBT and saving the transfer to DB.
+    ///
+    /// The provided PSBT, prepared with the [`link_begin`](Wallet::link_begin) function, needs to
+    /// have already been signed.
+    ///
+    /// A consignment proving the link (with its full history) is also written to disk, at the
+    /// `consignment_path` reported by [`list_transfers`](Wallet::list_transfers) for the link
+    /// operation, so that it can be handed to third parties that need to verify it.
+    ///
+    /// This doesn't require the wallet to have private keys.
+    ///
+    /// Returns a [`OperationResult`].
+    pub fn link_end(
+        &mut self,
+        online: Online,
+        signed_psbt: String,
+    ) -> Result<OperationResult, Error> {
+        info!(self.logger(), "Linking (end)...");
+        self.check_online(online)?;
+        let psbt = Psbt::from_str(&signed_psbt)?;
+        let txn = self.database().begin_transaction()?;
+        let res = self.link_end_impl(&txn, &psbt)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "Link (end) completed");
+        Ok(res)
+    }
+
     /// Prepare the PSBT to mint RGB assets, backed by tokens locked on the asset's bridge
     /// contract on the external chain, to the provided `recipient`, with the provided `fee_rate`
     /// (in sat/vB).
@@ -1669,20 +1823,27 @@ impl Wallet {
     /// corresponding tokens on the external chain contract needs to commit to it. The consignment
     /// is posted right away, so the recipient can check the mint before the lock is made (see
     /// [`get_received_mint`](crate::wallet::RgbWalletOpsOffline::get_received_mint)), while it
-    /// will be able to accept the transfer only once the lock event exists on the external chain.
+    /// will be able to accept the transfer only once the lock exists on the external chain.
     ///
     /// The `min_confirmations` number determines the minimum number of confirmations needed for
     /// the transaction anchoring the transfer for it to be considered final and move (while
     /// refreshing) to the [`TransferStatus::Settled`] status.
     ///
-    /// The deadline for the lock is the expiration of the recipient's invoice, which is also the
-    /// expiration of the transfer: the lock has to be included on the external chain by then. If
-    /// it is, the transfer is waited for past it, for the lock to be finalized, for up to 24
-    /// hours; otherwise, once the deadline passes, the recipient is allowed to fail the transfer
-    /// and [`mint_end`](Wallet::mint_end) will refuse to broadcast it. The invoice must have at
-    /// least 1 hour left, to leave time for the lock, erroring with [`Error::InvoiceExpired`]
-    /// otherwise. The lock should still be made well before the deadline, paying enough fees for
-    /// it to be included in time, since a lock included after it doesn't mint anything.
+    /// The lock has to be included on the external chain before the provided `before_block`, a
+    /// block of the external chain chosen by the caller (e.g. the bridge operator), which the mint
+    /// commits to: a lock included at or after it never confirms the mint, for anyone. It needs to
+    /// leave at least a block for the lock after the latest one, erroring with
+    /// [`Error::InvalidBeforeBlock`] otherwise.
+    ///
+    /// The provided `before_block` is the mint's only expiration, no timestamp is involved: the
+    /// `recipient` must have no expiration, erroring with [`Error::InvalidRecipientData`]
+    /// otherwise. Its invoice expiration only bounds how long its proxy keeps the invoice and the
+    /// consignment, so the consignment can't be posted once it has passed. The mint expires once
+    /// its lock can no longer be included before `before_block`, as of the latest finalized block
+    /// of the external chain: then the recipient fails it (at refresh) and the sender at
+    /// [`mint_end`](Wallet::mint_end). The lock should be made well before `before_block`, paying
+    /// enough fees for it to be included in time, since a lock included after it doesn't mint
+    /// anything.
     ///
     /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
     /// to be fed to the [`mint_end`](Wallet::mint_end) function for broadcasting.
@@ -1690,11 +1851,13 @@ impl Wallet {
     /// This doesn't require the wallet to have private keys.
     ///
     /// Returns a PSBT ready to be signed and operation details.
+    #[allow(clippy::too_many_arguments)]
     pub fn mint_begin(
         &mut self,
         online: Online,
         asset_id: String,
         recipient: Recipient,
+        before_block: u64,
         fee_rate: u64,
         min_confirmations: u8,
         sender_transport_endpoint: String,
@@ -1706,6 +1869,7 @@ impl Wallet {
             &txn,
             asset_id,
             recipient,
+            before_block,
             fee_rate,
             min_confirmations,
             sender_transport_endpoint,
@@ -1739,17 +1903,17 @@ impl Wallet {
     ///
     /// Before broadcasting, the wallet checks via the EVM RPC endpoint (which needs to be on the
     /// chain of the asset's bridge contract, erroring with [`Error::EvmChainIdMismatch`]
-    /// otherwise) that a lock event committing to the mint operation (see
-    /// [`MintDetails::opid`]) already exists on the bridge contract in a finalized block, erroring
-    /// with [`Error::MintEventNotFound`] otherwise. This enforces the safe operation order: begin,
+    /// otherwise) that a lock of the minted amount committing to the mint operation (see
+    /// [`MintDetails::opid`]) is already recorded by the bridge contract as of a finalized block,
+    /// included before the block the mint commits to (see [`mint_begin`](Wallet::mint_begin)),
+    /// erroring with [`Error::MintEventNotFound`] otherwise, or with [`Error::MintEventExpired`]
+    /// if it never will be. This enforces the safe operation order: begin,
     /// lock on the external chain, wait for the lock to be final, then end.
     ///
-    /// The TX is not broadcast once the deadline for the lock (the expiration of the recipient's
-    /// invoice, see [`mint_begin`](Wallet::mint_begin)) has passed, erroring with
-    /// [`Error::TransferExpired`] instead, since the recipient may have already failed the
-    /// transfer, unless the lock was included on the external chain by the deadline and 24 hours
-    /// haven't passed since it, as the recipient waits for such a lock to be finalized. The
-    /// expired transfer can then be failed with [`fail_transfers`](Wallet::fail_transfers).
+    /// A mint whose lock has expired (see [`mint_begin`](Wallet::mint_begin)) is failed, releasing
+    /// its inputs, before erroring with [`Error::MintEventExpired`]. A mint whose lock is not
+    /// confirmed yet is left as is, so this can be called again later, failing it once its lock
+    /// has expired.
     ///
     /// A mint that has already failed or been ended errors with [`Error::CannotEndTransfer`].
     ///
@@ -1765,7 +1929,16 @@ impl Wallet {
         self.check_online(online)?;
         let psbt = Psbt::from_str(&signed_psbt)?;
         let txn = self.database().begin_transaction()?;
-        let res = self.mint_end_impl(&txn, &psbt)?;
+        let res = match self.mint_end_impl(&txn, &psbt) {
+            Ok(res) => res,
+            // the mint has been failed, which needs to be committed
+            Err(e @ Error::MintEventExpired { .. }) => {
+                self.update_backup_info(&txn, false)?;
+                self.persist_and_commit(txn)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Minting (end) completed");

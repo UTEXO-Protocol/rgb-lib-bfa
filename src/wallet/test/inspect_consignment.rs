@@ -101,9 +101,15 @@ fn success() {
         transition.inputs[0].assignment,
         Assignment::Fungible(AMOUNT)
     );
-    // outputs: the two terminals and the change
+    // outputs: the two recipients' and the change, all of the terminal operation
     assert_eq!(transition.outputs.len(), 3);
     assert!(transition.outputs.iter().all(|o| o.is_ours.is_none()));
+    assert!(
+        transition
+            .outputs
+            .iter()
+            .all(|o| o.is_terminal == Some(true))
+    );
     let blind_output = transition.outputs.iter().find(|o| o.is_concealed).unwrap();
     assert_eq!(blind_output.assignment, Assignment::Fungible(amount_blind));
     assert_eq!(blind_output.vout, None);
@@ -126,7 +132,7 @@ fn success() {
     let change_output = transition
         .outputs
         .iter()
-        .find(|o| o.is_terminal == Some(false))
+        .find(|o| o.assignment == Assignment::Fungible(AMOUNT - amount_blind - amount_witness))
         .unwrap();
     assert!(!change_output.is_concealed);
     assert_eq!(change_output.txid.as_ref(), Some(&txid_1));

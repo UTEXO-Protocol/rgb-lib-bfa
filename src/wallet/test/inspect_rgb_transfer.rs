@@ -66,3 +66,119 @@ fn fail() {
     );
     assert_matches!(result, Err(Error::RgbInspection { details: d }) if d.contains("is not committed"));
 }
+
+/// A send of inflation rights moves them with a transition of their own, a transfer of inflation
+/// rights, which the inspection reports.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn inflation_rights() {
+    initialize();
+
+    let amount = 100;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party.issue_asset_ifa(None, None, None);
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::InflationRight(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+        }],
+    )]);
+    let res = party.send_begin_result(&recipient_map).unwrap();
+    let inspection = party
+        .wallet
+        .inspect_rgb_transfer(res.psbt, res.details.fascia_path, res.details.entropy)
+        .unwrap();
+    assert_eq!(inspection.operations.len(), 1);
+    let transitions = &inspection.operations[0].transitions;
+    assert_eq!(transitions.len(), 1);
+    let transition = &transitions[0];
+    assert_eq!(transition.r#type, TypeOfTransition::TransferInflation);
+    let inputs: Vec<_> = transition.inputs.iter().map(|i| &i.assignment).collect();
+    assert_eq!(inputs, vec![&Assignment::InflationRight(AMOUNT_INFLATION)]);
+    let mut outputs: Vec<_> = transition
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        vec![
+            (Assignment::InflationRight(amount), Some(false)),
+            (
+                Assignment::InflationRight(AMOUNT_INFLATION - amount),
+                Some(true)
+            ),
+        ]
+    );
+}
+
+/// A send of the link right moves it with a transition of its own, a transfer of link rights, which
+/// the inspection reports.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn link_right() {
+    initialize();
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    let asset = party
+        .wallet
+        .issue_asset_ifa(
+            TICKER.to_string(),
+            NAME.to_string(),
+            PRECISION,
+            vec![AMOUNT],
+            vec![],
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::LinkRight,
+            recipient_id: receive_data.recipient_id.clone(),
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+        }],
+    )]);
+    let res = party.send_begin_result(&recipient_map).unwrap();
+    let inspection = party
+        .wallet
+        .inspect_rgb_transfer(res.psbt, res.details.fascia_path, res.details.entropy)
+        .unwrap();
+    assert_eq!(inspection.operations.len(), 1);
+    let transitions = &inspection.operations[0].transitions;
+    assert_eq!(transitions.len(), 1);
+    let transition = &transitions[0];
+    assert_eq!(transition.r#type, TypeOfTransition::TransferLink);
+    let inputs: Vec<_> = transition.inputs.iter().map(|i| &i.assignment).collect();
+    assert_eq!(inputs, vec![&Assignment::LinkRight]);
+    let outputs: Vec<_> = transition
+        .outputs
+        .iter()
+        .map(|o| (o.assignment.clone(), o.is_ours))
+        .collect();
+    assert_eq!(outputs, vec![(Assignment::LinkRight, Some(false))]);
+}

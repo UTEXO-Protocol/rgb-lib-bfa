@@ -133,8 +133,9 @@ features = ["rustls"]
 default = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
 all = ["wallet", "bitcoind", "electrum", "esplora", "bdk_file_store_migration", "rgb_fs_store_migration"]
 # the wallet functionality; without it only the APIs that don't need a wallet (e.g. consignment
-# inspection, and validation with an indexer validation feature) are available, pulling in just the
-# RGB crates and few other lightweight dependencies
+# inspection and validation with resolvers provided by the caller, or with an indexer with an
+# indexer validation feature) are available, pulling in just the RGB crates and few other
+# lightweight dependencies
 wallet = [
     "dep:libc",
     "dep:base64",
@@ -174,13 +175,10 @@ rgb_fs_store_migration = ["wallet", "rgb-ops/legacy"]
 # implied by each indexer feature, marking a build whose wallet can reach the network; it exists
 # only to avoid repeating the list of indexer features in cfgs and must not be enabled on its own
 _online = ["wallet"]
-# consignment validation with a witness resolver provided by the caller (not enabling the wallet
-# functionality nor any indexer): enable an indexer validation feature to validate with an indexer
-validation = ["reqwest"]
 # implied by each indexer validation feature, marking a build that can validate consignments
 # reaching the network; it exists only to avoid repeating the list of indexer validation features
 # in cfgs and must not be enabled on its own
-_validation = ["validation"]
+_validation = ["reqwest"]
 # support for an indexer, to use it with an online wallet (enabling the wallet functionality)
 bitcoind = [
     "_online",
@@ -220,3 +218,13 @@ overflow-checks = true
 [profile.reldebug]
 inherits = "release"
 debug = 1
+
+[patch.crates-io]
+rgb-consensus = { git = "https://github.com/UTEXO-Protocol/rgb-consensus-s-bfa.git", rev = "af0b751dc9e51547cd57e025fdc3508e120ddf8a" }
+rgb-ops = { git = "https://github.com/UTEXO-Protocol/rgb-ops-s-bfa.git", rev = "ed1d60df69f9e4db65640c0ac61a5779ba9c018c" }
+rgb-invoicing = { git = "https://github.com/UTEXO-Protocol/rgb-ops-s-bfa.git", rev = "ed1d60df69f9e4db65640c0ac61a5779ba9c018c" }
+rgb-psbt-utils = { git = "https://github.com/UTEXO-Protocol/rgb-api-s-bfa.git", rev = "8e2f515d0f6445e88d3c794a4b592f7bdd3a12df" }
+rgb-schemas = { git = "https://github.com/UTEXO-Protocol/rgb-schemas-s-bfa.git", rev = "641a06f31cd277c42222504c8040055c8cbafca5" }
+rgb-strict-encoding = { git = "https://github.com/rgb-protocol/rgb-strict-encoding", rev = "e12b9944b30171950de03778d6666b24bc33d994" }
+rgb-strict-encoding-derive = { git = "https://github.com/rgb-protocol/rgb-strict-encoding", rev = "e12b9944b30171950de03778d6666b24bc33d994" }
+rgb-strict-types = { git = "https://github.com/rgb-protocol/rgb-strict-types", rev = "8714cdcc8af25333c27214cdf9f42a6388d484ff" }

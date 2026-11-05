@@ -6,6 +6,7 @@ use utils::*;
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(hub)]
 fn success() {
     initialize();
@@ -1009,6 +1010,7 @@ fn success() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(hub)]
 fn fail() {
     initialize();
@@ -1399,6 +1401,7 @@ fn fail() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(hub)]
 fn offline() {
     initialize();
@@ -1534,6 +1537,7 @@ fn offline() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(hub)]
 fn send_to_oneself() {
     initialize();

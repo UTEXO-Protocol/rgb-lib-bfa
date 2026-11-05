@@ -86,10 +86,11 @@ pub enum Error {
         asset_schema: AssetSchema,
     },
 
-    /// The consignment has terminals rejected by the reject list of its asset
+    /// The consignment has opouts rejected by the reject list of its asset, among the inputs and
+    /// outputs of its terminal operations (see `validate_consignment`)
     #[error("Consignment rejected by the reject list, rejected opouts: {opouts:?}")]
     ConsignmentRejected {
-        /// The rejected terminal opouts
+        /// The rejected opouts
         opouts: Vec<String>,
     },
 
@@ -280,6 +281,14 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided external chain block, before which the lock of a mint has to be included,
+    /// leaves no block for it
+    #[error("Invalid before block: {details}")]
+    InvalidBeforeBlock {
+        /// Error details
+        details: String,
+    },
+
     /// Keys derived from the provided data do not match
     #[error("Invalid bitcoin keys")]
     InvalidBitcoinKeys,
@@ -312,6 +321,13 @@ pub enum Error {
     /// The content signature was rejected as invalid
     #[error("Invalid content signature")]
     InvalidContentSignature,
+
+    /// The provided contract ID is invalid
+    #[error("Invalid contract ID: {contract_id}")]
+    InvalidContractId {
+        /// The invalid contract ID
+        contract_id: String,
+    },
 
     /// The provided cosigner is invalid
     #[error("Invalid cosigner: {details}")]
@@ -362,8 +378,8 @@ pub enum Error {
     },
 
     /// The provided EVM RPC URL is invalid, the endpoint cannot be reached or it doesn't serve
-    /// what confirming mint events needs (the latest finalized block and the logs of the whole
-    /// chain history)
+    /// what confirming mint events needs (the latest finalized block and the contract state as of
+    /// it)
     #[error("Invalid EVM RPC URL: {details}")]
     InvalidEvmRpcUrl {
         /// Error details
@@ -562,25 +578,22 @@ pub enum Error {
         txid: String,
     },
 
+    /// The lock of the mint operation was not included on the external chain before the block the
+    /// mint commits to, and never will be: the mint will never be confirmed
+    #[error("Mint event for operation {opid} not included before block {before_block}")]
+    MintEventExpired {
+        /// ID of the mint operation
+        opid: String,
+        /// External chain block the lock had to be included before
+        before_block: u64,
+    },
+
     /// No confirmed mint event committing to the mint operation was found on the external chain
     /// (yet): it may still be, e.g. once the lock is made or finalized
     #[error("Mint event for operation {opid} not found on the external chain")]
     MintEventNotFound {
         /// ID of the mint operation
         opid: String,
-    },
-
-    /// No mint event committing to the mint operation was found within the blocks scanned for it
-    /// after the one the mint commits to, all of them finalized: the mint will never be confirmed
-    #[error(
-        "Mint event for operation {opid} not found within {max_scan_blocks} blocks from the one \
-         the mint commits to"
-    )]
-    MintEventOutOfScanWindow {
-        /// ID of the mint operation
-        opid: String,
-        /// Number of blocks scanned for the mint event
-        max_scan_blocks: u64,
     },
 
     /// Cannot mark operation as processed
@@ -647,6 +660,12 @@ pub enum Error {
         details: String,
     },
 
+    /// The consignment has external anchors (mint events) to confirm, but no anchor resolver was
+    /// provided (see
+    /// [`validate_consignment_with_resolver`](crate::no_wallet::validate_consignment_with_resolver))
+    #[error("No anchor resolver provided to confirm the consignment's external anchors")]
+    NoAnchorResolver,
+
     /// Cannot burn an asset with zero amount
     #[error("Burn request with zero amount")]
     NoBurnAmount,
@@ -666,12 +685,12 @@ pub enum Error {
     )]
     #[cfg_attr(not(feature = "_online"), doc = "`OnlineOptions::evm_rpc_urls` or")]
     #[cfg_attr(
-        feature = "validation",
-        doc = "[`ValidationOptions::evm_rpc_urls`](crate::no_wallet::ValidationOptions::evm_rpc_urls))"
+        feature = "_validation",
+        doc = "the `evm_rpc_urls` of [`validate_consignment`](crate::no_wallet::validate_consignment))"
     )]
     #[cfg_attr(
-        not(feature = "validation"),
-        doc = "`ValidationOptions::evm_rpc_urls`)"
+        not(feature = "_validation"),
+        doc = "the `evm_rpc_urls` of `validate_consignment`)"
     )]
     #[error("No EVM RPC URL configured for chain ID {chain_id}")]
     NoEvmRpcUrl {
@@ -702,6 +721,11 @@ pub enum Error {
     /// Cannot issue an asset with zero mint rights
     #[error("Issuance request with zero mint rights")]
     NoMintRights,
+
+    /// The asset has a reject list, but no reject list resolver was provided to read it (see
+    /// [`validate_consignment_with_resolver`](crate::no_wallet::validate_consignment_with_resolver))
+    #[error("No reject list resolver provided to read the asset's reject list")]
+    NoRejectListResolver,
 
     /// Cannot create a wallet with no supported schemas
     #[error("Cannot create a wallet with no supported schemas")]
@@ -770,6 +794,11 @@ pub enum Error {
         /// Error details
         details: String,
     },
+
+    /// The PSBT of the operation would be too large to be parsed back, as it moves too many
+    /// allocations
+    #[error("PSBT too large")]
+    PsbtTooLarge,
 
     /// Provided recipient ID has already been used for another transfer
     #[error("Recipient ID already used")]
@@ -874,6 +903,13 @@ pub enum Error {
         layer_1: String,
     },
 
+    /// The schema doesn't support link transitions
+    #[error("Link not supported")]
+    UnsupportedLink {
+        /// Asset schema
+        asset_schema: AssetSchema,
+    },
+
     /// The schema doesn't support mint transitions
     #[error("Mint not supported")]
     UnsupportedMint {
@@ -935,7 +971,7 @@ pub enum Error {
     WrongPassword,
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IndexerError {
     #[cfg(feature = "bitcoind_validation")]
@@ -1061,7 +1097,7 @@ impl From<bdk_wallet::bitcoin::psbt::PsbtParseError> for Error {
     }
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 impl From<IndexerError> for Error {
     fn from(e: IndexerError) -> Self {
         Error::Indexer {
@@ -1070,7 +1106,7 @@ impl From<IndexerError> for Error {
     }
 }
 
-#[cfg(feature = "validation")]
+#[cfg(feature = "_validation")]
 impl From<reqwest::Error> for Error {
     fn from(e: reqwest::Error) -> Self {
         Error::RestClientBuild {
@@ -1114,7 +1150,6 @@ impl From<psrgbt::MpcPsbtError> for InternalError {
     }
 }
 
-#[cfg(feature = "validation")]
 impl From<AnchorResolverError> for Error {
     fn from(e: AnchorResolverError) -> Self {
         match e {

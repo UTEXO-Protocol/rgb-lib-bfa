@@ -15,7 +15,7 @@ use crate::database::entities::{
     asset_transfer, batch_transfer, pending_witness_script, reserved_txo, transfer,
 };
 #[cfg(feature = "_online")]
-use sea_orm::RelationTrait;
+use sea_orm::{PaginatorTrait, RelationTrait};
 
 #[derive(Debug, Clone)]
 #[cfg(feature = "_online")]
@@ -129,12 +129,7 @@ pub(crate) struct DbBatchTransferData {
 
 impl DbColoring {
     pub(crate) fn incoming(&self) -> bool {
-        [
-            ColoringType::Receive,
-            ColoringType::Change,
-            ColoringType::Issue,
-        ]
-        .contains(&self.r#type)
+        ColoringType::INCOMING.contains(&self.r#type)
     }
 }
 
@@ -274,7 +269,7 @@ impl RgbLibDatabase {
     /// This binds the acknowledgement token to the DB actually placed in the archive,
     /// rather than trusting a before/after observation of the live database.
     pub(crate) fn snapshot_file_digest(database: &Path, hash: &mut Sha256) -> Result<(), Error> {
-        let path = adjust_canonicalization(database.to_path_buf());
+        let path = adjust_canonicalization(database);
         let mut options = ConnectOptions::new(format!("sqlite:{path}?mode=ro&immutable=true"));
         options.max_connections(1).min_connections(0);
         let database = Self::new(block_on(Database::connect(options))?);
@@ -859,6 +854,30 @@ impl DbTxn {
                 .filter(transport_endpoint::Column::Endpoint.eq(endpoint))
                 .one(self.inner()),
         )?)
+    }
+
+    /// The number of allocations of the asset with ID `asset_id` the TXO with index `txo_idx`
+    /// holds or is due to receive (receives, changes and issuances), from transfers that haven't
+    /// failed, counted by the DB without loading the colorings.
+    #[cfg(feature = "_online")]
+    pub(crate) fn count_txo_incoming_asset_colorings(
+        &self,
+        txo_idx: i32,
+        asset_id: &str,
+    ) -> Result<usize, Error> {
+        Ok(block_on(
+            Coloring::find()
+                .join(JoinType::InnerJoin, coloring::Relation::AssetTransfer.def())
+                .join(
+                    JoinType::InnerJoin,
+                    asset_transfer::Relation::BatchTransfer.def(),
+                )
+                .filter(coloring::Column::TxoIdx.eq(txo_idx))
+                .filter(coloring::Column::Type.is_in(ColoringType::INCOMING))
+                .filter(asset_transfer::Column::AssetId.eq(asset_id))
+                .filter(batch_transfer::Column::Status.ne(TransferStatus::Failed))
+                .count(self.inner()),
+        )? as usize)
     }
 
     pub(crate) fn get_txo(&self, outpoint: &Outpoint) -> Result<Option<DbTxo>, Error> {

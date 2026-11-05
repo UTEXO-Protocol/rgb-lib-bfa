@@ -50,6 +50,8 @@ jobs:
     name: Build uniffi (${{ matrix.target }})
     needs: prepare
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +77,19 @@ jobs:
         with:
           toolchain: stable
           target: ${{ matrix.target }}
+
+      - name: Configure private RGB upstream access
+        env:
+          RGB_UPSTREAM_TOKEN: ${{ secrets.RGB_UPSTREAM_TOKEN }}
+        run: |
+          for r in rgb-consensus rgb-ops rgb-api rgb-schemas; do
+            git config --global \
+              url."https://x-access-token:${RGB_UPSTREAM_TOKEN}@github.com/UTEXO-Protocol/${r}-s-bfa.git".insteadOf \
+              "ssh://git@github.com/rgb-tools-devs/${r}.git"
+          done
+          # upstream may already ship the patch table: a second one fails the build
+          grep -q '^\[patch\.crates-io\]' bindings/uniffi/Cargo.toml ||
+            sed -n '/^\[patch\.crates-io\]/,$p' Cargo.toml >> bindings/uniffi/Cargo.toml
 
       - name: Build uniffi library
         working-directory: bindings/uniffi

@@ -135,6 +135,57 @@ pub extern "C" fn rgblib_burn_end(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn rgblib_link(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    asset_id: *const c_char,
+    linked_to_contract: *const c_char,
+    fee_rate: *const c_char,
+    min_confirmations: *const c_char,
+) -> CResultString {
+    link(
+        wallet,
+        online,
+        asset_id,
+        linked_to_contract,
+        fee_rate,
+        min_confirmations,
+    )
+    .into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_link_begin(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    asset_id: *const c_char,
+    linked_to_contract: *const c_char,
+    fee_rate: *const c_char,
+    min_confirmations: *const c_char,
+    dry_run: bool,
+) -> CResultString {
+    link_begin(
+        wallet,
+        online,
+        asset_id,
+        linked_to_contract,
+        fee_rate,
+        min_confirmations,
+        dry_run,
+    )
+    .into()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_link_end(
+    wallet: &COpaqueStruct,
+    online: *const c_char,
+    signed_psbt: *const c_char,
+) -> CResultString {
+    link_end(wallet, online, signed_psbt).into()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn rgblib_blind_receive(
     wallet: &COpaqueStruct,
     online: *const c_char,
@@ -383,6 +434,8 @@ pub extern "C" fn rgblib_issue_asset_bfa(
     chain_id: *const c_char,
     contract_address: *const c_char,
     reject_list_address: *const c_char,
+    link_right: bool,
+    linked_from_contract: *const c_char,
 ) -> CResultString {
     issue_asset_bfa(
         wallet,
@@ -393,6 +446,8 @@ pub extern "C" fn rgblib_issue_asset_bfa(
         chain_id,
         contract_address,
         reject_list_address,
+        link_right,
+        linked_from_contract,
     )
     .into()
 }
@@ -418,6 +473,8 @@ pub extern "C" fn rgblib_issue_asset_ifa(
     amounts: *const c_char,
     inflation_amounts: *const c_char,
     reject_list_url: *const c_char,
+    link_right: bool,
+    linked_from_contract: *const c_char,
 ) -> CResultString {
     issue_asset_ifa(
         wallet,
@@ -427,6 +484,8 @@ pub extern "C" fn rgblib_issue_asset_ifa(
         amounts,
         inflation_amounts,
         reject_list_url,
+        link_right,
+        linked_from_contract,
     )
     .into()
 }
@@ -510,11 +569,13 @@ pub extern "C" fn rgblib_load_wallet(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn rgblib_mint_begin(
     wallet: &COpaqueStruct,
     online: *const c_char,
     asset_id: *const c_char,
     recipient: *const c_char,
+    before_block: *const c_char,
     fee_rate: *const c_char,
     min_confirmations: *const c_char,
     sender_transport_endpoint: *const c_char,
@@ -524,6 +585,7 @@ pub extern "C" fn rgblib_mint_begin(
         online,
         asset_id,
         recipient,
+        before_block,
         fee_rate,
         min_confirmations,
         sender_transport_endpoint,
@@ -699,10 +761,18 @@ pub extern "C" fn rgblib_sync(
 pub extern "C" fn rgblib_validate_consignment(
     consignment_path: *const c_char,
     indexer_config: *const c_char,
+    evm_rpc_urls: *const c_char,
     min_confirmations: *const c_char,
     options: *const c_char,
 ) -> CResultString {
-    validate_consignment(consignment_path, indexer_config, min_confirmations, options).into()
+    validate_consignment(
+        consignment_path,
+        indexer_config,
+        evm_rpc_urls,
+        min_confirmations,
+        options,
+    )
+    .into()
 }
 
 #[unsafe(no_mangle)]

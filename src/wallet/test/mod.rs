@@ -27,6 +27,8 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 #[cfg(feature = "electrum")]
 use rgbstd::stl::{EmbeddedMedia as RgbEmbeddedMedia, ProofOfReserves as RgbProofOfReserves};
+#[cfg(feature = "_online")]
+use rgbstd::{Assign, RevealedValue, TypedAssigns};
 use serde_json::Value;
 use serial_test::parallel;
 #[cfg(feature = "_online")]
@@ -54,7 +56,8 @@ use crate::wallet::utils::build_indexer;
 use crate::{
     database::enums::{SCHEMA_ID_CFA, SCHEMA_ID_IFA, SCHEMA_ID_NIA, SCHEMA_ID_UDA},
     no_wallet::{
-        BundleFilter, inspect_consignment, validate_consignment, validation::terminal_opouts,
+        BundleFilter, ResolveRejectList, inspect_consignment, validate_consignment,
+        validation::RemoteRejectListResolver,
     },
     utils::{get_account_data, recipient_id_from_script_buf, script_buf_from_recipient_id},
     wallet::{multisig::*, rust_only::*},
@@ -79,6 +82,10 @@ const ANVIL_CHAIN_ID: u64 = 31337;
 /// 32 slots
 #[cfg(feature = "electrum")]
 const EVM_FINALITY_DEPTH: u64 = 64;
+/// Blocks a mint leaves for its lock by default, after the latest one when it begins: more than any
+/// test mines
+#[cfg(feature = "electrum")]
+const MINT_LOCK_BLOCKS: u64 = 100_000;
 #[cfg(feature = "_online")]
 const TEST_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_srv"];
 const NOSRV_DATA_DIR_PARTS: [&str; 2] = ["tests", "tmp_nosrv"];
@@ -137,6 +144,8 @@ const LISTS_DIR_PARTS: [&str; 2] = ["tests", "lists"];
 const HUB_DIR_PARTS: [&str; 2] = ["tests", "hub"];
 #[cfg(feature = "_online")]
 const TICKER: &str = "TICKER";
+#[cfg(feature = "electrum")]
+const UNICODE_TICKER: &str = "₿TC";
 #[cfg(feature = "_online")]
 const NAME: &str = "asset name";
 #[cfg(feature = "electrum")]
@@ -221,6 +230,7 @@ thread_local! {
     pub(crate) static MOCK_CHAIN_NET: RefCell<Option<ChainNet>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CONTRACT_DATA: RefCell<Vec<Attachment>> = const { RefCell::new(vec![]) };
     pub(crate) static MOCK_CONTRACT_DETAILS: RefCell<Option<String>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_IFA_LINK_RIGHT: RefCell<Option<BuilderSeal<BlindSeal<RgbTxid>>>> = const { RefCell::new(None) };
     pub(crate) static MOCK_TOKEN_DATA: RefCell<Vec<TokenData>> = const { RefCell::new(vec![]) };
 }
 
@@ -233,14 +243,13 @@ thread_local! {
     pub(crate) static MOCK_CHAIN_TXS: RefCell<HashMap<String, (BdkTransaction, u32)>> = RefCell::new(HashMap::new());
     pub(crate) static MOCK_LOCAL_VERSION: RefCell<Option<String>> = const { RefCell::new(None) };
     pub(crate) static MOCK_SEND_END_CRASH: RefCell<Option<()>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_STRIP_TERMINALS: RefCell<Option<()>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_SPAM_RECIPIENT_ASSIGNMENTS: RefCell<Option<(u16, u64)>> = const { RefCell::new(None) };
+    pub(crate) static MOCK_ACCEPT_MULTIPLE_ALLOCATIONS: RefCell<bool> = const { RefCell::new(false) };
+    pub(crate) static MOCK_MAX_UTXO_ASSET_ALLOCATIONS: RefCell<Option<usize>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CLOCK_SKEW_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_MIN_RETENTION_GRACE: RefCell<Option<u32>> = const { RefCell::new(None) };
     pub(crate) static MOCK_CONFIRMATION_MARGIN: RefCell<Option<u32>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_MINT_LOCK_WINDOW: RefCell<Option<u32>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_MINT_AFTER_BLOCK_GRACE: RefCell<Option<i64>> = const { RefCell::new(None) };
-    pub(crate) static MOCK_MAX_MINT_SCAN_BLOCKS: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "_online")]
@@ -359,6 +368,11 @@ macro_rules! get_funded_party {
     };
 }
 
+/// Seal the genesis of the next IFA asset issued assigns a link right to, if set.
+pub fn mock_ifa_link_right() -> Option<BuilderSeal<BlindSeal<RgbTxid>>> {
+    MOCK_IFA_LINK_RIGHT.take()
+}
+
 pub fn mock_asset_terms<W: WalletOffline + ?Sized>(
     wallet: &W,
     text: RicardianContract,
@@ -468,41 +482,10 @@ pub fn spv_only() -> bool {
     spv_only
 }
 
-#[cfg(feature = "_online")]
-pub fn strip_terminals() -> bool {
-    if MOCK_STRIP_TERMINALS.take().is_none() {
-        false
-    } else {
-        println!("stripping consignment terminals (mock)");
-        true
-    }
-}
-
 /// Clock skew margin (seconds) to use instead of `PROXY_CLOCK_SKEW_MARGIN_SECS`, if set.
 #[cfg(feature = "_online")]
 pub fn mock_clock_skew_margin() -> Option<u32> {
     MOCK_CLOCK_SKEW_MARGIN.with_borrow(|m| *m)
-}
-
-/// Minimum time (seconds) left on the invoice of a mint to use instead of
-/// `MIN_MINT_LOCK_WINDOW_SECS`, if set.
-#[cfg(feature = "_online")]
-pub fn mock_mint_lock_window() -> Option<u32> {
-    MOCK_MINT_LOCK_WINDOW.with_borrow(|m| *m)
-}
-
-/// Time (seconds) the block a received mint commits to may precede the invoice to use instead of
-/// `MINT_AFTER_BLOCK_GRACE_SECS`, if set.
-#[cfg(feature = "_online")]
-pub fn mock_mint_after_block_grace() -> Option<i64> {
-    MOCK_MINT_AFTER_BLOCK_GRACE.with_borrow(|m| *m)
-}
-
-/// Maximum number of blocks scanned for the event of a received mint to use instead of
-/// `MAX_MINT_SCAN_BLOCKS`, if set.
-#[cfg(feature = "_online")]
-pub fn mock_max_mint_scan_blocks() -> Option<u64> {
-    MOCK_MAX_MINT_SCAN_BLOCKS.with_borrow(|m| *m)
 }
 
 /// Sender proxy retention grace (seconds) to use instead of the one advertised by the proxy, if
@@ -523,6 +506,58 @@ pub fn mock_min_retention_grace() -> Option<u32> {
 #[cfg(feature = "_online")]
 pub fn mock_confirmation_margin() -> Option<u32> {
     MOCK_CONFIRMATION_MARGIN.with_borrow(|m| *m)
+}
+
+// whether to accept consignments paying an invoice more than one allocation, as the tests filling
+// UTXOs with allocations (see `mock_spam_recipient_assignments`) need
+#[cfg(feature = "_online")]
+pub fn accept_multiple_allocations() -> bool {
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.with_borrow(|a| *a)
+}
+
+// simulate a sender spamming the recipient with allocations: add the requested number of
+// assignments of the given amount to the (blinded) recipient seal of a transition, taking their
+// total from the recipient assignment, so the recipient receives that many allocations plus one
+// (the transition is changed once complete, as its builder refuses to assign twice to a seal)
+#[cfg(feature = "_online")]
+pub fn mock_spam_recipient_assignments(mut transition: Transition) -> Transition {
+    let Some((num, amount)) = MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take() else {
+        return transition;
+    };
+    println!("mocking {num} additional recipient assignments of amount {amount}");
+    let Some(TypedAssigns::Fungible(assignments)) = transition.assignments.get_mut(&OS_ASSET)
+    else {
+        panic!("transition has no fungible assignments");
+    };
+    let (idx, seal, recipient_amount) = assignments
+        .iter()
+        .enumerate()
+        .find_map(|(i, a)| match a.seal {
+            BuilderSeal::Concealed(seal) => Some((i, seal, a.state.as_u64())),
+            BuilderSeal::Revealed(_) => None,
+        })
+        .unwrap();
+    let spam_total = (num as u64)
+        .checked_mul(amount)
+        .expect("spam total overflows u64");
+    assert!(recipient_amount > spam_total);
+    assignments.get_mut(idx).unwrap().state = RevealedValue::new(recipient_amount - spam_total);
+    for _ in 0..num {
+        assignments
+            .push(Assign {
+                seal: BuilderSeal::Concealed(seal),
+                state: RevealedValue::new(amount),
+            })
+            .unwrap();
+    }
+    transition
+}
+
+/// Maximum number of allocations of an asset a UTXO can hold to use instead of
+/// `MAX_UTXO_ASSET_ALLOCATIONS`, if set.
+#[cfg(feature = "_online")]
+pub fn mock_max_utxo_asset_allocations() -> Option<usize> {
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.with_borrow(|m| *m)
 }
 
 #[cfg(feature = "_online")]
@@ -591,6 +626,8 @@ mod issue_asset_ifa;
 mod issue_asset_nia;
 #[cfg(feature = "electrum")]
 mod issue_asset_uda;
+#[cfg(feature = "electrum")]
+mod link;
 #[cfg(feature = "electrum")]
 mod list_assets;
 #[cfg(feature = "electrum")]

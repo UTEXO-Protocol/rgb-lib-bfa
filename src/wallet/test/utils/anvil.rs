@@ -60,9 +60,11 @@ fn forge_create(target: &str, constructor_args: &[String]) -> DeployedContract {
         s!("/contracts"),
         s!("--remappings=@openzeppelin/=/tmp/lib/openzeppelin-contracts/"),
         s!("--broadcast"),
-        s!("--constructor-args"),
     ]);
-    args.extend(constructor_args.iter().cloned());
+    if !constructor_args.is_empty() {
+        args.push(s!("--constructor-args"));
+        args.extend(constructor_args.iter().cloned());
+    }
 
     let output = Command::new("docker")
         .stdin(Stdio::null())
@@ -134,7 +136,52 @@ fn ensure_openzeppelin_installed() {
 ///
 /// `token` is the ERC-20 address the bridge will accept.
 pub(crate) fn deploy_bridge(token: &str) -> DeployedContract {
+    ensure_arbsys_installed();
     forge_create("MinimalBridge.sol:MinimalBridge", &[token.to_string()])
+}
+
+/// Run `cast` with the given arguments in the anvil container, returning its trimmed stdout.
+fn cast(cast_args: &[String]) -> String {
+    let mut args = anvil_exec();
+    args.push(s!("cast"));
+    args.extend(cast_args.iter().cloned());
+    args.extend([s!("--rpc-url"), EVM_RPC_URL.to_string()]);
+
+    let output = Command::new("docker")
+        .stdin(Stdio::null())
+        .arg("compose")
+        .args(&args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run cast {}: {e}", cast_args[0]));
+
+    assert!(
+        output.status.success(),
+        "cast {} failed: {}",
+        cast_args[0],
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    String::from_utf8(output.stdout)
+        .expect("invalid utf8 from cast")
+        .trim()
+        .to_string()
+}
+
+/// Install the MockArbSys code at the address of the Arbitrum system precompile (idempotent),
+/// which the MinimalBridge contract reads the block number of a lock from: anvil doesn't have it.
+fn ensure_arbsys_installed() {
+    static INSTALL_ARBSYS: std::sync::Once = std::sync::Once::new();
+
+    INSTALL_ARBSYS.call_once(|| {
+        let mock = forge_create("MockArbSys.sol:MockArbSys", &[]);
+        let code = cast(&[s!("code"), mock.address]);
+        cast(&[
+            s!("rpc"),
+            s!("anvil_setCode"),
+            s!("0x0000000000000000000000000000000000000064"),
+            code,
+        ]);
+    });
 }
 
 /// Deploy the RgbRejectList contract on anvil and return contract info.
@@ -281,7 +328,8 @@ pub(crate) fn erc20_approve(token: &str, spender: &str, amount: u64) {
 
 /// Call `fundsIn` on the MinimalBridge contract to lock ERC-20 tokens.
 ///
-/// `opid` is the 64-char hex RGB operation ID (used as `operationId`).
+/// `opid` is the 64-char hex RGB operation ID (used as `operationId`). The lock has no deadline
+/// (`beforeBlock` is the maximum block).
 pub(crate) fn bridge_funds_in(bridge: &str, amount: u64, opid: &str) {
     let operation_id = format!("0x{opid}");
 
@@ -290,9 +338,10 @@ pub(crate) fn bridge_funds_in(bridge: &str, amount: u64, opid: &str) {
         s!("cast"),
         s!("send"),
         bridge.to_string(),
-        s!("fundsIn(uint256,uint256)"),
+        s!("fundsIn(uint256,uint256,uint64)"),
         amount.to_string(),
         operation_id,
+        u64::MAX.to_string(),
         s!("--rpc-url"),
         EVM_RPC_URL.to_string(),
         s!("--private-key"),
@@ -337,4 +386,18 @@ pub(crate) fn evm_mine(blocks: u64) {
         "cast rpc anvil_mine failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Number of the latest block on anvil.
+pub(crate) fn evm_block_number() -> u64 {
+    let block = cast(&[s!("block-number")]);
+    block
+        .parse()
+        .unwrap_or_else(|e| panic!("could not parse block number from {block:?}: {e}"))
+}
+
+/// A block for a mint to commit to, leaving its lock [`MINT_LOCK_BLOCKS`] blocks after the latest
+/// one.
+pub(crate) fn default_before_block() -> u64 {
+    evm_block_number() + MINT_LOCK_BLOCKS
 }

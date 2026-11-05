@@ -35,6 +35,10 @@ struct StoredSweep {
     consignments: Vec<(String, Vec<u8>)>,
     beneficiaries: Vec<(String, Vec<SecretSeal>)>,
     min_confirmations: u8,
+    // bfa.5 strips commitment metadata from signing PSBTs. Keep the entropy in the
+    // protected journal; older preparations can still read it from the PSBT map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commitment_entropy: Option<u64>,
 }
 
 fn invalid(details: impl Into<String>) -> Error {
@@ -71,10 +75,9 @@ impl StoredSweep {
         }
         // Bind the entire decoded fascia to the actual transaction commitment, independently
         // of the journal hash. A self-consistent replacement payload must not substitute proof.
-        let entropy = psbt
-            .outputs
-            .iter()
-            .find_map(|output| output.mpc_entropy())
+        let entropy = record
+            .commitment_entropy
+            .or_else(|| psbt.outputs.iter().find_map(|output| output.mpc_entropy()))
             .ok_or_else(|| invalid("prepared sweep is missing commitment entropy"))?;
         let mut messages = BTreeMap::new();
         for (contract, bundle) in fascia.bundles() {
@@ -121,12 +124,25 @@ impl StoredSweep {
                 .get(&contract)
                 .ok_or_else(|| invalid("prepared proof has an unexpected contract"))?;
             let bundle_id = expected.bundle_id();
-            let terminals = transfer
-                .terminals
-                .get(&bundle_id)
-                .ok_or_else(|| invalid("prepared proof omits the prepared bundle"))?;
-            let seals: BTreeSet<SecretSeal> = terminals
-                .into_iter()
+            let expected_ops: BTreeSet<_> = expected
+                .known_transitions
+                .iter()
+                .map(|kt| kt.opid)
+                .collect();
+            if expected_ops.is_empty()
+                || transfer.terminal_ops() != expected_ops
+                || expected.known_transitions.iter().any(|kt| {
+                    kt.transition.transition_type != TS_TRANSFER
+                        || !kt.transition.globals.is_empty()
+                })
+            {
+                return Err(invalid("prepared proof has different terminal operations"));
+            }
+            let seals: BTreeSet<SecretSeal> = expected
+                .known_transitions
+                .iter()
+                .flat_map(|kt| kt.transition.assignments.values())
+                .flat_map(|assignments| assignments.seals())
                 .map(|seal| seal.to_secret_seal())
                 .collect();
             let expected_seals: BTreeSet<SecretSeal> = beneficiaries
@@ -135,7 +151,7 @@ impl StoredSweep {
                 .iter()
                 .copied()
                 .collect();
-            if transfer.terminals.len() != 1 || seals != expected_seals || seals.is_empty() {
+            if seals != expected_seals || seals.is_empty() {
                 return Err(invalid("prepared proof has different beneficiaries"));
             }
             let matching: Vec<_> = transfer
@@ -247,12 +263,11 @@ fn unsigned_layout(psbt: &Psbt) -> Result<(Psbt, bool), Error> {
         if !witness.script_pubkey.is_witness_program() || input.redeem_script.is_some() {
             return Err(invalid("sweep inputs must be native SegWit"));
         }
-        if let Some(previous) = &input.non_witness_utxo {
-            if previous.compute_txid() != txin.previous_output.txid
-                || previous.output.get(txin.previous_output.vout as usize) != Some(witness)
-            {
-                return Err(invalid("sweep previous output does not match witness_utxo"));
-            }
+        if let Some(previous) = &input.non_witness_utxo
+            && (previous.compute_txid() != txin.previous_output.txid
+                || previous.output.get(txin.previous_output.vout as usize) != Some(witness))
+        {
+            return Err(invalid("sweep previous output does not match witness_utxo"));
         }
     }
     let mut working = psbt.clone();
@@ -320,12 +335,10 @@ fn receive_scripts(txn: &DbTxn) -> Result<HashSet<String>, Error> {
                 transfer.recipient_type,
                 Some(RecipientTypeFull::Witness { .. })
             )
+            && let Some(recipient) = transfer.recipient_id
+            && let Some(script) = script_buf_from_recipient_id(recipient)?
         {
-            if let Some(recipient) = transfer.recipient_id {
-                if let Some(script) = script_buf_from_recipient_id(recipient)? {
-                    scripts.insert(script.to_hex_string());
-                }
-            }
+            scripts.insert(script.to_hex_string());
         }
     }
     Ok(scripts)
@@ -515,7 +528,7 @@ impl Wallet {
         }) {
             return Err(invalid("sweep inputs overlap another reserved operation"));
         }
-        let stock = self.rgb_stock(&txn)?;
+        let stock = self.rgb_stock(txn)?;
         let assigning: BTreeSet<ContractId> = stock
             .assignments_by_contract(inputs.iter().copied())?
             .into_keys()
@@ -527,7 +540,7 @@ impl Wallet {
                 "sweep must include every contract assigned to its inputs",
             ));
         }
-        let receives = receive_scripts(&txn)?;
+        let receives = receive_scripts(txn)?;
         let mut spent = BTreeMap::new();
         for (contract, coloring) in &coloring_info.asset_info_map {
             let schema = AssetSchema::get_from_contract_id(*contract, &stock)?;
@@ -595,17 +608,22 @@ impl Wallet {
             spent.insert(*contract, by_outpoint);
         }
         for (input, txin) in working.inputs.iter().zip(&working.unsigned_tx.input) {
-            if let Some(local) = self.bdk_wallet().get_utxo(txin.previous_output) {
-                if Some(&local.txout) != input.witness_utxo.as_ref() {
-                    return Err(invalid("sweep witness_utxo differs from the wallet input"));
-                }
+            if let Some(local) = self.bdk_wallet().get_utxo(txin.previous_output)
+                && Some(&local.txout) != input.witness_utxo.as_ref()
+            {
+                return Err(invalid("sweep witness_utxo differs from the wallet input"));
             }
         }
         // The commitment host is already inserted, so color_psbt cannot rebuild/erase PSBT maps.
+        let entropy = coloring_info
+            .static_blinding
+            .unwrap_or_else(|| rand::rng().random());
+        let mut commitment_coloring = coloring_info.clone();
+        commitment_coloring.static_blinding = Some(entropy);
         let (fascia, beneficiaries) =
-            self.color_psbt_in_txn(txn, &mut working, coloring_info.clone())?;
+            self.color_psbt_in_txn(txn, &mut working, commitment_coloring)?;
         let txid = working.unsigned_tx.compute_txid().to_string();
-        let mut stock = self.rgb_stock(&txn)?;
+        let mut stock = self.rgb_stock(txn)?;
         let mut transfers = Vec::new();
         let mut serialized = Vec::new();
         for (contract, seals) in &beneficiaries {
@@ -653,10 +671,10 @@ impl Wallet {
             incoming: ActiveValue::Set(false),
             ..Default::default()
         })?;
-        self.reserve_colored_txos(&txn, &working, batch)?;
+        self.reserve_colored_txos(txn, &working, batch)?;
         persist_projection(
             self,
-            &txn,
+            txn,
             batch,
             &working,
             &coloring_info,
@@ -683,13 +701,14 @@ impl Wallet {
                 })
                 .collect(),
             min_confirmations,
+            commitment_entropy: Some(entropy),
         })
         .map_err(InternalError::from)?;
         txn.prepared_sweep_insert(batch, &txid, payload)?;
         // Protect matching receives before any handoff/signing. Their status and balance remain
         // unchanged; a later out-of-band provide still performs normal proof admission.
         bind_sweep_receives(self, txn, &working, &coloring_info, shift)?;
-        self.update_backup_info(&txn, false)?;
+        self.update_backup_info(txn, false)?;
         Ok((
             working,
             ColorPrepareResult {
@@ -1501,6 +1520,24 @@ mod tests {
             let (_, _, payload) = txn.prepared_sweep_read(batch).unwrap();
             let (_, _, fascia, _) = StoredSweep::decode(&payload, &txid).unwrap();
             txn.commit().unwrap();
+            let mut changed: StoredSweep = serde_json::from_slice(&payload).unwrap();
+            let entropy = changed.commitment_entropy.unwrap();
+            changed.commitment_entropy = Some(entropy ^ 1);
+            assert!(StoredSweep::decode(&serde_json::to_vec(&changed).unwrap(), &txid).is_err());
+            changed.commitment_entropy = None;
+            assert!(StoredSweep::decode(&serde_json::to_vec(&changed).unwrap(), &txid).is_err());
+            // Retain admission of the previous journal representation, where the
+            // exact same entropy lived in the signing PSBT's commitment host.
+            let mut legacy_psbt = psbt.clone();
+            let host = legacy_psbt
+                .unsigned_tx
+                .output
+                .iter()
+                .position(|output| output.script_pubkey.is_op_return())
+                .unwrap();
+            legacy_psbt.outputs[host].set_mpc_entropy(entropy).unwrap();
+            changed.psbt = legacy_psbt.to_string();
+            StoredSweep::decode(&serde_json::to_vec(&changed).unwrap(), &txid).unwrap();
             assert!(matches!(
                 wallet.consume_fascia(fascia.clone(), None),
                 Err(Error::WrongOperation { .. })

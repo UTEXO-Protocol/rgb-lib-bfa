@@ -3,6 +3,7 @@ use super::*;
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn success() {
     initialize();
@@ -58,7 +59,7 @@ fn success() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -100,10 +101,10 @@ fn success() {
     let mint = received_mint(&party).unwrap();
     assert_eq!(mint.opid, res.details.opid);
     assert_eq!(mint.amount, AMOUNT);
-    // the inspected mint commits to the external chain block the recipient expects the lock after
+    // the inspected mint commits to the external chain block the lock has to be included before
     assert_eq!(
         mint_metadata,
-        vec![TransitionMetadata::AfterBlock(mint.after_block)]
+        vec![TransitionMetadata::BeforeBlock(mint.before_block)]
     );
     assert_eq!(mint.evm_chain_id, ANVIL_CHAIN_ID);
     assert_eq!(
@@ -305,7 +306,7 @@ fn success() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data_2.public_key.clone()),
-        expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -373,7 +374,7 @@ fn success() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data_3.public_key.clone()),
-        expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let result = party.mint_begin_result(party.online, &asset.asset_id, recipient);
@@ -382,6 +383,7 @@ fn success() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn witness_recipient() {
     initialize();
@@ -405,7 +407,7 @@ fn witness_recipient() {
         }),
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -439,6 +441,7 @@ fn witness_recipient() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn revalidate_received_mint() {
     initialize();
@@ -457,7 +460,7 @@ fn revalidate_received_mint() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -491,8 +494,9 @@ fn revalidate_received_mint() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
-fn save_new_asset_mint_scan_window() {
+fn save_new_asset_mint() {
     initialize();
 
     let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
@@ -509,7 +513,7 @@ fn save_new_asset_mint_scan_window() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -536,21 +540,18 @@ fn save_new_asset_mint_scan_window() {
     let result = save_new_asset(&rcv_party);
     assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
 
-    // the lock is finalized, but outside the scanned blocks: the event follows the block the mint
-    // commits to, so it's never within 0 blocks from it, and the mint will never be confirmed
+    // the lock isn't finalized yet
     erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
     bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    evm_mine(EVM_FINALITY_DEPTH);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
     let result = save_new_asset(&rcv_party);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-    assert_matches!(result, Err(Error::MintEventOutOfScanWindow { opid, max_scan_blocks: 0 }) if opid == res.details.opid);
+    assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == res.details.opid);
 }
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
-fn history_mint_scan_limit() {
+fn lock_before_block() {
     initialize();
 
     let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
@@ -558,106 +559,105 @@ fn history_mint_scan_limit() {
 
     let mut party = get_funded_party!();
     let mut rcv_party = get_funded_party!();
-    let mut rcv_party_2 = get_funded_party!();
-    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
-
-    // mint to a wallet
-    let receive_data = rcv_party.blind_receive();
-    let recipient = Recipient {
+    let rcv_party_2 = get_funded_party!();
+    let asset = party.issue_asset_bfa(3, bridge_contract.address.clone(), None);
+    let mint_recipient = |receive_data: &ReceiveData| Recipient {
         assignment: Assignment::Fungible(AMOUNT),
         recipient_id: receive_data.recipient_id.clone(),
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
-    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
-    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
-    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    evm_mine(EVM_FINALITY_DEPTH);
-    rcv_party.wait_for_refresh(None);
-    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
-    party.mint_end(party.online, signed_psbt);
-    mine(false);
-    rcv_party.wait_for_refresh(None);
-    assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, AMOUNT);
 
-    // send it on, to a wallet scanning no block after the one the mint commits to: the mint in
-    // the history is never found within the limit, so the consignment is refused rather than
-    // waited for
-    let receive_data_2 = rcv_party_2.blind_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(AMOUNT),
-            recipient_id: receive_data_2.recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            public_key: Some(receive_data_2.public_key.clone()),
-            expiration_timestamp: Some(receive_data_2.expiration_timestamp),
-            encryption: Encryption::Optional,
-        }],
-    )]);
-    rcv_party.send_retry(&recipient_map);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
-    rcv_party_2.refresh_all();
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
-    assert!(rcv_party_2.check_test_transfer_status_recipient(
-        &receive_data_2.recipient_id,
-        TransferStatus::Failed
-    ));
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[serial(evm)]
-fn terminal_mint_scan_limit() {
-    initialize();
-
-    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
-    let bridge_contract = deploy_bridge(&token_contract.address);
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
-
-    // the lock is made and finalized, but the recipient scans no block after the one the mint
-    // commits to: the mint is refused, as whoever the asset is sent to next would refuse it
+    // the lock is made, and finalized, but not before the block the mint commits to
     let receive_data = rcv_party.blind_receive();
-    let recipient = Recipient {
-        assignment: Assignment::Fungible(AMOUNT),
-        recipient_id: receive_data.recipient_id.clone(),
-        witness_data: None,
-        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
-        encryption: Encryption::Optional,
-    };
-    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
+    let before_block = evm_block_number() + 3;
+    let res = party
+        .mint_begin_before_result(
+            party.online,
+            &asset.asset_id,
+            mint_recipient(&receive_data),
+            before_block,
+        )
+        .unwrap();
+    let txid = Psbt::from_str(&res.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    let consignment = RgbTransfer::load_file(
+        party
+            .wallet
+            .get_send_consignment_path(&asset.asset_id, &txid),
+    )
+    .unwrap();
+    evm_mine(5);
     erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
     bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
     evm_mine(EVM_FINALITY_DEPTH);
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(Some(0));
+    // the mint will never be confirmed, for anyone: its recipient refuses it, it's not valid and
+    // it cannot be ended
     rcv_party.refresh_all();
-    MOCK_MAX_MINT_SCAN_BLOCKS.replace(None);
     assert!(
         rcv_party.check_test_transfer_status_recipient(
             &receive_data.recipient_id,
             TransferStatus::Failed
         )
     );
+    let result = rcv_party_2
+        .wallet
+        .save_new_asset(rcv_party_2.online, consignment, txid.clone());
+    assert_matches!(result, Err(Error::MintEventExpired { opid, before_block: b }) if opid == res.details.opid && b == before_block);
+    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
+    let result = party.mint_end_result(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::MintEventExpired { opid, before_block: b }) if opid == res.details.opid && b == before_block);
+    // ending it fails it, releasing its inputs
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
+
+    // no lock is made and the blocks before the one the mint commits to are all finalized: the
+    // mint is refused right away, without waiting for the invoice to expire
+    let receive_data = rcv_party.blind_receive();
+    let before_block = evm_block_number() + 3;
+    let res = party
+        .mint_begin_before_result(
+            party.online,
+            &asset.asset_id,
+            mint_recipient(&receive_data),
+            before_block,
+        )
+        .unwrap();
+    let txid = Psbt::from_str(&res.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    rcv_party.refresh_all();
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+    evm_mine(3 + EVM_FINALITY_DEPTH);
+    rcv_party.refresh_all();
     assert!(
-        rcv_party
-            .wallet
-            .get_received_mint(receive_data.recipient_id.clone())
-            .unwrap()
-            .is_none()
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Failed
+        )
     );
+    // the sender's refresh leaves it pending, only ending it fails it
+    party.refresh_all();
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Initiated));
+    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
+    let result = party.mint_end_result(party.online, signed_psbt);
+    assert_matches!(result, Err(Error::MintEventExpired { opid, before_block: b }) if opid == res.details.opid && b == before_block);
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
 }
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn concurrent_mints() {
     initialize();
@@ -704,7 +704,7 @@ fn concurrent_mints() {
             }),
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            expiration_timestamp: None,
             encryption: Encryption::Optional,
         };
         let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -756,6 +756,7 @@ fn concurrent_mints() {
 /// confirmations.
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn mint_end_after_fail() {
     initialize();
@@ -778,7 +779,7 @@ fn mint_end_after_fail() {
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            expiration_timestamp: None,
             encryption: Encryption::Optional,
         };
         let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -789,15 +790,35 @@ fn mint_end_after_fail() {
         (res.batch_transfer_idx, signed_psbt)
     };
 
-    // a failed mint is not ended, even if its lock is on the external chain
-    let (batch_transfer_idx, signed_psbt) = mint_begin(&mut party, &mut rcv_party);
+    // a failed mint is not ended: one whose lock has expired, failed by the first mint_end
+    let receive_data = rcv_party.blind_receive();
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+    let res = party
+        .mint_begin_before_result(
+            party.online,
+            &asset.asset_id,
+            recipient,
+            evm_block_number() + 3,
+        )
+        .unwrap();
+    evm_mine(3 + EVM_FINALITY_DEPTH);
+    let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
     let txid = Psbt::from_str(&signed_psbt)
         .unwrap()
         .extract_tx()
         .unwrap()
         .compute_txid()
         .to_string();
-    assert!(party.fail_transfers_single(batch_transfer_idx));
+    let result = party.mint_end_result(party.online, signed_psbt.clone());
+    assert_matches!(result, Err(Error::MintEventExpired { .. }));
     assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Failed));
     let result = party.mint_end_result(party.online, signed_psbt);
     assert_matches!(result, Err(Error::CannotEndTransfer { txid: t }) if t == txid);
@@ -820,6 +841,7 @@ fn mint_end_after_fail() {
 // to address reuse.
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn bdk_changes_persisted() {
     initialize();
@@ -870,7 +892,7 @@ fn bdk_changes_persisted() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -896,49 +918,7 @@ fn bdk_changes_persisted() {
 
 #[cfg(feature = "electrum")]
 #[test]
-#[serial(evm)]
-fn old_after_block() {
-    initialize();
-
-    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
-    let bridge_contract = deploy_bridge(&token_contract.address);
-
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-    let asset = party.issue_asset_bfa(3, bridge_contract.address.clone(), None);
-
-    // the latest finalized block when the mint begins precedes the invoice (by the finality
-    // depth): with no grace, the recipient refuses the mint before scanning for its lock
-    MOCK_MINT_AFTER_BLOCK_GRACE.replace(Some(0));
-    let receive_data = rcv_party.blind_receive();
-    let recipient = Recipient {
-        assignment: Assignment::Fungible(AMOUNT),
-        recipient_id: receive_data.recipient_id.clone(),
-        witness_data: None,
-        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
-        encryption: Encryption::Optional,
-    };
-    party.mint_begin(party.online, &asset.asset_id, recipient);
-    rcv_party.refresh_all();
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &receive_data.recipient_id,
-            TransferStatus::Failed
-        )
-    );
-    assert!(
-        rcv_party
-            .wallet
-            .get_received_mint(receive_data.recipient_id.clone())
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[cfg(feature = "electrum")]
-#[test]
+#[parallel]
 #[serial(evm)]
 fn received_mint_amount() {
     initialize();
@@ -973,7 +953,7 @@ fn received_mint_amount() {
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            expiration_timestamp: None,
             encryption: Encryption::Optional,
         };
         party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -1013,13 +993,13 @@ fn received_mint_amount() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
-fn lock_deadline() {
+fn invoice_expiration_ignored() {
     initialize();
 
-    // allow mints to invoices expiring within seconds
+    // allow invoices expiring within seconds
     MOCK_CLOCK_SKEW_MARGIN.replace(Some(1));
-    MOCK_MINT_LOCK_WINDOW.replace(Some(1));
 
     let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
     let bridge_contract = deploy_bridge(&token_contract.address);
@@ -1028,57 +1008,49 @@ fn lock_deadline() {
     let mut rcv_party = get_funded_party!();
     let asset = party.issue_asset_bfa(3, bridge_contract.address.clone(), None);
 
-    // mint to an invoice expiring shortly, its expiration being the deadline for the lock, and
-    // let the recipient check it
-    let deadline_secs = 40;
-    let mint_to_expiring_invoice = |party: &mut SinglesigParty,
-                                    rcv_party: &mut SinglesigParty|
-     -> (MintBeginResult, ReceiveData, i64) {
-        let deadline = now().unix_timestamp() + deadline_secs;
-        let receive_data = rcv_party.blind_receive_asset_expiry(None, Some(deadline as u64));
-        let recipient = Recipient {
-            assignment: Assignment::Fungible(AMOUNT),
-            recipient_id: receive_data.recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
-            encryption: Encryption::Optional,
-        };
-        let res = party
+    // mint to an invoice expiring shortly and let the recipient check the mint
+    let expiration = now().unix_timestamp() + 40;
+    let receive_data = rcv_party.blind_receive_asset_expiry(None, Some(expiration as u64));
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
+    let txid = Psbt::from_str(&res.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
+    rcv_party.refresh_all();
+    assert!(
+        rcv_party
             .wallet
-            .mint_begin(
-                party.online,
-                asset.asset_id.clone(),
-                recipient,
-                FEE_RATE,
-                MIN_CONFIRMATIONS,
-                PROXY_ENDPOINT.clone(),
-            )
-            .unwrap();
-        rcv_party.refresh_all();
-        assert!(
-            rcv_party
-                .wallet
-                .get_received_mint(receive_data.recipient_id.clone())
-                .unwrap()
-                .is_some()
-        );
-        (res, receive_data, deadline)
-    };
-    let sleep_past = |deadline: i64| {
-        let secs = std::cmp::max(deadline - now().unix_timestamp() + 2, 0) as u64;
-        std::thread::sleep(Duration::from_secs(secs));
-    };
+            .get_received_mint(receive_data.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
 
-    // a lock included by the deadline, but finalized after it, is waited for: neither side fails
-    // the mint, which is then broadcast past the deadline and completes
-    let (res, receive_data, deadline) = mint_to_expiring_invoice(&mut party, &mut rcv_party);
-    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
-    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
-    sleep_past(deadline);
+    // once the mint has been checked, the invoice expiration no longer applies: past it, neither
+    // side fails the mint, its only expiration being the block its lock has to be included before
+    let secs = std::cmp::max(expiration - now().unix_timestamp() + 2, 0) as u64;
+    std::thread::sleep(Duration::from_secs(secs));
     assert!(!rcv_party.fail_transfers_all());
     assert!(!party.fail_transfers_all());
+    rcv_party.refresh_all();
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Initiated));
+
+    // the lock is then made, and the mint completes past the invoice expiration
+    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
+    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
     evm_mine(EVM_FINALITY_DEPTH);
     rcv_party.wait_for_refresh(None);
     let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
@@ -1092,27 +1064,186 @@ fn lock_deadline() {
         )
     );
     assert_eq!(rcv_party.get_asset_balance(&asset.asset_id).settled, AMOUNT);
-    // the minter settles the mint
     party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+}
 
-    // a lock included after the deadline is too late: the mint is not broadcast and both sides
-    // fail it
-    let (res, receive_data, deadline) = mint_to_expiring_invoice(&mut party, &mut rcv_party);
-    sleep_past(deadline);
-    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
-    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
+// finalize the lock of the mint `res` paying `recipient_id`, end the mint and check it settles
+#[cfg(feature = "electrum")]
+fn settle_locked_mint(
+    party: &mut SinglesigParty,
+    rcv_party: &mut SinglesigParty,
+    asset_id: &str,
+    recipient_id: &str,
+    res: MintBeginResult,
+) {
+    let txid = Psbt::from_str(&res.psbt)
+        .unwrap()
+        .unsigned_tx
+        .compute_txid()
+        .to_string();
     evm_mine(EVM_FINALITY_DEPTH);
+    rcv_party.wait_for_refresh(None);
     let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
-    let result = party.mint_end_result(party.online, signed_psbt);
-    assert_matches!(result, Err(Error::TransferExpired));
-    assert!(rcv_party.fail_transfers_all());
-    assert!(
-        rcv_party.check_test_transfer_status_recipient(
-            &receive_data.recipient_id,
-            TransferStatus::Failed
+    party.mint_end(party.online, signed_psbt);
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_recipient(recipient_id, TransferStatus::Settled));
+    assert_eq!(rcv_party.get_asset_balance(asset_id).settled, AMOUNT);
+    party.wait_for_refresh(Some(asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+}
+
+// a mint whose lock is made before its recipient checks it (e.g. by a bridge locking right away),
+// first checked by the refresh fail_transfers makes on the receive
+#[cfg(feature = "electrum")]
+fn mint_locked_before_check(
+    party: &mut SinglesigParty,
+    recipient: Recipient,
+    asset_id: &str,
+    token_contract: &str,
+    bridge_contract: &str,
+) -> (MintBeginResult, u64) {
+    let res = party.mint_begin(party.online, asset_id, recipient);
+    erc20_approve(token_contract, bridge_contract, AMOUNT);
+    let lock_from = evm_block_number();
+    bridge_funds_in(bridge_contract, AMOUNT, &res.details.opid);
+    (res, lock_from)
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+#[serial(evm)]
+fn mint_checked_by_fail_all() {
+    initialize();
+
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
+
+    // a witness invoice (witness receives have no retention grace) expiring shortly
+    let expiration = now().unix_timestamp() + 40;
+    let receive_data = rcv_party
+        .wallet
+        .witness_receive(
+            Some(rcv_party.online),
+            None,
+            Assignment::Any,
+            expiration as u64,
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            None,
         )
+        .unwrap();
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: Some(WitnessData {
+            amount_sat: 1000,
+            blinding: None,
+        }),
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+    let (res, lock_from) = mint_locked_before_check(
+        &mut party,
+        recipient,
+        &asset.asset_id,
+        &token_contract.address,
+        &bridge_contract.address,
     );
-    assert!(party.fail_transfers_all());
+
+    // past the invoice expiration, failing the expired transfers checks the mint and doesn't fail it
+    let secs = std::cmp::max(expiration - now().unix_timestamp() + 2, 0) as u64;
+    std::thread::sleep(Duration::from_secs(secs));
+    let failed = rcv_party.fail_transfers_all();
+    // the lock is not final, so the refresh cannot settle the receive
+    assert!(evm_block_number() < lock_from + EVM_FINALITY_DEPTH);
+    assert!(!failed);
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+    assert!(
+        rcv_party
+            .wallet
+            .get_received_mint(receive_data.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+
+    // the mint then completes past the invoice expiration
+    settle_locked_mint(
+        &mut party,
+        &mut rcv_party,
+        &asset.asset_id,
+        &receive_data.recipient_id,
+        res,
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+#[serial(evm)]
+fn mint_checked_by_fail_single() {
+    initialize();
+
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
+
+    // a blind invoice, which can be failed before its expiration
+    let receive_data = rcv_party.blind_receive();
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+    let (res, _) = mint_locked_before_check(
+        &mut party,
+        recipient,
+        &asset.asset_id,
+        &token_contract.address,
+        &bridge_contract.address,
+    );
+
+    // failing the receive checks the mint and is then denied
+    let result = rcv_party.fail_transfers(Some(receive_data.batch_transfer_idx), false, false);
+    assert_matches!(result, Err(Error::CannotFailBatchTransfer));
+    assert!(rcv_party.check_test_transfer_status_recipient(
+        &receive_data.recipient_id,
+        TransferStatus::WaitingCounterparty
+    ));
+    assert!(
+        rcv_party
+            .wallet
+            .get_received_mint(receive_data.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+
+    // the mint then completes
+    settle_locked_mint(
+        &mut party,
+        &mut rcv_party,
+        &asset.asset_id,
+        &receive_data.recipient_id,
+        res,
+    );
 }
 
 #[cfg(feature = "electrum")]
@@ -1140,6 +1271,7 @@ fn fail() {
         Online { id: 0 },
         s!(""),
         offline_recipient,
+        0,
         FEE_RATE,
         MIN_CONFIRMATIONS,
         PROXY_ENDPOINT.clone(),
@@ -1161,7 +1293,7 @@ fn fail() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
 
@@ -1192,12 +1324,21 @@ fn fail() {
     zero_recipient.assignment = Assignment::Fungible(0);
     let result = party.mint_begin_result(party.online, &asset_bfa.asset_id, zero_recipient);
     assert_matches!(result, Err(Error::InvalidAmountZero));
+    // - check before_block: it has to leave a block for the lock after the latest one
+    let result = party.mint_begin_before_result(
+        party.online,
+        &asset_bfa.asset_id,
+        recipient.clone(),
+        evm_block_number() + 1,
+    );
+    assert_matches!(result, Err(Error::InvalidBeforeBlock { .. }));
     // - check fee_rate
     //   - low
     let result = party.wallet.mint_begin(
         party.online,
         asset_bfa.asset_id.clone(),
         recipient.clone(),
+        default_before_block(),
         0,
         MIN_CONFIRMATIONS,
         PROXY_ENDPOINT.clone(),
@@ -1208,22 +1349,20 @@ fn fail() {
         party.online,
         asset_bfa.asset_id.clone(),
         recipient.clone(),
+        default_before_block(),
         u64::MAX,
         MIN_CONFIRMATIONS,
         PROXY_ENDPOINT.clone(),
     );
     assert_matches!(result, Err(Error::InvalidFeeRate { details: m }) if m == FEE_MSG_OVER);
-    // - invoice leaving too little time for the lock
-    let short_expiration = now().unix_timestamp() as u64 + MIN_MINT_LOCK_WINDOW_SECS as u64 - 60;
-    let short_receive_data = party.blind_receive_asset_expiry(None, Some(short_expiration));
-    let short_recipient = Recipient {
-        recipient_id: short_receive_data.recipient_id.clone(),
-        public_key: Some(short_receive_data.public_key.clone()),
-        expiration_timestamp: Some(short_receive_data.expiration_timestamp),
+    // - recipient with an expiration (a mint expires by the block its lock has to be included
+    //   before only)
+    let expiring_recipient = Recipient {
+        expiration_timestamp: Some(receive_data.expiration_timestamp),
         ..recipient.clone()
     };
-    let result = party.mint_begin_result(party.online, &asset_bfa.asset_id, short_recipient);
-    assert_matches!(result, Err(Error::InvoiceExpired));
+    let result = party.mint_begin_result(party.online, &asset_bfa.asset_id, expiring_recipient);
+    assert_matches!(result, Err(Error::InvalidRecipientData { details: m }) if m == "a mint recipient cannot have an expiration");
 
     // mint_begin errors
     // - inexistent asset
@@ -1313,6 +1452,8 @@ fn fail() {
             ANVIL_CHAIN_ID + 1,
             FAKE_EVM_ADDRESS.to_string(),
             None,
+            false,
+            None,
         )
         .unwrap();
     let result =
@@ -1338,43 +1479,24 @@ fn fail() {
     let signed_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
     let result = party.mint_end_result(party.online, signed_psbt.clone());
     assert_matches!(result, Err(Error::MintEventNotFound { opid }) if opid == expected_opid);
-    // - expired transfer (its deadline being the invoice expiration): the TX is not broadcast,
-    //   since the recipient may have already failed the transfer
-    assert!(party.fail_transfers_single(res.batch_transfer_idx));
-    // allow mints to invoices expiring within seconds
-    MOCK_CLOCK_SKEW_MARGIN.replace(Some(1));
-    MOCK_MINT_LOCK_WINDOW.replace(Some(1));
-    let expiration_secs: u64 = 5;
-    let invoice_expiration = now().unix_timestamp() as u64 + expiration_secs;
-    let receive_data = party.blind_receive_asset_expiry(None, Some(invoice_expiration));
-    let recipient = Recipient {
-        assignment: Assignment::Fungible(AMOUNT),
-        recipient_id: receive_data.recipient_id.clone(),
-        witness_data: None,
-        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
-        encryption: Encryption::Optional,
-    };
-    let res = party
-        .wallet
-        .mint_begin(
-            party.online,
-            asset_bfa.asset_id.clone(),
-            recipient,
-            FEE_RATE,
-            MIN_CONFIRMATIONS,
-            PROXY_ENDPOINT.clone(),
+    // - the pending mint is left as is, so the mint can be ended later, and it can't be failed
+    //   by fail_transfers, but only by mint_end once its lock has expired
+    assert!(
+        party.check_test_transfer_status_sender(
+            &Psbt::from_str(&signed_psbt)
+                .unwrap()
+                .unsigned_tx
+                .compute_txid()
+                .to_string(),
+            TransferStatus::Initiated
         )
-        .unwrap();
-    let expired_psbt = party.wallet.sign_psbt(res.psbt, None).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(
-        expiration_secs * 1000 + 2000,
-    ));
-    let result = party.mint_end_result(party.online, expired_psbt);
-    assert_matches!(result, Err(Error::TransferExpired));
-    // the expired mint is failed by the expiration-based cleanup
-    assert!(party.fail_transfers_all());
+    );
+    let result =
+        party
+            .wallet
+            .fail_transfers(party.online, Some(res.batch_transfer_idx), false, false);
+    assert_matches!(result, Err(Error::CannotFailBatchTransfer));
+    assert!(!party.fail_transfers_all());
     // - no prior mint_begin
     let psbt_txid = Psbt::from_str(&signed_psbt)
         .unwrap()
@@ -1401,6 +1523,65 @@ fn fail() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
+#[serial(evm)]
+fn fail_received() {
+    initialize();
+
+    let token_contract = deploy_test_erc20("Bridged Token", "BRG", 18, 1_000_000);
+    let bridge_contract = deploy_bridge(&token_contract.address);
+
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+    let asset = party.issue_asset_bfa(2, bridge_contract.address.clone(), None);
+
+    // a receive whose mint hasn't been checked yet is a regular one, failed by fail_transfers
+    let receive_data = rcv_party.blind_receive();
+    assert!(rcv_party.fail_transfers_single(receive_data.batch_transfer_idx));
+
+    // once checked, a received mint is never failed by fail_transfers, with its lock pending
+    // or confirmed (waiting for the broadcast)
+    let receive_data = rcv_party.blind_receive();
+    let recipient = Recipient {
+        assignment: Assignment::Fungible(AMOUNT),
+        recipient_id: receive_data.recipient_id.clone(),
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: None,
+        encryption: Encryption::Optional,
+    };
+    let res = party.mint_begin(party.online, &asset.asset_id, recipient);
+    rcv_party.refresh_all();
+    assert!(
+        rcv_party
+            .wallet
+            .get_received_mint(receive_data.recipient_id.clone())
+            .unwrap()
+            .is_some()
+    );
+    let check_not_failed = |rcv_party: &mut SinglesigParty, status: TransferStatus| {
+        let result = rcv_party.wallet.fail_transfers(
+            rcv_party.online,
+            Some(receive_data.batch_transfer_idx),
+            false,
+            false,
+        );
+        assert_matches!(result, Err(Error::CannotFailBatchTransfer));
+        assert!(!rcv_party.fail_transfers_all());
+        assert!(rcv_party.check_test_transfer_status_recipient(&receive_data.recipient_id, status));
+    };
+    check_not_failed(&mut rcv_party, TransferStatus::WaitingCounterparty);
+    erc20_approve(&token_contract.address, &bridge_contract.address, AMOUNT);
+    bridge_funds_in(&bridge_contract.address, AMOUNT, &res.details.opid);
+    evm_mine(EVM_FINALITY_DEPTH);
+    rcv_party.refresh_all();
+    check_not_failed(&mut rcv_party, TransferStatus::WaitingBroadcast);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
 #[serial(evm)]
 fn send_mint_right() {
     initialize();
@@ -1517,6 +1698,25 @@ fn send_mint_right() {
         .unwrap();
     assert_eq!(rcv_transfer.assignments, vec![Assignment::MintRight]);
 
+    // the received consignment can be inspected, the mint right moved by a propagate transition
+    let inspection = inspect_consignment(
+        rcv_transfer.consignment_path.clone().unwrap(),
+        BundleFilter::All,
+    )
+    .unwrap();
+    assert_eq!(inspection.asset_schema, AssetSchema::Bfa);
+    assert_eq!(inspection.genesis.ticker.as_deref(), Some(TICKER));
+    assert_eq!(inspection.genesis.name, NAME);
+    assert_eq!(inspection.genesis.precision, PRECISION);
+    assert_eq!(inspection.witnesses.len(), 1);
+    let transitions = &inspection.witnesses[0].operations[0].transitions;
+    assert!(!transitions.is_empty());
+    assert!(
+        transitions
+            .iter()
+            .all(|t| t.r#type == TypeOfTransition::Propagate)
+    );
+
     // the receiver now holds the mint rights
     rcv_party.show_unspent_colorings("after receive");
     let unspents = rcv_party.list_unspents(false);
@@ -1542,7 +1742,7 @@ fn send_mint_right() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data_2.public_key.clone()),
-        expiration_timestamp: Some(receive_data_2.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let result = party.mint_begin_result(party.online, &asset.asset_id, recipient);
@@ -1557,7 +1757,7 @@ fn send_mint_right() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data_3.public_key.clone()),
-        expiration_timestamp: Some(receive_data_3.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = rcv_party.mint_begin(rcv_party.online, &asset.asset_id, recipient);
@@ -1605,6 +1805,7 @@ fn send_mint_right() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn reject_list() {
     initialize();
@@ -1636,7 +1837,7 @@ fn reject_list() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party_1.mint_begin(party_1.online, &asset.asset_id, recipient);
@@ -1760,7 +1961,7 @@ fn reject_list() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let res = party_1.mint_begin(party_1.online, &asset.asset_id, recipient);
@@ -1797,7 +1998,7 @@ fn reject_list() {
         witness_data: None,
         transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         public_key: Some(receive_data.public_key.clone()),
-        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        expiration_timestamp: None,
         encryption: Encryption::Optional,
     };
     let result = party_1.mint_begin_result(party_1.online, &asset.asset_id, recipient);
@@ -1809,6 +2010,7 @@ fn reject_list() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn reject_list_multi_right_utxo() {
     initialize();
@@ -1835,7 +2037,7 @@ fn reject_list_multi_right_utxo() {
             witness_data: None,
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
             public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            expiration_timestamp: None,
             encryption: Encryption::Optional,
         };
         let res = party.mint_begin(party.online, &asset.asset_id, recipient);
@@ -1892,6 +2094,7 @@ fn reject_list_multi_right_utxo() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn reject_list_rpc_config() {
     initialize();
@@ -1971,6 +2174,7 @@ fn reject_list_rpc_config() {
 
 #[cfg(feature = "electrum")]
 #[test]
+#[parallel]
 #[serial(evm)]
 fn reject_list_malicious_contract() {
     initialize();

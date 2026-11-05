@@ -460,6 +460,10 @@ pub struct Metadata {
     pub token: Option<Token>,
     /// Reject list URL
     pub reject_list_url: Option<String>,
+    /// ID of the contract the asset is linked from (e.g. the one it replaces), if any
+    pub linked_from_contract: Option<String>,
+    /// ID of the contract the asset has been linked to (e.g. the one replacing it), if any
+    pub linked_to_contract: Option<String>,
 }
 
 /// A Non-Inflatable Asset.
@@ -975,6 +979,8 @@ pub struct AssignmentsCollection {
     pub non_fungible: bool,
     /// Inflation right assignments
     pub inflation: u64,
+    /// Link right assignment
+    pub link: bool,
     /// Mint right assignments
     pub mint: u64,
 }
@@ -1017,6 +1023,9 @@ impl AssignmentsCollection {
             AllocatedState::Data(_) => {
                 self.add_non_fungible();
             }
+            AllocatedState::Void if opout.ty == OS_LINK => {
+                self.link = true;
+            }
             AllocatedState::Void if opout.ty == OS_MINT => {
                 self.add_mint();
             }
@@ -1038,6 +1047,7 @@ impl AssignmentsCollection {
                 needed.inflation.saturating_sub(self.inflation) > 0
             }
             (AllocatedState::Data(_), _) => needed.non_fungible && !self.non_fungible,
+            (AllocatedState::Void, OS_LINK) => needed.link && !self.link,
             (AllocatedState::Void, OS_MINT) => needed.mint.saturating_sub(self.mint) > 0,
             _ => false,
         }
@@ -1054,6 +1064,7 @@ impl AssignmentsCollection {
                 .inflation
                 .checked_sub(needed.inflation)
                 .expect("selected inputs must cover outputs"),
+            link: false,
             mint: self
                 .mint
                 .checked_sub(needed.mint)
@@ -1069,6 +1080,9 @@ impl AssignmentsCollection {
             return false;
         }
         if self.inflation < needed.inflation {
+            return false;
+        }
+        if needed.link && !self.link {
             return false;
         }
         if self.mint < needed.mint {
@@ -1269,6 +1283,9 @@ impl Invoice {
                         Assignment::InflationRight(v.value())
                     }
                     (None, Some(RGB_STATE_INFLATION_ALLOWANCE)) => Assignment::InflationRight(0),
+                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
+                        Assignment::LinkRight
+                    }
                     (Some(InvoiceState::Amount(_)), None) => Assignment::Any,
                     (None, None) => Assignment::Any,
                     (_, _) => {
@@ -1284,6 +1301,9 @@ impl Invoice {
                         Assignment::Fungible(v.value())
                     }
                     (None, Some(RGB_STATE_ASSET_OWNER)) => Assignment::Fungible(0),
+                    (Some(InvoiceState::Void) | None, Some(RGB_STATE_LINK_RIGHT)) => {
+                        Assignment::LinkRight
+                    }
                     (Some(InvoiceState::Void) | None, Some(RGB_STATE_MINT_RIGHT)) => {
                         Assignment::MintRight
                     }
@@ -1428,6 +1448,8 @@ pub enum TransferKind {
     Inflation,
     /// A burn transfer
     Burn,
+    /// A link transfer
+    Link,
     /// A mint transfer, bringing in assets backed by tokens locked on the external chain
     Mint,
 }
@@ -1841,6 +1863,32 @@ pub struct BurnDetails {
     pub burn_reason: Option<String>,
 }
 
+/// The result of a link begin operation.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg(feature = "_online")]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct LinkBeginResult {
+    /// PSBT to inspect and sign
+    pub psbt: String,
+    /// Batch transfer idx, None when `dry_run: true`
+    pub batch_transfer_idx: Option<i32>,
+    /// Operation details
+    pub details: LinkDetails,
+}
+
+/// Details for link operations.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg(feature = "_online")]
+#[cfg_attr(feature = "camel_case", serde(rename_all = "camelCase"))]
+pub struct LinkDetails {
+    /// Path to the strict-encoded fascia file, for inspection
+    pub fascia_path: String,
+    /// Minimum confirmations for the operation
+    pub min_confirmations: u8,
+    /// Entropy used for the merkle tree construction operation
+    pub entropy: u64,
+}
+
 /// The result of an inflate begin operation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[cfg(feature = "_online")]
@@ -1904,8 +1952,8 @@ pub struct ReceivedMint {
     pub opid: String,
     /// Amount minted, which the lock has to match
     pub amount: u64,
-    /// External chain block the lock has to follow
-    pub after_block: u64,
+    /// External chain block the lock has to be included before
+    pub before_block: u64,
     /// EIP-155 chain ID of the EVM chain the asset's bridge contract lives on
     pub evm_chain_id: u64,
     /// Address of the asset's bridge contract, where the lock has to be made
@@ -2109,6 +2157,13 @@ impl LocalRgbAllocation {
     pub(crate) fn future(&self) -> bool {
         !self.txo_spent && self.incoming && !self.status.failed() && !self.settled()
     }
+
+    /// Whether the allocation is held by its UTXO, or due to be, so that spending the UTXO moves
+    /// it: an incoming allocation on an unspent TXO, from a transfer that hasn't failed.
+    #[cfg(feature = "_online")]
+    pub(crate) fn held(&self) -> bool {
+        self.incoming && !self.txo_spent && !self.status.failed()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -2144,17 +2199,22 @@ pub struct InfoAssetTransfer {
     pub beneficiaries_blinded: Vec<SecretSeal>,
     pub beneficiaries_witness: Vec<ExplicitSeal<RgbTxid>>,
     pub burn_reason: Option<BurnReason>,
-    pub after_block: Option<u64>,
+    /// The contract a link links the asset to
+    #[serde(default)]
+    pub linked_to_contract: Option<ContractId>,
+    pub before_block: Option<u64>,
 }
 
 impl InfoAssetTransfer {
-    /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn has no
-    /// beneficiary, so its transition is selected by OpId, while the others are selected by their
-    /// beneficiaries
+    /// OpIds of the transitions to explicitly request when consigning from `fascia`: a burn or a
+    /// link has no beneficiary, so its transition is selected by OpId, while the others are
+    /// selected by their beneficiaries
     pub(crate) fn requested_opids(&self, fascia: &Fascia) -> Vec<OpId> {
-        if self.main_transition != TypeOfTransition::Burn {
-            return vec![];
-        }
+        let transition_type = match self.main_transition {
+            TypeOfTransition::Burn => TS_BURN,
+            TypeOfTransition::Link => TS_LINK,
+            _ => return vec![],
+        };
         fascia
             .bundles()
             .get(&self.asset_info.contract_id)
@@ -2162,7 +2222,7 @@ impl InfoAssetTransfer {
                 bundle
                     .known_transitions
                     .iter()
-                    .filter(|kt| kt.transition.transition_type == TS_BURN)
+                    .filter(|kt| kt.transition.transition_type == transition_type)
                     .map(|kt| kt.opid)
                     .collect()
             })
@@ -2314,6 +2374,106 @@ pub enum ReceiveMatcher {
     /// the script paid and, when known (proxy exchange), the blinding of the seal
     /// (`v1.0-changes-spec.md` A.11)
     Witness(ScriptBuf, Option<u64>),
+}
+
+/// The UTXOs selected as inputs of an operation, with the number of allocations of each asset they
+/// hold, which spending them moves, as inputs of the bundle of the asset.
+#[cfg(feature = "_online")]
+#[derive(Clone, Debug, Default)]
+pub struct SelectedInputs {
+    outpoints: HashSet<Outpoint>,
+    // map of asset IDs to the number of their allocations
+    allocations: HashMap<String, usize>,
+}
+
+#[cfg(feature = "_online")]
+impl SelectedInputs {
+    /// The number of allocations of each asset held by the given UTXO.
+    fn held_allocations(unspent: &LocalUnspent) -> HashMap<&str, usize> {
+        let mut held: HashMap<&str, usize> = HashMap::new();
+        for asset_id in unspent
+            .rgb_allocations
+            .iter()
+            .filter(|a| a.held())
+            // an allocation without an asset ID is due from a receive of an asset not known yet,
+            // which makes its UTXO unspendable (see `get_input_unspents`); a UTXO used as change
+            // gets checked when the receive gets its asset, counting the change (see
+            // `count_utxo_asset_allocations`)
+            .filter_map(|a| a.asset_id.as_deref())
+        {
+            *held.entry(asset_id).or_default() += 1;
+        }
+        held
+    }
+
+    /// Whether the allocations of each asset held by the given UTXO, added to the ones of the
+    /// UTXOs selected, don't exceed `max_allocations`. A UTXO already selected (e.g. for another
+    /// asset of the same operation) fits, since its allocations have already been accounted for
+    /// (they would otherwise be counted twice).
+    pub(crate) fn fits(&self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
+        self.outpoints.contains(&unspent.utxo.outpoint())
+            || Self::held_allocations(unspent)
+                .iter()
+                .all(|(asset_id, num)| {
+                    self.allocations.get(*asset_id).unwrap_or(&0) + num <= max_allocations
+                })
+    }
+
+    /// Select the given UTXO, unless it doesn't fit (see [`Self::fits`]), returning whether it's
+    /// selected.
+    pub(crate) fn select(&mut self, unspent: &LocalUnspent, max_allocations: usize) -> bool {
+        if !self.fits(unspent, max_allocations) {
+            return false;
+        }
+        let outpoint = unspent.utxo.outpoint();
+        if self.outpoints.insert(outpoint) {
+            for (asset_id, num) in Self::held_allocations(unspent) {
+                *self.allocations.entry(asset_id.to_string()).or_default() += num;
+            }
+        }
+        true
+    }
+}
+
+/// The seal at which a consignment pays this recipient: a concealed one (blind receives) or one
+/// revealed on a vout of the bundle witness TX (witness receives), never both.
+#[cfg(feature = "_online")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PaymentSeal {
+    Concealed(SecretSeal),
+    WitnessVout(u32),
+}
+
+#[cfg(feature = "_online")]
+impl PaymentSeal {
+    /// the vout of the bundle witness TX being paid, for witness receives
+    pub(crate) fn vout(&self) -> Option<u32> {
+        match self {
+            Self::Concealed(_) => None,
+            Self::WitnessVout(vout) => Some(*vout),
+        }
+    }
+
+    pub(crate) fn matches(&self, seal: &BuilderSeal<GraphSeal>) -> bool {
+        match (self, seal) {
+            (Self::Concealed(secret_seal), BuilderSeal::Concealed(seal)) => secret_seal == seal,
+            (Self::WitnessVout(vout), BuilderSeal::Revealed(seal)) => {
+                seal.txid == TxPtr::WitnessTx && seal.vout.into_u32() == *vout
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A destination at which a consignment pays this recipient, see `find_payments`.
+#[cfg(feature = "_online")]
+pub struct ConsignmentPayment<'c> {
+    /// the bundle paying the recipient
+    pub(crate) bundle: &'c WitnessBundle,
+    /// for witness receives, the vout of the bundle witness TX being paid
+    pub(crate) vout: Option<u32>,
+    /// the assignments received, unspent within the consignment
+    pub(crate) receiving: HashMap<Opout, Assignment>,
 }
 
 impl DbTransfer {

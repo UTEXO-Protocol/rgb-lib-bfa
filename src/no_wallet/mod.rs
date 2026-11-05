@@ -2,12 +2,11 @@
 //!
 //! This module defines the methods that don't require a wallet (available without the `wallet`
 //! feature) and the objects they return, some of which are shared with wallet methods (e.g. the
-//! inspection ones). Methods that need to reach the network (e.g. the validation ones) require an
-//! indexer validation feature (`bitcoind_validation`, `electrum_validation` or
+//! inspection ones). Methods that need to reach the network (e.g. the validation with an indexer)
+//! require an indexer validation feature (`bitcoind_validation`, `electrum_validation` or
 //! `esplora_validation`), which doesn't enable the `wallet` feature.
 
 pub(crate) mod inspection;
-#[cfg(feature = "validation")]
 pub(crate) mod validation;
 
 use super::*;
@@ -21,10 +20,10 @@ pub use inspection::{
 pub(crate) use inspection::{bundle_info, verify_witness_commitment};
 #[cfg(feature = "_validation")]
 pub use validation::{BitcoindAuth, IndexerConfig, IndexerProtocol, validate_consignment};
-#[cfg(feature = "validation")]
 pub use validation::{
-    ConsignmentValidation, ValidatedWitness, ValidationOptions, ValidationWarning,
-    WitnessValidationStatus, validate_consignment_with_resolver,
+    ConsignmentValidation, RejectList, RejectListSource, ResolveRejectList, ValidatedWitness,
+    ValidationOptions, ValidationWarning, WitnessValidationStatus,
+    validate_consignment_with_resolver,
 };
 
 /// Supported Bitcoin networks.

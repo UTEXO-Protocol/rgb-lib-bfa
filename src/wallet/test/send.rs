@@ -2976,6 +2976,208 @@ fn recipient_refuses_tampered_consignment() {
     );
 }
 
+/// A consignment paying someone else, posted to the invoice of the recipient (which anyone can do,
+/// the invoice being public), pays the recipient nothing, so it's refused.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn recipient_refuses_consignment_not_paying_it() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party_1 = get_funded_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // issue
+    let asset = party.issue_asset_nia(None);
+
+    // send to rcv_party_1 and settle
+    let receive_data_1 = rcv_party_1.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data_1.recipient_id.clone(),
+            public_key: Some(receive_data_1.public_key.clone()),
+            expiration_timestamp: Some(receive_data_1.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party_1.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party_1.wait_for_refresh(Some(&asset.asset_id));
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+
+    // post the same consignment to the invoice of rcv_party_2 (which advertises cleartext, so the
+    // consignment can be posted as is)
+    let receive_data_2 = rcv_party_2
+        .wallet
+        .blind_receive(
+            Some(rcv_party_2.online),
+            None,
+            Assignment::Any,
+            default_rcv_expiration(),
+            TRANSPORT_ENDPOINTS.clone(),
+            MIN_CONFIRMATIONS,
+            Some(Encryption::Unsupported),
+        )
+        .unwrap();
+    let consignment_path = party
+        .wallet
+        .get_send_consignment_path(&asset.asset_id, &txid);
+    let (_, transfer_id) = post_test_consignment(
+        &get_proxy_client(None),
+        &receive_data_2.recipient_id,
+        &receive_data_2.public_key,
+        &consignment_path,
+        &hash_bytes_hex(&std::fs::read(&consignment_path).unwrap()),
+    );
+
+    // rcv_party_2 downloads the consignment and refuses it, receiving nothing
+    rcv_party_2.wait_for_refresh(None);
+    let transfer = rcv_party_2.get_test_transfer_recipient(&receive_data_2.recipient_id);
+    assert_eq!(transfer.proxy_transfer_id, Some(transfer_id));
+    assert!(rcv_party_2.check_test_transfer_status_recipient(
+        &receive_data_2.recipient_id,
+        TransferStatus::Failed
+    ));
+    assert!(rcv_party_2.list_unspents(false).iter().all(|u| {
+        u.rgb_allocations
+            .iter()
+            .all(|a| a.asset_id.as_ref() != Some(&asset.asset_id))
+    }));
+}
+
+/// The outpoints of the unspent UTXOs of the given wallet holding a link right of the given asset,
+/// according to its stock, which also knows about the ones rgb-lib doesn't track.
+#[cfg(feature = "electrum")]
+fn link_right_outpoints(wallet: &Wallet, asset_id: &str) -> Vec<OutPoint> {
+    use schemata::OS_LINK;
+
+    let contract_id = ContractId::from_str(asset_id).unwrap();
+    let txn = wallet.database().begin_transaction().unwrap();
+    let outpoints: Vec<OutPoint> = txn
+        .get_unspent_txos(vec![])
+        .unwrap()
+        .into_iter()
+        .map(OutPoint::from)
+        .collect();
+    let stock = wallet.rgb_stock(&txn).unwrap();
+    let mut link_right_outpoints = vec![];
+    for (seal, opout_state_map) in stock
+        .contract_assignments_for(contract_id, outpoints)
+        .unwrap()
+    {
+        if opout_state_map.keys().any(|opout| opout.ty == OS_LINK) {
+            link_right_outpoints.push(seal.to_outpoint());
+        }
+    }
+    txn.commit().unwrap();
+    link_right_outpoints
+}
+
+/// A link right can be assigned to any UTXO by the genesis of an asset, which needs no witness: it
+/// ends up on a UTXO of a wallet receiving the asset, which doesn't track it as it hasn't received
+/// it, then moves it along when spending the UTXO, tracking it from then on.
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn link_right_on_wallet_utxo() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // issue an asset whose genesis assigns a link right to the UTXO of a blind receive (known to the
+    // sender e.g. from a witness transfer it made to the recipient)
+    let receive_data = rcv_party.blind_receive();
+    let transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+    let Some(RecipientTypeFull::Blind { unblinded_utxo }) = transfer.recipient_type else {
+        panic!("blind receive expected");
+    };
+    let receive_outpoint = OutPoint::from(unblinded_utxo);
+    MOCK_IFA_LINK_RIGHT.replace(Some(party.wallet.get_builder_seal(receive_outpoint)));
+    let asset = party.issue_asset_ifa(None, None, None);
+
+    // send to the blind receive and settle
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data.recipient_id.clone(),
+            public_key: Some(receive_data.public_key.clone()),
+            expiration_timestamp: Some(receive_data.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+
+    // the link right is on the UTXO of the blind receive
+    assert_eq!(
+        link_right_outpoints(&rcv_party.wallet, &asset.asset_id),
+        vec![receive_outpoint]
+    );
+
+    // spending the UTXO moves the link right along, to another UTXO
+    let receive_data_back = party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            assignment: Assignment::Fungible(amount),
+            recipient_id: receive_data_back.recipient_id.clone(),
+            public_key: Some(receive_data_back.public_key.clone()),
+            expiration_timestamp: Some(receive_data_back.expiration_timestamp),
+            encryption: Encryption::Optional,
+            witness_data: None,
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = rcv_party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    mine(false);
+    party.wait_for_refresh(Some(&asset.asset_id));
+    rcv_party.wait_for_refresh(Some(&asset.asset_id));
+    assert!(rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    let link_right_outpoints = link_right_outpoints(&rcv_party.wallet, &asset.asset_id);
+    assert_eq!(link_right_outpoints.len(), 1);
+    assert_ne!(link_right_outpoints[0], receive_outpoint);
+    let link_right_unspent = rcv_party
+        .list_unspents(false)
+        .into_iter()
+        .find(|u| OutPoint::from(u.utxo.outpoint.clone()) == link_right_outpoints[0])
+        .unwrap();
+    assert!(
+        link_right_unspent
+            .rgb_allocations
+            .iter()
+            .any(|a| a.asset_id.as_ref() == Some(&asset.asset_id)
+                && a.assignment == Assignment::LinkRight)
+    );
+}
+
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
@@ -3476,9 +3678,12 @@ fn send_assignment_supported(schema: AssetSchema, assignment: &Assignment) -> bo
         AssetSchema::Uda => matches!(assignment, Assignment::NonFungible),
         AssetSchema::Ifa => matches!(
             assignment,
-            Assignment::Fungible(_) | Assignment::InflationRight(_)
+            Assignment::Fungible(_) | Assignment::InflationRight(_) | Assignment::LinkRight
         ),
-        AssetSchema::Bfa => matches!(assignment, Assignment::Fungible(_) | Assignment::MintRight),
+        AssetSchema::Bfa => matches!(
+            assignment,
+            Assignment::Fungible(_) | Assignment::LinkRight | Assignment::MintRight
+        ),
     }
 }
 
@@ -5918,6 +6123,8 @@ fn witness_multiple_assets_success() {
         ),
     ]);
     party.create_utxos(false, None, None, FEE_RATE, None);
+    // no blocks until the transfers have been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -6052,6 +6259,7 @@ fn witness_multiple_assets_success() {
     });
 
     // transfers progress to status Settled after tx mining + refresh
+    drop(guard);
     mine(false);
     // check receiver transfers
     rcv_party.wait_for_refresh(None);
@@ -6136,6 +6344,8 @@ fn witness_multiple_assets_success() {
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
     )]);
+    // no blocks until the transfer has been checked in status WaitingConfirmations
+    let guard = stop_mining();
     let txid = party.send_retry(&recipient_map);
     assert!(!txid.is_empty());
 
@@ -6181,6 +6391,7 @@ fn witness_multiple_assets_success() {
     );
 
     // transfers progress to status Settled after tx mining + refresh
+    drop(guard);
     mine(false);
     rcv_party.wait_for_refresh(None);
     party.wait_for_refresh(None);
@@ -11309,56 +11520,6 @@ fn out_of_band_consignment_multiple_receives() {
 #[cfg(feature = "electrum")]
 #[test]
 #[parallel]
-fn fail_no_terminals() {
-    initialize();
-
-    let amount: u64 = 66;
-
-    // wallets
-    let mut party = get_funded_party!();
-    let mut rcv_party = get_funded_party!();
-
-    // issue
-    let asset = party.issue_asset_nia(None);
-
-    // send, stripping the terminals from the generated consignment
-    let receive_data = rcv_party.blind_receive();
-    let recipient_map = HashMap::from([(
-        asset.asset_id.clone(),
-        vec![Recipient {
-            assignment: Assignment::Fungible(amount),
-            recipient_id: receive_data.recipient_id.clone(),
-            witness_data: None,
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-            public_key: Some(receive_data.public_key.clone()),
-            expiration_timestamp: Some(receive_data.expiration_timestamp),
-            encryption: Encryption::Optional,
-        }],
-    )]);
-    println!("setting MOCK_STRIP_TERMINALS");
-    MOCK_STRIP_TERMINALS.replace(Some(()));
-    let txid = party.send_retry(&recipient_map);
-    assert!(!txid.is_empty());
-
-    // the receiver refuses the consignment and both sides end up Failed
-    rcv_party.wait_for_refresh(None);
-    let rcv_transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
-    let (rcv_transfer_data, _) = rcv_party.get_test_transfer_data(&rcv_transfer);
-    assert_eq!(rcv_transfer_data.status, TransferStatus::Failed);
-
-    party.wait_for_refresh(Some(&asset.asset_id));
-    let batch_transfers = party.db_batch_transfers_filtered(&txid);
-    let batch_transfer = batch_transfers.first().unwrap();
-    let asset_transfer = party.get_test_asset_transfer(batch_transfer.idx);
-    for transfer in party.db_transfers_filtered(asset_transfer.idx) {
-        let (transfer_data, _) = party.get_test_transfer_data(&transfer);
-        assert_eq!(transfer_data.status, TransferStatus::Failed);
-    }
-}
-
-#[cfg(feature = "electrum")]
-#[test]
-#[parallel]
 fn proxy_auth() {
     initialize();
 
@@ -11878,4 +12039,822 @@ fn proxy_max_media() {
         &receive_data_3.recipient_id,
         TransferStatus::WaitingConfirmations
     ));
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn receive_multiple_allocations_refused() {
+    initialize();
+
+    let amount_1: u64 = 100;
+    let amount_2: u64 = 50;
+    // the second send pays its invoice 2 allocations: 1 of the requested amount minus 1, plus 1
+    let spam: (u16, u64) = (1, 1);
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // a send paying the invoice a single allocation is accepted
+    let receive_data_1 = rcv_party.blind_receive();
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_1,
+        Assignment::Fungible(amount_1),
+    );
+
+    // a send paying the invoice more than one allocation is refused
+    let receive_data_2 = rcv_party.blind_receive();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(Some(spam));
+    send_to_blind_refused(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_2,
+        Assignment::Fungible(amount_2),
+    );
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+
+    // the sender gets its allocation back, the receiving UTXO only holds the first allocation
+    assert_eq!(
+        party.get_asset_balance(asset_id).spendable,
+        AMOUNT - amount_1
+    );
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, amount_1);
+    assert_eq!(single_colored_utxo_allocations(&mut rcv_party).len(), 1);
+
+    // and it can be spent
+    let receive_data_3 = rcv_party_2.blind_receive();
+    send_to_blind_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        &receive_data_3,
+        Assignment::Fungible(amount_1),
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn utxo_freeze_limit() {
+    initialize();
+
+    // a low limit, to check it with a few allocations
+    let max_allocations: usize = 2;
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations));
+    let amount: u64 = 100;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // paying the only UTXO of the receiver up to the limit is accepted
+    for _ in 0..max_allocations {
+        send_and_settle(
+            &mut party,
+            &mut rcv_party,
+            asset_id,
+            Assignment::Fungible(amount),
+        );
+    }
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        max_allocations
+    );
+
+    // paying it one allocation more is refused
+    let receive_data = rcv_party.blind_receive();
+    send_to_blind_refused(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data,
+        Assignment::Fungible(amount),
+    );
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        max_allocations
+    );
+
+    // and the UTXO can be spent
+    let total = amount * max_allocations as u64;
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, total);
+    send_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        Assignment::Fungible(total),
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn utxo_freeze_concurrent_receives() {
+    initialize();
+
+    // a UTXO can hold a single allocation: either transfer fits on it, both together don't
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(1));
+    let amount: u64 = 50;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue, on two UTXOs, so that two transfers can be pending at the same time
+    let asset = party.issue_asset_nia(Some(&[AMOUNT, AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // two invoices on the victim's only UTXO
+    let receive_data_1 = rcv_party.blind_receive();
+    let receive_data_2 = rcv_party.blind_receive();
+    let rcv_transfer_1 = rcv_party.get_test_transfer_recipient(&receive_data_1.recipient_id);
+    let rcv_transfer_2 = rcv_party.get_test_transfer_recipient(&receive_data_2.recipient_id);
+    assert_eq!(
+        rcv_party
+            .get_test_transfer_data(&rcv_transfer_1)
+            .0
+            .receive_utxo,
+        rcv_party
+            .get_test_transfer_data(&rcv_transfer_2)
+            .0
+            .receive_utxo
+    );
+
+    // both transfers are sent before the victim refreshes
+    let mut txids = vec![];
+    for receive_data in [&receive_data_1, &receive_data_2] {
+        let recipient_map =
+            blind_recipient_map(asset_id, receive_data, Assignment::Fungible(amount));
+        txids.push(party.send_result(&recipient_map).unwrap().txid);
+    }
+    assert_ne!(txids[0], txids[1]);
+
+    // the victim processes both in the same refresh: the allocation of the first one it accepts
+    // counts against the second one, which is refused
+    rcv_party.refresh_result(None, &[]).unwrap();
+    let statuses: Vec<TransferStatus> = [&receive_data_1, &receive_data_2]
+        .iter()
+        .map(|rd| {
+            let transfer = rcv_party.get_test_transfer_recipient(&rd.recipient_id);
+            rcv_party.get_test_transfer_data(&transfer).0.status
+        })
+        .collect();
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == TransferStatus::WaitingConfirmations)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == TransferStatus::Failed)
+            .count(),
+        1
+    );
+
+    // the accepted transfer settles, the refused one fails for the sender too
+    party.wait_for_refresh(Some(asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(asset_id));
+    let (accepted, refused) = if statuses[0] == TransferStatus::Failed {
+        (1, 0)
+    } else {
+        (0, 1)
+    };
+    assert!(party.check_test_transfer_status_sender(&txids[accepted], TransferStatus::Settled));
+    assert!(party.check_test_transfer_status_sender(&txids[refused], TransferStatus::Failed));
+    assert_eq!(single_colored_utxo_allocations(&mut rcv_party).len(), 1);
+    assert_eq!(rcv_party.get_asset_balance(asset_id).settled, amount);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn utxo_allocations_limit_across_inputs() {
+    utxo_allocations_limit_across_inputs_impl(10);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[ignore = "should be executed alone for performance reasons"]
+#[parallel]
+fn utxo_allocations_limit_across_inputs_full() {
+    utxo_allocations_limit_across_inputs_impl(u16::MAX);
+}
+
+// check coin selection skips a UTXO that would make a send move more allocations of an asset than
+// `max_allocations`, mocking the limit when lower than the real one
+#[cfg(feature = "electrum")]
+fn utxo_allocations_limit_across_inputs_impl(max_allocations: u16) {
+    initialize();
+
+    // UTXOs are filled by paying invoices many allocations
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
+
+    if max_allocations as usize != MAX_UTXO_ASSET_ALLOCATIONS {
+        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations as usize));
+    }
+    // two UTXOs, each holding half of the allocations that can be spent plus one, so that each can
+    // be spent alone but not together, and one with a single allocation of a larger amount
+    let spam: (u16, u64) = (max_allocations / 2, 1);
+    let amount_a: u64 = 33_000;
+    let amount_b: u64 = 34_000;
+    let amount_c: u64 = 50_000;
+    // more than A holds, so that a second UTXO is needed
+    let amount_send: u64 = 40_000;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(3), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[amount_a + amount_b + amount_c + AMOUNT]));
+    let asset_id = asset.asset_id.as_str();
+
+    // fill the victim's UTXOs, each invoice going to a different one
+    let mut receive_utxos = vec![];
+    for (amount, spam) in [
+        (amount_a, Some(spam)),
+        (amount_b, Some(spam)),
+        (amount_c, None),
+    ] {
+        let receive_data = rcv_party.blind_receive();
+        let transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+        receive_utxos.push(rcv_party.get_test_transfer_data(&transfer).0.receive_utxo);
+        MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(spam);
+        send_to_blind_and_settle(
+            &mut party,
+            &mut rcv_party,
+            asset_id,
+            &receive_data,
+            Assignment::Fungible(amount),
+        );
+        assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+    }
+    assert_eq!(
+        receive_utxos.iter().collect::<HashSet<_>>().len(),
+        receive_utxos.len()
+    );
+    let unspents = rcv_party.list_unspents(true);
+    let mut allocations: Vec<(u64, usize)> = unspents
+        .iter()
+        .filter(|u| !u.rgb_allocations.is_empty())
+        .map(|u| {
+            let sum = u
+                .rgb_allocations
+                .iter()
+                .map(|a| a.assignment.main_amount())
+                .sum();
+            (sum, u.rgb_allocations.len())
+        })
+        .collect();
+    allocations.sort();
+    let num_spam = spam.0 as usize + 1;
+    assert_eq!(
+        allocations,
+        vec![(amount_a, num_spam), (amount_b, num_spam), (amount_c, 1)]
+    );
+    assert!(2 * num_spam > max_allocations as usize);
+
+    // UTXOs are selected by ascending amount, but B would make the send move more allocations than
+    // a bundle can spend, so it's skipped and A and C are selected
+    let receive_data = rcv_party_2.blind_receive();
+    send_to_blind_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        &receive_data,
+        Assignment::Fungible(amount_send),
+    );
+    assert_eq!(rcv_party_2.get_asset_balance(asset_id).settled, amount_send);
+
+    // B is untouched
+    let utxo_b = receive_utxos[1].clone().unwrap();
+    let unspents = rcv_party.list_unspents(true);
+    let unspent_b = unspents
+        .iter()
+        .find(|u| u.utxo.outpoint == utxo_b)
+        .expect("UTXO B should be unspent");
+    assert_eq!(unspent_b.rgb_allocations.len(), num_spam);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn utxo_allocations_limit_across_assets() {
+    initialize();
+
+    // UTXOs are filled by paying invoices many allocations
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
+
+    // a low limit, to check it without u16::MAX allocations
+    let max_allocations: u16 = 10;
+    MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations as usize));
+    let amount_x: u64 = 100;
+    // 6 allocations of asset Y on each of 2 UTXOs: either fits the limit, both together don't
+    let amount_y_1: u64 = 60;
+    let spam_y_1: (u16, u64) = (5, 10);
+    let amount_y_2: u64 = 30;
+    let spam_y_2: (u16, u64) = (5, 5);
+    let amount_y_send: u64 = 50;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue
+    let asset_x = party.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_y = party.issue_asset_nia(Some(&[AMOUNT]));
+    let asset_x_id = asset_x.asset_id.as_str();
+    let asset_y_id = asset_y.asset_id.as_str();
+
+    // UTXO 1 (the victim's only one for now) gets asset X and 6 allocations of asset Y
+    let receive_data = rcv_party.blind_receive();
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_x_id,
+        &receive_data,
+        Assignment::Fungible(amount_x),
+    );
+    let receive_data = rcv_party.blind_receive();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(Some(spam_y_1));
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_y_id,
+        &receive_data,
+        Assignment::Fungible(amount_y_1),
+    );
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+    let utxo_1 = single_colored_utxo_allocations(&mut rcv_party);
+    assert_eq!(utxo_1.len(), spam_y_1.0 as usize + 2);
+
+    // UTXO 2 gets 6 allocations of asset Y, with a smaller total
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+    let receive_data = rcv_party.blind_receive();
+    let transfer = rcv_party.get_test_transfer_recipient(&receive_data.recipient_id);
+    let utxo_2 = rcv_party
+        .get_test_transfer_data(&transfer)
+        .0
+        .receive_utxo
+        .unwrap();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(Some(spam_y_2));
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_y_id,
+        &receive_data,
+        Assignment::Fungible(amount_y_2),
+    );
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+
+    // send both assets, selecting inputs for them in any order: if X selects UTXO 1 first, which
+    // also holds 6 allocations of Y, Y then skips UTXO 2 (the one with the smaller total), which
+    // would take the allocations of Y moved by the operation past the limit, UTXO 1 being enough;
+    // if Y selects first, UTXO 2 isn't enough and makes it skip UTXO 1, so Y retries from the UTXO
+    // with the most, selecting UTXO 1 only
+    let receive_data_x = rcv_party_2.blind_receive();
+    let receive_data_y = rcv_party_2.blind_receive();
+    let mut recipient_map =
+        blind_recipient_map(asset_x_id, &receive_data_x, Assignment::Fungible(amount_x));
+    recipient_map.extend(blind_recipient_map(
+        asset_y_id,
+        &receive_data_y,
+        Assignment::Fungible(amount_y_send),
+    ));
+    let txid = rcv_party.send_result(&recipient_map).unwrap().txid;
+    rcv_party_2.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(None);
+    mine(false);
+    rcv_party_2.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(None);
+    assert!(rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert_eq!(rcv_party_2.get_asset_balance(asset_x_id).settled, amount_x);
+    assert_eq!(
+        rcv_party_2.get_asset_balance(asset_y_id).settled,
+        amount_y_send
+    );
+
+    // UTXO 2 is untouched
+    let unspents = rcv_party.list_unspents(true);
+    let unspent_2 = unspents
+        .iter()
+        .find(|u| u.utxo.outpoint == utxo_2)
+        .expect("UTXO 2 should be unspent");
+    assert_eq!(unspent_2.rgb_allocations.len(), spam_y_2.0 as usize + 1);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[ignore = "should be executed alone for performance reasons"]
+#[parallel]
+fn send_many_allocations_full() {
+    initialize();
+
+    // UTXOs are filled by paying invoices many allocations
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
+
+    // many allocations on a single UTXO, each one moved by its own transition when the UTXO is
+    // spent: with at least 104 bytes (input and consumer entry) for each of them, the RGB data
+    // would exceed the MAX_VEC_SIZE bytes the global map of a PSBT can take to be parsed back
+    let spam: (u16, u64) = (40_000, 1);
+    let amount: u64 = 50_000;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[AMOUNT + amount]));
+    let asset_id = asset.asset_id.as_str();
+
+    // fill the victim's UTXO
+    let receive_data = rcv_party.blind_receive();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(Some(spam));
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data,
+        Assignment::Fungible(amount),
+    );
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        spam.0 as usize + 1
+    );
+
+    // sending from it works, as the RGB data are removed from the PSBT once committed: the
+    // allocation sent is the one needed, all the others are moved to the change
+    let receive_data = rcv_party_2.blind_receive();
+    send_to_blind_and_settle(
+        &mut rcv_party,
+        &mut rcv_party_2,
+        asset_id,
+        &receive_data,
+        Assignment::Fungible(1),
+    );
+    assert_eq!(rcv_party_2.get_asset_balance(asset_id).settled, 1);
+    assert_eq!(rcv_party.get_asset_balance(asset_id).spendable, amount - 1);
+    assert_eq!(
+        single_colored_utxo_allocations(&mut rcv_party).len(),
+        spam.0 as usize
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn broadcast_legacy_signed_psbt() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_party!();
+
+    // issue
+    let asset = party.issue_asset_nia(None);
+    let asset_id = asset.asset_id.as_str();
+
+    // send, keeping the signed PSBT
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(amount));
+    let begin = party.send_begin_result(&recipient_map).unwrap();
+    let signed_psbt = party.wallet.sign_psbt(begin.psbt, None).unwrap();
+    let txid = party
+        .wallet
+        .send_end(party.online, signed_psbt.clone())
+        .unwrap()
+        .txid;
+
+    // the signed TX is saved to broadcast it, not the signed PSBT
+    let transfer_dir = party.wallet.get_transfer_dir(&txid);
+    let signed_tx_path = transfer_dir.join("signed.tx");
+    let signed_psbt_path = transfer_dir.join("signed.psbt");
+    assert!(signed_tx_path.exists());
+    assert!(!signed_psbt_path.exists());
+
+    // a transfer created by a previous version, which saved the signed PSBT, is still broadcast
+    fs::remove_file(&signed_tx_path).unwrap();
+    fs::write(&signed_psbt_path, &signed_psbt).unwrap();
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::WaitingConfirmations));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(asset_id));
+    assert!(party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert!(
+        rcv_party.check_test_transfer_status_recipient(
+            &receive_data.recipient_id,
+            TransferStatus::Settled
+        )
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn change_utxo_allocations_limit() {
+    change_utxo_allocations_limit_impl(10);
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[ignore = "should be executed alone for performance reasons"]
+#[parallel]
+fn change_utxo_allocations_limit_full() {
+    change_utxo_allocations_limit_impl(MAX_UTXO_ASSET_ALLOCATIONS);
+}
+
+// check an existing UTXO isn't used as change if the allocations moved to the change would take it
+// past `max_allocations`, mocking the limit when lower than the real one
+#[cfg(feature = "electrum")]
+fn change_utxo_allocations_limit_impl(max_allocations: usize) {
+    initialize();
+
+    // UTXOs are filled by paying invoices many allocations
+    MOCK_ACCEPT_MULTIPLE_ALLOCATIONS.replace(true);
+
+    if max_allocations != MAX_UTXO_ASSET_ALLOCATIONS {
+        MOCK_MAX_UTXO_ASSET_ALLOCATIONS.replace(Some(max_allocations));
+    }
+    // UTXO S (rcv_party) is prepared with the max number of allocations that can be spent: 1 with
+    // amount 100, the others with amount 2 (so spending 1 produces a change of 1); the sender pays
+    // all of its allocation, as a transition assigns at most u16::MAX allocations of a type, which
+    // leaves none for a change
+    let spam: (u16, u64) = (max_allocations as u16 - 1, 2);
+    let amount_s: u64 = spam.0 as u64 * spam.1 + 100;
+    // UTXO D (rcv_party) holds a single allocation, larger than what S holds, so that S is
+    // selected first when spending
+    let amount_d: u64 = 1_000_000;
+    // tiny UTXOs, so that sending from S leaves no BTC change and the RGB change goes to D
+    let utxo_size: u32 = 500;
+
+    // wallets
+    let mut party = get_funded_party!();
+    let mut rcv_party = get_funded_noutxo_party!();
+    let mut rcv_party_2 = get_funded_party!();
+
+    // prepare UTXOs
+    rcv_party.create_utxos(false, Some(2), Some(utxo_size), FEE_RATE, None);
+
+    // issue
+    let asset = party.issue_asset_nia(Some(&[amount_d + amount_s]));
+    let asset_id = asset.asset_id.as_str();
+
+    // D gets its allocation, then S gets its many ones (the second invoice is on the other UTXO,
+    // as D already holds an allocation)
+    let receive_data_d = rcv_party.blind_receive();
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_d,
+        Assignment::Fungible(amount_d),
+    );
+    let receive_data_s = rcv_party.blind_receive();
+    MOCK_SPAM_RECIPIENT_ASSIGNMENTS.replace(Some(spam));
+    send_to_blind_and_settle(
+        &mut party,
+        &mut rcv_party,
+        asset_id,
+        &receive_data_s,
+        Assignment::Fungible(amount_s),
+    );
+    assert!(MOCK_SPAM_RECIPIENT_ASSIGNMENTS.take().is_none());
+    let utxo_of = |party: &SinglesigParty, receive_data: &ReceiveData| {
+        let transfer = party.get_test_transfer_recipient(&receive_data.recipient_id);
+        party
+            .get_test_transfer_data(&transfer)
+            .0
+            .receive_utxo
+            .unwrap()
+    };
+    let utxo_d = utxo_of(&rcv_party, &receive_data_d);
+    let utxo_s = utxo_of(&rcv_party, &receive_data_s);
+    assert_ne!(utxo_d, utxo_s);
+    let num_allocations = |party: &mut SinglesigParty, utxo: &Outpoint| {
+        party
+            .list_unspents(true)
+            .iter()
+            .find(|u| u.utxo.outpoint == *utxo)
+            .map(|u| u.rgb_allocations.len())
+    };
+    assert_eq!(num_allocations(&mut rcv_party, &utxo_d), Some(1));
+    assert_eq!(
+        num_allocations(&mut rcv_party, &utxo_s),
+        Some(max_allocations)
+    );
+
+    // sending 1 spends S, moving its change plus all other allocations (extra) to the RGB change,
+    // which can't go to D, as the TX has no BTC change and D would then hold more allocations than
+    // can be spent, and there's no other UTXO for it
+    let receive_data = rcv_party_2.blind_receive();
+    let recipient_map = blind_recipient_map(asset_id, &receive_data, Assignment::Fungible(1));
+    let result = rcv_party.send_result(&recipient_map);
+    assert_matches!(result, Err(Error::InsufficientAllocationSlots));
+
+    // with another UTXO the RGB change goes there
+    rcv_party.create_utxos(false, Some(1), None, FEE_RATE, None);
+    let txid = rcv_party.send_result(&recipient_map).unwrap().txid;
+    let (transfer, _, _) = rcv_party.get_test_transfer_sender(&txid);
+    let (transfer_data, _) = rcv_party.get_test_transfer_data(&transfer);
+    let utxo_change = transfer_data.change_utxo.unwrap();
+    assert_ne!(utxo_change, utxo_d);
+    assert_ne!(utxo_change, utxo_s);
+    rcv_party_2.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(asset_id));
+    mine(false);
+    rcv_party_2.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(asset_id));
+    assert!(rcv_party.check_test_transfer_status_sender(&txid, TransferStatus::Settled));
+    assert_eq!(num_allocations(&mut rcv_party, &utxo_d), Some(1));
+    assert_eq!(
+        num_allocations(&mut rcv_party, &utxo_change),
+        Some(max_allocations)
+    );
+}
+
+#[cfg(feature = "electrum")]
+#[test]
+#[parallel]
+fn batch_send_keeps_allocations_on_inputs_selected_for_other_assets() {
+    initialize();
+
+    let amount_a_sent: u64 = 100;
+    let amount_a_received: u64 = 10;
+    let amount_b_sent: u64 = 50;
+    let amount_a_change = AMOUNT - amount_a_sent;
+
+    // wallets
+    let mut party = get_funded_noutxo_party!();
+    let mut rcv_party = get_funded_party!();
+    party.create_utxos(false, Some(1), None, FEE_RATE, None);
+
+    let blind_recipient = |receive_data: &ReceiveData, amount: u64| Recipient {
+        assignment: Assignment::Fungible(amount),
+        recipient_id: receive_data.recipient_id.clone(),
+        public_key: Some(receive_data.public_key.clone()),
+        expiration_timestamp: Some(receive_data.expiration_timestamp),
+        encryption: Encryption::Optional,
+        witness_data: None,
+        transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+    };
+    // the settled amounts of the asset with ID `asset_id` held by each UTXO holding it
+    let utxo_amounts = |party: &mut SinglesigParty, asset_id: &str| -> HashMap<Outpoint, u64> {
+        party
+            .list_unspents(true)
+            .into_iter()
+            .filter_map(|u| {
+                let amount: u64 = u
+                    .rgb_allocations
+                    .iter()
+                    .filter(|a| a.asset_id.as_deref() == Some(asset_id) && a.settled)
+                    .map(|a| a.assignment.main_amount())
+                    .sum();
+                (amount > 0).then_some((u.utxo.outpoint, amount))
+            })
+            .collect()
+    };
+
+    // issue assets A and B on the only colorable UTXO
+    let asset_a = party.issue_asset_nia(None);
+    let asset_b = party.issue_asset_nia(None);
+
+    // send some A, which moves B with the A change to a single UTXO C
+    let receive_data = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_a.asset_id.clone(),
+        vec![blind_recipient(&receive_data, amount_a_sent)],
+    )]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset_a.asset_id));
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(Some(&asset_a.asset_id));
+
+    // receive a little A on a different UTXO U
+    party.create_utxos(false, Some(2), None, FEE_RATE, None);
+    let receive_data = party.blind_receive();
+    let recipient_map = HashMap::from([(
+        asset_a.asset_id.clone(),
+        vec![blind_recipient(&receive_data, amount_a_received)],
+    )]);
+    let txid = rcv_party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset_a.asset_id));
+    mine(false);
+    party.wait_for_refresh(None);
+    rcv_party.wait_for_refresh(Some(&asset_a.asset_id));
+
+    // check the layout: C holds A and B, U holds a little A only
+    let amounts_a = utxo_amounts(&mut party, &asset_a.asset_id);
+    let amounts_b = utxo_amounts(&mut party, &asset_b.asset_id);
+    assert_eq!(amounts_a.len(), 2);
+    assert_eq!(amounts_b.len(), 1);
+    let (utxo_c, _) = amounts_b.iter().next().unwrap();
+    assert_eq!(amounts_a.get(utxo_c), Some(&amount_a_change));
+    assert!(amounts_a.values().any(|a| *a == amount_a_received));
+    assert_eq!(
+        party.get_asset_balance(&asset_a.asset_id).settled,
+        amount_a_change + amount_a_received
+    );
+
+    // send A and B together: A is selected from U, B from C
+    let receive_data_a = rcv_party.blind_receive();
+    let receive_data_b = rcv_party.blind_receive();
+    let recipient_map = HashMap::from([
+        (
+            asset_a.asset_id.clone(),
+            vec![blind_recipient(&receive_data_a, amount_a_received)],
+        ),
+        (
+            asset_b.asset_id.clone(),
+            vec![blind_recipient(&receive_data_b, amount_b_sent)],
+        ),
+    ]);
+    let txid = party.send_retry(&recipient_map);
+    assert!(!txid.is_empty());
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(None);
+    mine(false);
+    rcv_party.wait_for_refresh(None);
+    party.wait_for_refresh(None);
+    let (transfers, _, _) = party.get_test_transfers_sender(&txid);
+    for transfer in transfers.values().flatten() {
+        let (transfer_data, _) = party.get_test_transfer_data(transfer);
+        assert_eq!(transfer_data.status, TransferStatus::Settled);
+    }
+
+    // the A consignment carries only the A transition, spending the A on U: the A on C is moved
+    // by an extra transition it doesn't carry, so the recipient doesn't learn about it
+    let consignment_path = party
+        .wallet
+        .get_send_consignment_path(&asset_a.asset_id, &txid);
+    let consignment = RgbTransfer::load_file(consignment_path).unwrap();
+    let witness_bundle = consignment
+        .bundled_witnesses()
+        .find(|bw| bw.witness_id().to_string() == txid)
+        .unwrap();
+    let known_transitions = &witness_bundle.bundle.known_transitions;
+    assert_eq!(known_transitions.len(), 1);
+    let main_opid = known_transitions[0].opid;
+    let opids: HashSet<_> = witness_bundle.bundle.input_map.values().copied().collect();
+    assert!(opids.len() > 1 && opids.contains(&main_opid));
+
+    // the A on C, spent as an input of the B transition only, must be moved to the change
+    assert_eq!(
+        party.get_asset_balance(&asset_a.asset_id).settled,
+        amount_a_change
+    );
+    assert_eq!(
+        party.get_asset_balance(&asset_b.asset_id).settled,
+        AMOUNT - amount_b_sent
+    );
 }

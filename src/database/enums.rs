@@ -7,9 +7,9 @@ pub(crate) const SCHEMA_ID_UDA: &str =
 pub(crate) const SCHEMA_ID_CFA: &str =
     "rgb:sch:JgqK5hJX9YBT4osCV7VcW_iLTcA5csUCnLzvaKTTrNY#mars-house-friend";
 pub(crate) const SCHEMA_ID_IFA: &str =
-    "rgb:sch:Y2a6SW4rY3gRwLE40OxILhwOyL2FR9ppte790oLbIe0#athena-paul-horizon";
+    "rgb:sch:UzeBrwOrGqUR7NLRReHIBY7OimYpapjnV~NxiIglPPg#package-general-mozart";
 pub(crate) const SCHEMA_ID_BFA: &str =
-    "rgb:sch:Ryl5eQZ3IHrU05e3AWdQZJR4FB5GvxZPy96cwhJiApc#amazon-norway-harris";
+    "rgb:sch:HbLJ6SjvzVw~XTu6e~Iau6wIcxYsVTlSM7dRUn0DDo4#brave-type-culture";
 
 /// The schema of an asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -90,7 +90,35 @@ impl AssetSchema {
         }
     }
 
-    #[cfg(any(feature = "wallet", feature = "validation"))]
+    /// Whether the schema has state the given concrete `assignment` can refer to.
+    ///
+    /// [`Assignment::Any`] is not a concrete assignment, so it is never supported.
+    pub(crate) fn supports_assignment(&self, assignment: &Assignment) -> bool {
+        match assignment {
+            Assignment::Fungible(_) => match self {
+                Self::Nia | Self::Cfa | Self::Ifa | Self::Bfa => true,
+                Self::Uda => false,
+            },
+            Assignment::NonFungible => match self {
+                Self::Uda => true,
+                Self::Nia | Self::Cfa | Self::Ifa | Self::Bfa => false,
+            },
+            Assignment::InflationRight(_) => match self {
+                Self::Ifa => true,
+                Self::Nia | Self::Uda | Self::Cfa | Self::Bfa => false,
+            },
+            Assignment::LinkRight => match self {
+                Self::Ifa | Self::Bfa => true,
+                Self::Nia | Self::Uda | Self::Cfa => false,
+            },
+            Assignment::MintRight => match self {
+                Self::Bfa => true,
+                Self::Nia | Self::Uda | Self::Cfa | Self::Ifa => false,
+            },
+            Assignment::Any => false,
+        }
+    }
+
     pub(crate) fn schema_rules(&self) -> SchemaRules {
         match self {
             Self::Nia => NonInflatableAsset::schema_rules(),
@@ -102,7 +130,6 @@ impl AssetSchema {
     }
 
     /// Whether the schema can carry a reject list.
-    #[cfg(feature = "validation")]
     pub(crate) fn supports_reject_list(&self) -> bool {
         match self {
             Self::Bfa | Self::Ifa => true,
@@ -111,7 +138,6 @@ impl AssetSchema {
     }
 
     /// Whether the schema supports mint operations.
-    #[cfg(feature = "validation")]
     pub(crate) fn supports_mint(&self) -> bool {
         match self {
             Self::Bfa => true,
@@ -143,31 +169,6 @@ impl AssetSchema {
         }
     }
 
-    /// Whether the schema has state the given concrete `assignment` can refer to.
-    ///
-    /// [`Assignment::Any`] is not a concrete assignment, so it is never supported.
-    pub(crate) fn supports_assignment(&self, assignment: &Assignment) -> bool {
-        match assignment {
-            Assignment::Fungible(_) => match self {
-                Self::Nia | Self::Cfa | Self::Ifa | Self::Bfa => true,
-                Self::Uda => false,
-            },
-            Assignment::NonFungible => match self {
-                Self::Uda => true,
-                Self::Nia | Self::Cfa | Self::Ifa | Self::Bfa => false,
-            },
-            Assignment::InflationRight(_) => match self {
-                Self::Ifa => true,
-                Self::Nia | Self::Uda | Self::Cfa | Self::Bfa => false,
-            },
-            Assignment::MintRight => match self {
-                Self::Bfa => true,
-                Self::Nia | Self::Uda | Self::Cfa | Self::Ifa => false,
-            },
-            Assignment::Any => false,
-        }
-    }
-
     /// Whether the schema can be used on mainnet.
     pub(crate) fn allowed_on_mainnet(&self) -> bool {
         match self {
@@ -175,7 +176,6 @@ impl AssetSchema {
             Self::Ifa | Self::Bfa => false,
         }
     }
-
     /// What a request for [`Assignment::Any`] of the schema refers to: the only kind of state it
     /// can be requested for, or [`Assignment::Any`] itself if there is more than one.
     pub(crate) fn any_assignment(&self) -> Assignment {
@@ -204,6 +204,14 @@ impl AssetSchema {
         }
     }
 
+    /// Whether the schema has a link right, to link the asset to another contract.
+    #[cfg(feature = "_online")]
+    pub(crate) fn supports_link(&self) -> bool {
+        match self {
+            Self::Ifa | Self::Bfa => true,
+            Self::Nia | Self::Uda | Self::Cfa => false,
+        }
+    }
     pub(crate) fn import_schema_definition(&self, stock: &mut RgbStock<'_>) -> Result<(), Error> {
         stock.import_schema_definition(self.schema_definition())
     }
@@ -233,6 +241,12 @@ pub enum ColoringType {
     Input = 3,
     #[sea_orm(num_value = 4)]
     Change = 4,
+}
+
+#[cfg(feature = "wallet")]
+impl ColoringType {
+    /// The types of the colorings assigning allocations to a TXO (the others spend them).
+    pub(crate) const INCOMING: [Self; 3] = [Self::Receive, Self::Change, Self::Issue];
 }
 
 #[cfg(feature = "wallet")]
@@ -495,6 +509,8 @@ pub enum Assignment {
     NonFungible,
     /// Inflation right
     InflationRight(u64),
+    /// Link right
+    LinkRight,
     /// Mint right
     MintRight,
     /// Any assignment
@@ -510,6 +526,7 @@ impl Assignment {
                 Self::InflationRight(amt.as_u64())
             }
             AllocatedState::Data(_) => Self::NonFungible,
+            AllocatedState::Void if opout.ty == OS_LINK => Self::LinkRight,
             AllocatedState::Void if opout.ty == OS_MINT => Self::MintRight,
             _ => unreachable!(),
         }
@@ -531,6 +548,7 @@ impl Assignment {
                     .checked_add(*amt)
                     .expect("total inflation amount cannot exceed u64::MAX")
             }
+            Self::LinkRight => assignments.link = true,
             Self::MintRight => {
                 assignments.mint = assignments
                     .mint
@@ -546,6 +564,7 @@ impl Assignment {
         match self {
             Self::Fungible(_) | Self::NonFungible => Some(RGB_STATE_ASSET_OWNER),
             Self::InflationRight(_) => Some(RGB_STATE_INFLATION_ALLOWANCE),
+            Self::LinkRight => Some(RGB_STATE_LINK_RIGHT),
             Self::MintRight => Some(RGB_STATE_MINT_RIGHT),
             Self::Any => None,
         }
@@ -656,6 +675,7 @@ impl Assignment {
                 _ => None,
             },
             TypedAssigns::Declarative(assigns) => match ty {
+                OS_LINK => assigns.get(no).map(|_| Self::LinkRight),
                 OS_MINT => assigns.get(no).map(|_| Self::MintRight),
                 _ => None,
             },
@@ -677,9 +697,21 @@ pub enum TypeOfTransition {
     /// Burn transition (burning existing tokens)
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 3))]
     Burn = 3,
-    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    /// Link transition (spending the link right to link the asset to another contract)
     #[cfg_attr(feature = "wallet", sea_orm(num_value = 4))]
-    Mint = 4,
+    Link = 4,
+    /// Mint transition (minting assets backed by tokens locked on the external chain)
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 7))]
+    Mint = 7,
+    /// Transfer of inflation rights (moving them beside the transition of the operation)
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 5))]
+    TransferInflation = 5,
+    /// Transfer of link rights (moving them beside the transition of the operation)
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 6))]
+    TransferLink = 6,
+    /// Propagation of mint rights (moving them beside the transition of the operation)
+    #[cfg_attr(feature = "wallet", sea_orm(num_value = 8))]
+    Propagate = 8,
 }
 
 impl TypeOfTransition {
@@ -689,7 +721,11 @@ impl TypeOfTransition {
             Self::Inflate => "inflate",
             Self::Transfer => "transfer",
             Self::Burn => "burn",
+            Self::Link => "link",
             Self::Mint => "mint",
+            Self::TransferInflation => "transferInflation",
+            Self::TransferLink => "transferLink",
+            Self::Propagate => "propagate",
         }
     }
 }
@@ -702,7 +738,11 @@ impl TryFrom<TransitionType> for TypeOfTransition {
             TS_TRANSFER => Self::Transfer,
             TS_INFLATION => Self::Inflate,
             TS_BURN => Self::Burn,
+            TS_LINK => Self::Link,
             TS_MINT => Self::Mint,
+            TS_TRANSFER_INFLATION => Self::TransferInflation,
+            TS_TRANSFER_LINK => Self::TransferLink,
+            TS_PROPAGATE => Self::Propagate,
             _ => return Err(()),
         })
     }
@@ -724,7 +764,6 @@ mod tests {
             let asset_schema_from_schema_id = AssetSchema::from_schema_id(schema_id).unwrap();
             assert_eq!(asset_schema, asset_schema_from_schema_id);
             // the constants match the compiled schemata
-            #[cfg(feature = "validation")]
             assert_eq!(asset_schema.schema_rules().schema_id(), schema_id);
         }
 
@@ -834,6 +873,8 @@ mod tests {
             Assignment::Fungible(100),
             Assignment::NonFungible,
             Assignment::InflationRight(500),
+            Assignment::LinkRight,
+            Assignment::MintRight,
             Assignment::Any,
         ];
         for assignment in assignments {
@@ -896,6 +937,8 @@ mod tests {
         assert_eq!(Assignment::Fungible(0).main_amount(), 0);
         assert_eq!(Assignment::NonFungible.main_amount(), 1);
         assert_eq!(Assignment::InflationRight(500).main_amount(), 0);
+        assert_eq!(Assignment::LinkRight.main_amount(), 0);
+        assert_eq!(Assignment::MintRight.main_amount(), 0);
         assert_eq!(Assignment::Any.main_amount(), 0);
     }
 

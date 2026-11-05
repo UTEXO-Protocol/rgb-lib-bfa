@@ -49,7 +49,6 @@ pub fn load_fascia(path: &Path) -> Result<Fascia, Error> {
     read_fascia(path)
 }
 
-#[cfg(feature = "validation")]
 pub use crate::no_wallet::validate_consignment_with_resolver;
 
 /// Rust-only APIs of the wallet.
@@ -227,11 +226,8 @@ impl Wallet {
                 .map_err(InternalError::from)?;
         }
 
-        for (contract_id, transition) in all_transitions {
-            for opout in transition.inputs() {
-                psbt.set_rgb_contract_consumer(contract_id, opout, transition.id())
-                    .map_err(InternalError::from)?;
-            }
+        // pushing a transition also sets it as the consumer of all of its inputs
+        for transition in all_transitions.into_values() {
             psbt.push_rgb_transition(transition)
                 .map_err(InternalError::from)?;
         }
@@ -239,6 +235,8 @@ impl Wallet {
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         psbt.set_as_unmodifiable();
         let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+        strip_rgb_data(psbt);
+        check_psbt_parsable(psbt)?;
 
         info!(self.logger(), "Color PSBT completed");
         Ok((fascia, asset_beneficiaries))
@@ -379,7 +377,7 @@ impl Wallet {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            AnchorResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         ) {
             Ok(consignment) => consignment,
@@ -407,8 +405,11 @@ impl Wallet {
             .import_contract(valid_contract, &self.blockchain_resolver())
             .expect("failure importing validated contract");
 
-        let received_rgb_assignments =
-            self.extract_received_assignments(&consignment, witness_id, Some(vout), None);
+        let received_rgb_assignments = self.extract_received_assignments(
+            &consignment,
+            witness_id,
+            PaymentSeal::WitnessVout(vout),
+        );
 
         let resolver = OffchainResolver {
             witness_id: Some(witness_id),
@@ -526,7 +527,7 @@ impl Wallet {
             &consignment,
             Some(witness_id),
             &self.blockchain_resolver(),
-            self.evm_rpc_urls(),
+            AnchorResolution::Evm(self.evm_rpc_urls()),
             &validation_config,
         )?;
         let valid_contract = valid_transfer.clone().into_valid_contract();

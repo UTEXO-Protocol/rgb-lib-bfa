@@ -73,6 +73,14 @@ to 64, and the aggregate active payload set to 64 MiB before recovery allocation
 Terminal records remain retained. Snapshots contain the journal and sensitive proof
 and wallet data and require encrypted transport.
 
+On bfa.5, the journal stores commitment entropy separately because the upstream
+PSBT builder strips RGB/MPC metadata before handoff. Recovery recomputes the
+commitment from the exact fascia bundles and this entropy, then verifies it against
+the transaction. Previous journal records may still supply entropy through the
+PSBT map. Missing or changed entropy is rejected. Consignments must contain exactly
+the prepared terminal operations, beneficiaries, witness transaction and bundle;
+the old terminal-bundle container is not used by this release.
+
 These guards do not establish arbitrary external-signer broadcast recovery,
 post-consumption reorg qualification, every Lightning channel lifecycle or platform
 acceptance. Test results must identify the exact source graph and exercised scope.

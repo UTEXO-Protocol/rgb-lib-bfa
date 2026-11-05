@@ -3,7 +3,7 @@ use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 
-// TypeOfTransition values (see wallet::objects::TypeOfTransition)
+// TypeOfTransition values (see database::enums::TypeOfTransition)
 const TRANSITION_TRANSFER: i32 = 1;
 const TRANSITION_INFLATE: i32 = 2;
 const TRANSITION_BURN: i32 = 3;
@@ -28,8 +28,8 @@ impl MigrationTrait for Migration {
 
         // backfill the outgoing asset transfers (incoming ones record no transition), telling the
         // transition apart as the transfer listing did before: a burn is the only one with a
-        // transfer having no recipient, an inflation the only one with issue colorings. Mints
-        // were never released before this migration
+        // transfer having no recipient, an inflation the only one with issue colorings. Links
+        // and mints were never released before this migration
         manager
             .get_connection()
             .execute_unprepared(&format!(

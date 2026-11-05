@@ -85,7 +85,8 @@ restore interface. Raw archive creation is not proof of full Lightning recovery.
 ```sh
 cargo test --locked --lib --no-default-features --features wallet -- --test-threads=1
 cargo test --locked --lib --no-default-features --features wallet,bitcoind migration_prerequisites -- --test-threads=1
-cargo test --locked --lib --no-default-features --features validation -- --test-threads=1
+cargo test --locked --lib --no-default-features -- --test-threads=1
+cargo test --locked --lib --no-default-features --features bitcoind_validation,electrum_validation,esplora_validation -- --test-threads=1
 ```
 
 The prerequisite tests use fresh private wallets and the supplied public contract.
@@ -96,13 +97,20 @@ separate integration scopes.
 
 ## Current BFA branch integration
 
-The migration branch merges BFA source `4b78c2285b7e9d719dd5b465d186b2fe8ad6450b`
-without rewriting its earlier tested commits. It retains upstream's wallet-less
-inspection/validation split, EVM finality and retry handling, reject-list bounds,
-and updated dependency graph. Contract registration stays available with `wallet`
-alone; the schema rules it needs are also available to wallet-less `validation`.
+The migration branch carries these prerequisites onto the frozen bfa.5 source
+`0a9d352f2690902df2b6fae9bca1a6c13c3354d4`
+(`v0.3.0-beta.7-upstream-dev-bfa.5`, branch `bfa-1ae1c160`), retaining its merge
+ancestry. It preserves bfa.5's terminal-operation consignment format, block-based
+EVM mint-lock checks, link-capable schemas and wallet-less validation feature split.
+The rolling `bfa` branch is a different release base and is not this PR's target.
+Contract registration stays available with `wallet` alone. Wallet-less inspection
+needs no feature, and network validation selects `bitcoind_validation`,
+`electrum_validation` or `esplora_validation`.
 The no-argument EVM request fix still sends `params: []` through upstream's shared
 RPC/retry path. The snapshot token and archive-admission boundaries are unchanged.
+The new BUSDT positive fixture and legacy-format rejection fixture are documented
+under `tests/fixtures`; importing a previous schema is not silently coerced into
+the new asset identity.
 
 Linux/macOS CI checks formatting, offline wallet/import/snapshot regressions,
 online-capable import/snapshot and mock EVM tests, and wallet-less validation.

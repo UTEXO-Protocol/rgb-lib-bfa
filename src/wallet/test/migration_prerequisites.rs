@@ -1,8 +1,9 @@
 use super::*;
 use std::io::{Cursor, Read};
 
-const DEV_ASSET: &str = "rgb:OG9No4hZ-UrxoWmR-09ohtOk-ppxBN7h-g~KkQro-ncKc9A4";
-const DEV_CONTRACT: &[u8] = include_bytes!("../../../tests/fixtures/dev-bridge-usdt.rgb");
+const DEV_ASSET: &str = "rgb:fbkO6B_i-qyLXa6d-x3sAOaX-cx~vZB9-rxNSUle-9lXBTf8";
+const DEV_CONTRACT: &[u8] = include_bytes!("../../../tests/fixtures/dev-bridge-busdt-bfa5.rgb");
+const LEGACY_DEV_CONTRACT: &[u8] = include_bytes!("../../../tests/fixtures/dev-bridge-usdt.rgb");
 
 fn contract_path(directory: &PrivateDataDir) -> String {
     let path = directory.sub_path("public-contract.rgb");
@@ -23,10 +24,33 @@ fn execute_sql(wallet: &Wallet, sql: &str) {
 
 #[test]
 #[parallel]
+fn legacy_contract_encoding_is_rejected_without_wallet_mutation() {
+    let directory = PrivateDataDir::new();
+    let mut wallet = directory.wallet_with_net(false, None, BitcoinNetwork::Signet);
+    let path = directory.sub_path("legacy-contract.rgb");
+    fs::write(&path, LEGACY_DEV_CONTRACT).unwrap();
+    let pending = wallet.backup_info().unwrap();
+    assert!(matches!(
+        wallet.import_contract(path.to_string_lossy().into_owned(), None),
+        Err(Error::InvalidConsignment)
+    ));
+    assert!(
+        wallet
+            .list_assets(vec![AssetSchema::Bfa])
+            .unwrap()
+            .bfa
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(wallet.backup_info().unwrap(), pending);
+}
+
+#[test]
+#[parallel]
 fn supplied_contract_registers_without_balance_or_transfer_and_is_idempotent() {
     assert_eq!(
         hex::encode(Sha256::digest(DEV_CONTRACT)),
-        "dfb49261fed5ad3dd237dd3a03913793b76fe70e486372bbeb0769b82158a895"
+        "a678ebf73f3a0523b307cd2fe8019a321ac938eaf547c2c65a7ac079948332ce"
     );
     let directory = PrivateDataDir::new();
     let mut wallet = directory.wallet_with_net(false, None, BitcoinNetwork::Signet);

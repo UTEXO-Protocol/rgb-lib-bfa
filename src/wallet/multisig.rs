@@ -1495,6 +1495,8 @@ impl MultisigWallet {
             amounts,
             inflation_amounts,
             reject_list_url,
+            false,
+            None,
         )?;
         let res = self.upload_and_process_issuance(&txn, &issue_data, vec![])?;
         txn.commit()?;
