@@ -804,7 +804,14 @@ pub trait WalletOnline: WalletOffline {
 
         let script_pubkey = self.get_script_pubkey(&address)?;
 
-        let reserved = self.get_reserved_bdk_outpoints(txn)?;
+        // a drain spends every UTXO, reserved ones included, except the inputs of active sweeps
+        let sweeps: HashSet<i32> = txn.prepared_sweep_active_batches()?.into_iter().collect();
+        let reserved: Vec<BdkOutPoint> = txn
+            .iter_reserved_txos()?
+            .into_iter()
+            .filter(|r| r.reserved_for_colored.is_some_and(|b| sweeps.contains(&b)))
+            .map(BdkOutPoint::from)
+            .collect();
         let mut tx_builder = self.bdk_wallet_mut().build_tx();
         tx_builder
             .unspendable(reserved)
@@ -4396,6 +4403,7 @@ pub trait WalletOnline: WalletOffline {
         filter: Vec<RefreshFilter>,
         skip_sync: bool,
     ) -> Result<RefreshResult, Error> {
+        super::prepared_sweep::release_lost_sweeps(self, txn)?;
         let mut db_data = txn.get_db_data(false)?;
 
         if asset_id.is_some() {
@@ -4628,7 +4636,6 @@ pub trait WalletOnline: WalletOffline {
         input_outpoints: HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         let change_addr = self.get_new_address()?.script_pubkey();
         let mut builder = self.bdk_wallet_mut().build_tx();
@@ -4643,9 +4650,6 @@ pub trait WalletOnline: WalletOffline {
             builder.add_recipient(script_buf.clone(), BdkAmount::from_sat(*amount_sat));
         }
         builder.drain_to(change_addr.clone());
-        if let Some(lock_time) = lock_time {
-            builder.nlocktime(lock_time);
-        }
 
         let mut psbt = builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
@@ -4684,15 +4688,9 @@ pub trait WalletOnline: WalletOffline {
         all_inputs: &mut HashSet<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: FeeRate,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
     ) -> Result<(Psbt, Option<BtcChange>), Error> {
         Ok(loop {
-            break match self.prepare_psbt(
-                all_inputs.clone(),
-                witness_recipients,
-                fee_rate,
-                lock_time,
-            ) {
+            break match self.prepare_psbt(all_inputs.clone(), witness_recipients, fee_rate) {
                 Ok(res) => res,
                 Err(Error::InsufficientBitcoins { .. }) => {
                     let used_txos: Vec<Outpoint> =
@@ -6373,45 +6371,6 @@ pub trait WalletOnline: WalletOffline {
         rejected: &mut HashSet<Opout>,
         dry_run: bool,
     ) -> Result<PrepareTransferPsbtResult, Error> {
-        self.prepare_transfer_psbt_with_locktime(
-            txn,
-            transfer_info_map,
-            transfer_dir,
-            donation,
-            unspents,
-            input_unspents,
-            witness_recipients,
-            fee_rate_checked,
-            min_confirmations,
-            expiration_timestamp,
-            sender_transport_endpoint,
-            operation_secret_key,
-            stock,
-            rejected,
-            dry_run,
-            None,
-        )
-    }
-
-    fn prepare_transfer_psbt_with_locktime(
-        &mut self,
-        txn: &DbTxn,
-        transfer_info_map: &mut BTreeMap<String, InfoAssetTransfer>,
-        transfer_dir: PathBuf,
-        donation: bool,
-        unspents: Vec<LocalUnspent>,
-        input_unspents: &[LocalUnspent],
-        witness_recipients: &Vec<(ScriptBuf, u64)>,
-        fee_rate_checked: FeeRate,
-        min_confirmations: u8,
-        expiration_timestamp: Option<i64>,
-        sender_transport_endpoint: Option<String>,
-        operation_secret_key: Option<Vec<u8>>,
-        stock: &mut RgbStock<'_>,
-        rejected: &mut HashSet<Opout>,
-        dry_run: bool,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
-    ) -> Result<PrepareTransferPsbtResult, Error> {
         // prepare BDK PSBT
         let mut all_inputs: HashSet<BdkOutPoint> = transfer_info_map
             .values()
@@ -6427,7 +6386,6 @@ pub trait WalletOnline: WalletOffline {
             &mut all_inputs,
             witness_recipients,
             fee_rate_checked,
-            lock_time,
         )?;
         psbt.unsigned_tx.output[0].script_pubkey = ScriptBuf::new_op_return([]);
 
@@ -6524,31 +6482,6 @@ pub trait WalletOnline: WalletOffline {
         expiration_timestamp: Option<i64>,
         sender_transport_endpoint: Option<String>,
         dry_run: bool,
-    ) -> Result<BeginOperationData, Error> {
-        self.send_begin_impl_with_locktime(
-            txn,
-            recipient_map,
-            donation,
-            fee_rate,
-            min_confirmations,
-            expiration_timestamp,
-            sender_transport_endpoint,
-            dry_run,
-            None,
-        )
-    }
-
-    fn send_begin_impl_with_locktime(
-        &mut self,
-        txn: &DbTxn,
-        recipient_map: HashMap<String, Vec<Recipient>>,
-        donation: bool,
-        fee_rate: u64,
-        min_confirmations: u8,
-        expiration_timestamp: Option<i64>,
-        sender_transport_endpoint: Option<String>,
-        dry_run: bool,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
     ) -> Result<BeginOperationData, Error> {
         if recipient_map.is_empty() || recipient_map.values().any(|v| v.is_empty()) {
             return Err(Error::InvalidRecipientMap);
@@ -6750,7 +6683,7 @@ pub trait WalletOnline: WalletOffline {
                 }
             }
 
-            match self.prepare_transfer_psbt_with_locktime(
+            match self.prepare_transfer_psbt(
                 txn,
                 &mut transfer_info_map,
                 transfer_dir.clone(),
@@ -6766,7 +6699,6 @@ pub trait WalletOnline: WalletOffline {
                 &mut stock,
                 &mut rejected,
                 dry_run,
-                lock_time,
             )? {
                 PrepareTransferPsbtResult::Retry => continue,
                 PrepareTransferPsbtResult::Success(begin_operation_data) => {
@@ -6783,9 +6715,7 @@ pub trait WalletOnline: WalletOffline {
         // before reading the transfer data, which doesn't parse for a send from before the proxy
         // protocol update (failed by the upgrade)
         let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
-        if txn.is_prepared_rgb_sweep_txid(&txid)? {
-            return Err(Error::WrongOperation { txid });
-        }
+        txn.ensure_no_prepared_sweep_mutation(&signed_psbt.unsigned_tx)?;
         if let Some(existing) = txn
             .get_batch_transfers_by_txid(&txid)?
             .into_iter()
@@ -7058,21 +6988,6 @@ pub trait WalletOnline: WalletOffline {
         skip_sync: bool,
         dry_run: bool,
     ) -> Result<Psbt, Error> {
-        self.send_btc_begin_impl_with_locktime(
-            txn, address, amount, fee_rate, skip_sync, dry_run, None,
-        )
-    }
-
-    fn send_btc_begin_impl_with_locktime(
-        &mut self,
-        txn: &DbTxn,
-        address: String,
-        amount: u64,
-        fee_rate: u64,
-        skip_sync: bool,
-        dry_run: bool,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
-    ) -> Result<Psbt, Error> {
         let fee_rate_checked = self.check_fee_rate(fee_rate)?;
 
         if !skip_sync {
@@ -7097,9 +7012,6 @@ pub trait WalletOnline: WalletOffline {
             .unspendable(unspendable)
             .add_recipient(script_pubkey, BdkAmount::from_sat(amount))
             .fee_rate(fee_rate_checked);
-        if let Some(lock_time) = lock_time {
-            tx_builder.nlocktime(lock_time);
-        }
         let mut psbt = tx_builder.finish().map_err(|e| match e {
             bdk_wallet::error::CreateTxError::CoinSelection(InsufficientFunds {
                 needed,
@@ -7258,9 +7170,7 @@ pub trait WalletOnline: WalletOffline {
     /// status brought back.
     fn check_end_initiated(&self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<(), Error> {
         let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
-        if txn.is_prepared_rgb_sweep_txid(&txid)? {
-            return Err(Error::WrongOperation { txid });
-        }
+        txn.ensure_no_prepared_sweep_mutation(&signed_psbt.unsigned_tx)?;
         if let Some(existing) = txn
             .get_batch_transfers_by_txid(&txid)?
             .into_iter()

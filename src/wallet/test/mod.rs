@@ -19,6 +19,8 @@ use std::path::MAIN_SEPARATOR_STR;
 use amplify::set;
 #[cfg(feature = "_online")]
 use bdk_wallet::bitcoin::Denomination;
+#[cfg(feature = "electrum")]
+use bdk_wallet::bitcoin::{Sequence, TxIn, Witness, absolute::LockTime, transaction::Version};
 use bdk_wallet::descriptor::ExtendedDescriptor;
 #[cfg(feature = "electrum")]
 use biscuit_auth::{KeyPair, builder::date, macros::*};

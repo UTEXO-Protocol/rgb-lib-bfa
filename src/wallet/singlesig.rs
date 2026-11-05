@@ -1022,6 +1022,8 @@ impl Wallet {
     /// operation, only do this if you know what you're doing! After draining the wallet will not
     /// be usable anymore.</div>
     ///
+    /// The inputs of active prepared sweeps are left out.
+    ///
     /// If `dry_run` is true, the wallet does not reserve the selected vanilla TXOs. The returned
     /// PSBT can still be signed and completed with [`drain_to_end`](Wallet::drain_to_end) but
     /// concurrent vanilla operations may try to spend the same inputs.
@@ -1175,66 +1177,10 @@ impl Wallet {
         sender_transport_endpoint: Option<String>,
         dry_run: bool,
     ) -> Result<SendBeginResult, Error> {
-        self.send_begin_with_locktime(
-            online,
-            recipient_map,
-            donation,
-            fee_rate,
-            min_confirmations,
-            expiration_timestamp,
-            sender_transport_endpoint,
-            dry_run,
-            None,
-        )
-    }
-
-    /// Prepare an RGB channel-funding transfer with an absolute locktime of zero.
-    ///
-    /// This Rust-only API retains the validation, result and `dry_run` semantics of
-    /// [`Self::send_begin`]. The locktime is applied by the transaction builder before
-    /// RGB commitments, transaction identity and any input reservations are recorded.
-    /// It does not sign or broadcast the transaction. Ordinary sends retain their
-    /// existing transaction-builder locktime policy.
-    pub fn send_channel_funding_begin(
-        &mut self,
-        online: Online,
-        recipient_map: HashMap<String, Vec<Recipient>>,
-        donation: bool,
-        fee_rate: u64,
-        min_confirmations: u8,
-        expiration_timestamp: u64,
-        sender_transport_endpoint: Option<String>,
-        dry_run: bool,
-    ) -> Result<SendBeginResult, Error> {
-        self.send_begin_with_locktime(
-            online,
-            recipient_map,
-            donation,
-            fee_rate,
-            min_confirmations,
-            expiration_timestamp,
-            sender_transport_endpoint,
-            dry_run,
-            Some(bdk_wallet::bitcoin::absolute::LockTime::ZERO),
-        )
-    }
-
-    fn send_begin_with_locktime(
-        &mut self,
-        online: Online,
-        recipient_map: HashMap<String, Vec<Recipient>>,
-        donation: bool,
-        fee_rate: u64,
-        min_confirmations: u8,
-        expiration_timestamp: u64,
-        sender_transport_endpoint: Option<String>,
-        dry_run: bool,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
-    ) -> Result<SendBeginResult, Error> {
         info!(self.logger(), "Sending (begin) to: {:?}...", recipient_map);
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let begin_op_data = self.send_begin_impl_with_locktime(
+        let begin_op_data = self.send_begin_impl(
             &txn,
             recipient_map,
             donation,
@@ -1243,7 +1189,6 @@ impl Wallet {
             Some(expiration_timestamp as i64),
             sender_transport_endpoint,
             dry_run,
-            lock_time,
         )?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
@@ -1411,53 +1356,10 @@ impl Wallet {
         skip_sync: bool,
         dry_run: bool,
     ) -> Result<String, Error> {
-        self.send_btc_begin_with_locktime(
-            online, address, amount, fee_rate, skip_sync, dry_run, None,
-        )
-    }
-
-    /// Prepare Bitcoin channel funding with an absolute locktime of zero.
-    ///
-    /// This Rust-only API retains the validation and `dry_run` semantics of
-    /// [`Self::send_btc_begin`]. The builder fixes the locktime before finalizing
-    /// the PSBT and reserving its exact transaction inputs. Signing and broadcast
-    /// remain separate operations; ordinary Bitcoin sends are unchanged.
-    pub fn send_btc_channel_funding_begin(
-        &mut self,
-        online: Online,
-        address: String,
-        amount: u64,
-        fee_rate: u64,
-        skip_sync: bool,
-        dry_run: bool,
-    ) -> Result<String, Error> {
-        self.send_btc_begin_with_locktime(
-            online,
-            address,
-            amount,
-            fee_rate,
-            skip_sync,
-            dry_run,
-            Some(bdk_wallet::bitcoin::absolute::LockTime::ZERO),
-        )
-    }
-
-    fn send_btc_begin_with_locktime(
-        &mut self,
-        online: Online,
-        address: String,
-        amount: u64,
-        fee_rate: u64,
-        skip_sync: bool,
-        dry_run: bool,
-        lock_time: Option<bdk_wallet::bitcoin::absolute::LockTime>,
-    ) -> Result<String, Error> {
         info!(self.logger(), "Sending BTC (begin)...");
         self.check_online(online)?;
         let txn = self.database().begin_transaction()?;
-        let res = self.send_btc_begin_impl_with_locktime(
-            &txn, address, amount, fee_rate, skip_sync, dry_run, lock_time,
-        )?;
+        let res = self.send_btc_begin_impl(&txn, address, amount, fee_rate, skip_sync, dry_run)?;
         if !dry_run {
             self.update_backup_info(&txn, false)?;
         }

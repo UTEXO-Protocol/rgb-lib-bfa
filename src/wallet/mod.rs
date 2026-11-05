@@ -3,8 +3,6 @@
 //! This module defines the [`Wallet`] and [`MultisigWallet`] structures and related functionality.
 
 pub(crate) mod backup;
-#[cfg(test)]
-mod channel_funding_tests;
 pub(crate) mod core;
 #[cfg(feature = "_online")]
 pub(crate) mod indexer;
@@ -15,6 +13,8 @@ pub(crate) mod offline;
 pub(crate) mod online;
 #[cfg(feature = "_online")]
 mod prepared_sweep;
+#[cfg(test)]
+mod prepared_sweep_fixture;
 pub mod rust_only;
 pub(crate) mod singlesig;
 

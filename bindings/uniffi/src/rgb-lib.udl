@@ -1145,11 +1145,14 @@ interface Wallet {
     Encryption? encryption);
 
   // Color an externally built PSBT (e.g. an HTLC claim or refund) and reserve its batch without
-  // consuming RGB state. The consignments are saved under the wallet directory; a payment to a
-  // witness receive of this wallet is accepted by providing them out of band.
+  // consuming RGB state. The PSBT inputs carrying RGB assignments must be exactly input_outpoints
+  // and every asset output must pay a pending witness receive or a colored script of this wallet.
+  // The consignments are saved under the wallet directory; a payment to a witness receive of this
+  // wallet is accepted by providing them out of band.
   [Throws=RgbLibError]
   PreparedSweep color_psbt_and_prepare_consume(
-    string psbt, ColoringInfo coloring_info, u8 min_confirmations);
+    string psbt, ColoringInfo coloring_info, sequence<Outpoint> input_outpoints,
+    u8 min_confirmations);
 
   [Throws=RgbLibError]
   sequence<PreparedSweep> list_prepared_sweeps();

@@ -124,8 +124,15 @@ fn save_sweep_consignments(
     transfers
         .iter()
         .map(|transfer| {
-            let path = dir.join(format!("{}.rgb", transfer.contract_id()));
-            transfer.save_file(&path)?;
+            let contract_id = transfer.contract_id().to_string();
+            let name = contract_id.strip_prefix("rgb:").unwrap_or(&contract_id);
+            let path = dir.join(format!("{name}.rgb"));
+            // written once, through a temporary file renamed into place
+            if !path.exists() {
+                let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+                transfer.save_file(&tmp)?;
+                std::fs::rename(&tmp, &path)?;
+            }
             Ok(path.to_string_lossy().to_string())
         })
         .collect()
@@ -1545,6 +1552,7 @@ impl Wallet {
         &self,
         psbt: String,
         coloring_info: ColoringInfo,
+        input_outpoints: Vec<Outpoint>,
         min_confirmations: u8,
     ) -> Result<PreparedSweep, RgbLibError> {
         let mut psbt = Psbt::from_str(&psbt)?;
@@ -1553,6 +1561,7 @@ impl Wallet {
         let result = wallet.color_psbt_and_prepare_consume(
             &mut psbt,
             coloring_info,
+            input_outpoints,
             min_confirmations,
             None,
         )?;

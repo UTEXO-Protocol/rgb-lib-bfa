@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-        features: [wallet, bitcoind, validation]
+        features: [wallet, bitcoind, electrum_validation]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 35
     env:
@@ -45,10 +45,10 @@ jobs:
             cargo test --locked --no-default-features --features bitcoind --lib api::evm::tests -- --test-threads=1
           else
             # Wallet-less validation must remain independent of wallet/storage features.
-            cargo test --locked --no-default-features --features validation --lib -- --test-threads=1
+            cargo test --locked --no-default-features --features electrum_validation --lib -- --test-threads=1
           fi
 
-  funded-funding-and-sweeps:
+  funded-sweeps:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -95,11 +95,10 @@ jobs:
                   raise RuntimeError('regtest indexes did not become ready')
               time.sleep(1)
           PY
-      - name: Test final-locktime funding and durable confirmed sweeps
+      - name: Test durable confirmed sweeps
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked --no-default-features --features bitcoind --lib channel_funding_tests -- --test-threads=1
           cargo test --locked --no-default-features --features bitcoind --lib prepared_sweep -- --test-threads=1
       - name: Record fixture logs on failure
         if: failure()

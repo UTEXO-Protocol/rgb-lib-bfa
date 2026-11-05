@@ -378,6 +378,56 @@ impl Indexer {
         })
     }
 
+    /// Whether a confirmed transaction other than `txid` spends `outpoint`, which pays `script`
+    pub(crate) fn conflicting_spend_confirmed(
+        &self,
+        outpoint: OutPoint,
+        #[cfg_attr(any(feature = "esplora", feature = "bitcoind"), allow(unused))]
+        script: &ScriptBuf,
+        txid: &str,
+    ) -> Result<bool, Error> {
+        Ok(match self {
+            #[cfg(feature = "bitcoind")]
+            Indexer::Bitcoind(client) => {
+                client
+                    .get_tx_out(&outpoint.txid, outpoint.vout, Some(false))
+                    .map_err(IndexerError::from)?
+                    .is_none()
+                    && self.get_tx_confirmations(txid)?.unwrap_or(0) == 0
+            }
+            #[cfg(feature = "electrum")]
+            Indexer::Electrum(client) => {
+                let own = Txid::from_str(txid).map_err(|_| Error::InvalidTxid)?;
+                for entry in client
+                    .inner
+                    .script_get_history(script)
+                    .map_err(IndexerError::from)?
+                {
+                    if entry.height <= 0 || entry.tx_hash == own {
+                        continue;
+                    }
+                    let tx = client
+                        .inner
+                        .transaction_get(&entry.tx_hash)
+                        .map_err(IndexerError::from)?;
+                    if tx.input.iter().any(|i| i.previous_output == outpoint) {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            #[cfg(feature = "esplora")]
+            Indexer::Esplora(client) => client
+                .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                .map_err(IndexerError::from)?
+                .is_some_and(|status| {
+                    status.spent
+                        && status.txid.map(|t| t.to_string()).as_deref() != Some(txid)
+                        && status.status.is_some_and(|s| s.confirmed)
+                }),
+        })
+    }
+
     pub(crate) fn populate_tx_cache(
         &self,
         #[cfg_attr(any(feature = "esplora", feature = "bitcoind"), allow(unused))]
