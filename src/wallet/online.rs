@@ -8498,4 +8498,41 @@ mod tests {
             Error::Proxy { .. }
         );
     }
+
+    // A hostile `expires_at` must not panic, overflow a later `+ margin`, or yield a past deadline.
+    #[test]
+    fn broadcast_deadline_tolerates_hostile_expires_at() {
+        let grace = MIN_SENDER_RETENTION_GRACE_SECS;
+        let now = now().unix_timestamp();
+
+        // near i64::MAX: no panic, and no deadline that overflows once the confirmation margin is
+        // added (a saturating-only fix that returns i64::MAX fails this)
+        for exp in [
+            i64::MAX.to_string(),
+            (i64::MAX - i64::from(grace)).to_string(),
+            (i64::MAX - i64::from(grace) + 1).to_string(),
+        ] {
+            if let Some(deadline) = broadcast_deadline(Some(&exp), grace) {
+                assert!(
+                    deadline
+                        .checked_add(i64::from(CONFIRMATION_MARGIN_SECS))
+                        .is_some(),
+                    "deadline {deadline} from expires_at {exp} overflows once the confirmation \
+                     margin is added, panicking every later refresh"
+                );
+            }
+        }
+
+        // a past (here negative) expiration must not land the deadline before now: that would
+        // fail the just-ACKed transfer before its TX can be broadcast. A bare checked/saturating
+        // add leaves `-1 + grace` in 1970 and misses this; the value must be clamped up to now or
+        // rejected (returning None, which this guard skips).
+        if let Some(deadline) = broadcast_deadline(Some("-1"), grace) {
+            assert!(
+                deadline >= now,
+                "a negative expires_at produced a deadline ({deadline}) already in the past \
+                 (now {now}), which would fail the transfer before its TX can be broadcast"
+            );
+        }
+    }
 }

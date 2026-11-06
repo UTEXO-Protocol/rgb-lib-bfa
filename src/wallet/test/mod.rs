@@ -708,6 +708,8 @@ mod mint;
 mod multisig;
 mod new;
 #[cfg(feature = "electrum")]
+mod proxy_expires_at;
+#[cfg(feature = "electrum")]
 mod refresh;
 #[cfg(feature = "electrum")]
 mod rust_only;

@@ -793,6 +793,21 @@ pub(crate) fn default_send_expiration() -> u64 {
     (now().unix_timestamp() + DURATION_SEND_TRANSFER as i64) as u64
 }
 
+// a mock proxy serving POST /json-rpc with `handler`, which receives each request and returns the
+// response body. Holds the setup every mock proxy below repeats.
+#[cfg(feature = "electrum")]
+pub(crate) fn json_rpc_proxy(
+    handler: impl Fn(&mockito::Request) -> Vec<u8> + Send + Sync + 'static,
+) -> (mockito::ServerGuard, mockito::Mock) {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/json-rpc")
+        .with_body_from_request(move |req| handler(req))
+        .expect_at_least(1)
+        .create();
+    (server, mock)
+}
+
 // proxy that forwards every call to the real one, except ACK posts and gets that receive an
 // unparsable response while `fail_ack` is set; it also returns how many times a consignment
 // has been requested
@@ -802,24 +817,19 @@ pub(crate) fn failing_ack_proxy(
 ) -> (mockito::ServerGuard, mockito::Mock, Arc<AtomicUsize>) {
     let consignment_gets = Arc::new(AtomicUsize::new(0));
     let gets = Arc::clone(&consignment_gets);
-    let mut server = mockito::Server::new();
-    let mock = server
-        .mock("POST", "/json-rpc")
-        .with_body_from_request(move |req| {
-            let body = req.body().unwrap().clone();
-            let body_str = String::from_utf8_lossy(&body);
-            if body_str.contains("\"consignment.get\"") {
-                gets.fetch_add(1, Ordering::Relaxed);
-            }
-            if fail_ack.load(Ordering::Relaxed)
-                && (body_str.contains("\"ack.post\"") || body_str.contains("\"ack.get\""))
-            {
-                return b"not valid json".to_vec();
-            }
-            forward_to_proxy(req, body)
-        })
-        .expect_at_least(1)
-        .create();
+    let (server, mock) = json_rpc_proxy(move |req| {
+        let body = req.body().unwrap().clone();
+        let body_str = String::from_utf8_lossy(&body);
+        if body_str.contains("\"consignment.get\"") {
+            gets.fetch_add(1, Ordering::Relaxed);
+        }
+        if fail_ack.load(Ordering::Relaxed)
+            && (body_str.contains("\"ack.post\"") || body_str.contains("\"ack.get\""))
+        {
+            return b"not valid json".to_vec();
+        }
+        forward_to_proxy(req, body)
+    });
     (server, mock, consignment_gets)
 }
 
@@ -829,46 +839,34 @@ pub(crate) fn failing_ack_proxy(
 pub(crate) fn failing_list_proxy(
     fail_list: Arc<AtomicBool>,
 ) -> (mockito::ServerGuard, mockito::Mock) {
-    let mut server = mockito::Server::new();
-    let mock = server
-        .mock("POST", "/json-rpc")
-        .with_body_from_request(move |req| {
-            let body = req.body().unwrap().clone();
-            if fail_list.load(Ordering::Relaxed)
-                && String::from_utf8_lossy(&body).contains("\"transfer.list\"")
-            {
-                return b"not valid json".to_vec();
-            }
-            forward_to_proxy(req, body)
-        })
-        .expect_at_least(1)
-        .create();
-    (server, mock)
+    json_rpc_proxy(move |req| {
+        let body = req.body().unwrap().clone();
+        if fail_list.load(Ordering::Relaxed)
+            && String::from_utf8_lossy(&body).contains("\"transfer.list\"")
+        {
+            return b"not valid json".to_vec();
+        }
+        forward_to_proxy(req, body)
+    })
 }
 
 // proxy that forwards every call to the real one, except the calls starting a new transfer
 // (invoice.prepare, consignment.post and ack.prepare) that are refused as by a draining proxy
 #[cfg(feature = "electrum")]
 pub(crate) fn draining_proxy(draining: Arc<AtomicBool>) -> (mockito::ServerGuard, mockito::Mock) {
-    let mut server = mockito::Server::new();
-    let mock = server
-        .mock("POST", "/json-rpc")
-        .with_body_from_request(move |req| {
-            let body = req.body().unwrap().clone();
-            let body_str = String::from_utf8_lossy(&body);
-            // consignment.post is a multipart call, so its method name is not quoted
-            if draining.load(Ordering::Relaxed)
-                && ["invoice.prepare", "consignment.post", "ack.prepare"]
-                    .iter()
-                    .any(|m| body_str.contains(m))
-            {
-                return br#"{"jsonrpc":"2.0","id":null,"error":{"code":-115,"message":"Server draining"}}"#.to_vec();
-            }
-            forward_to_proxy(req, body)
-        })
-        .expect_at_least(1)
-        .create();
-    (server, mock)
+    json_rpc_proxy(move |req| {
+        let body = req.body().unwrap().clone();
+        let body_str = String::from_utf8_lossy(&body);
+        // consignment.post is a multipart call, so its method name is not quoted
+        if draining.load(Ordering::Relaxed)
+            && ["invoice.prepare", "consignment.post", "ack.prepare"]
+                .iter()
+                .any(|m| body_str.contains(m))
+        {
+            return br#"{"jsonrpc":"2.0","id":null,"error":{"code":-115,"message":"Server draining"}}"#.to_vec();
+        }
+        forward_to_proxy(req, body)
+    })
 }
 
 // proxy that forwards every call to the real one, advertising `max_media` in server.info (not
@@ -877,32 +875,26 @@ pub(crate) fn draining_proxy(draining: Arc<AtomicBool>) -> (mockito::ServerGuard
 pub(crate) fn max_media_proxy(
     max_media: Arc<AtomicUsize>,
 ) -> (mockito::ServerGuard, mockito::Mock) {
-    let mut server = mockito::Server::new();
-    let mock = server
-        .mock("POST", "/json-rpc")
-        .with_body_from_request(move |req| {
-            let body = req.body().unwrap().clone();
-            let is_info = String::from_utf8_lossy(&body).contains("\"server.info\"");
-            let res = forward_to_proxy(req, body);
-            if !is_info {
-                return res;
-            }
-            let mut res: serde_json::Value = serde_json::from_slice(&res).unwrap();
-            let result = res["result"].as_object_mut().unwrap();
-            match max_media.load(Ordering::Relaxed) {
-                0 => result.remove("max_media"),
-                max => result.insert(s!("max_media"), max.to_string().into()),
-            };
-            serde_json::to_vec(&res).unwrap()
-        })
-        .expect_at_least(1)
-        .create();
-    (server, mock)
+    json_rpc_proxy(move |req| {
+        let body = req.body().unwrap().clone();
+        let is_info = String::from_utf8_lossy(&body).contains("\"server.info\"");
+        let res = forward_to_proxy(req, body);
+        if !is_info {
+            return res;
+        }
+        let mut res: serde_json::Value = serde_json::from_slice(&res).unwrap();
+        let result = res["result"].as_object_mut().unwrap();
+        match max_media.load(Ordering::Relaxed) {
+            0 => result.remove("max_media"),
+            max => result.insert(s!("max_media"), max.to_string().into()),
+        };
+        serde_json::to_vec(&res).unwrap()
+    })
 }
 
 // forward a request received by a mock proxy to the real one, returning its response body
 #[cfg(feature = "electrum")]
-fn forward_to_proxy(req: &mockito::Request, body: Vec<u8>) -> Vec<u8> {
+pub(crate) fn forward_to_proxy(req: &mockito::Request, body: Vec<u8>) -> Vec<u8> {
     let content_type = req.header(CONTENT_TYPE)[0].clone();
     // the blocking client cannot run inside mockito's async runtime
     std::thread::spawn(move || {
