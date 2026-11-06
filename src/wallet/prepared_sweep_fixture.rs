@@ -229,7 +229,7 @@ impl Fixture {
             vanilla_sync_lookback: 20,
             failed_witness_receive_grace_secs: 604800,
             proxy_auth_keys: HashMap::new(),
-            evm_rpc_urls: HashMap::new(),
+            evm_chains: HashMap::new(),
         }
     }
 

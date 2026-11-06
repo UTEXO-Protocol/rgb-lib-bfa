@@ -936,7 +936,10 @@ fn release_lost_sweep<W: WalletOnline + ?Sized>(
     // the sweep itself is not mined, so a confirmed spend of an input is another transaction's
     let mut lost = false;
     for txin in &psbt.unsigned_tx.input {
-        if wallet.indexer().output_spent_on_chain(&txin.previous_output)? {
+        if wallet
+            .indexer()
+            .output_spent_on_chain(&txin.previous_output)?
+        {
             lost = true;
             break;
         }
@@ -1695,7 +1698,7 @@ mod tests {
                 vanilla_sync_lookback: 20,
                 failed_witness_receive_grace_secs: 604800,
                 proxy_auth_keys: HashMap::new(),
-                evm_rpc_urls: HashMap::new(),
+                evm_chains: HashMap::new(),
             };
             drop(wallet);
             let mut wallet = Wallet::new(data, keys).unwrap();
