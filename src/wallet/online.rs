@@ -170,7 +170,9 @@ fn broadcast_deadline_passed_beyond_skew_margin(batch_transfer: &DbBatchTransfer
     batch_transfer
         .broadcast_deadline
         .or(batch_transfer.expiration)
-        .is_some_and(|deadline| deadline + i64::from(clock_skew_margin()) < now().unix_timestamp())
+        .is_some_and(|deadline| {
+            deadline.saturating_add(i64::from(clock_skew_margin())) < now().unix_timestamp()
+        })
 }
 
 /// Whether the broadcast deadline of an incoming transfer plus the confirmation margin has passed,
@@ -183,7 +185,7 @@ fn confirmation_deadline_passed(batch_transfer: &DbBatchTransfer) -> bool {
     let margin = CONFIRMATION_MARGIN_SECS;
     batch_transfer
         .broadcast_deadline
-        .is_some_and(|deadline| deadline + i64::from(margin) < now().unix_timestamp())
+        .is_some_and(|deadline| deadline.saturating_add(i64::from(margin)) < now().unix_timestamp())
 }
 
 /// Whether an incoming transfer is expired, so it can be failed: a transfer waiting for the
@@ -235,10 +237,19 @@ fn min_sender_retention_grace() -> u32 {
 
 /// The broadcast deadline of an operation from the `expires_at` returned by `ack.post` and the
 /// sender proxy retention grace, `None` if the proxy didn't return a valid expiration.
+///
+/// The sender picks its proxy, so `expires_at` is clamped to avoid a past or overflowing deadline.
 fn broadcast_deadline(expires_at: Option<&str>, retention_grace: u32) -> Option<i64> {
+    let now = now().unix_timestamp();
+    let max_expiration = i64::MAX
+        .saturating_sub(i64::from(retention_grace))
+        .saturating_sub(i64::from(CONFIRMATION_MARGIN_SECS));
     expires_at
         .and_then(|exp| exp.parse::<i64>().ok())
-        .map(|exp| exp + i64::from(retention_grace))
+        .map(|exp| {
+            exp.clamp(now, max_expiration)
+                .saturating_add(i64::from(retention_grace))
+        })
 }
 
 /// Minimum time between the expiration of an outgoing operation and the earliest invoice
@@ -7215,7 +7226,7 @@ pub trait WalletOnline: WalletOffline {
             let sender_proxy_url =
                 self.convert_transport_endpoint_url(sender_transport_endpoint)?;
             let retention_grace = sender_proxy_retention_grace(&sender_proxy_url)?;
-            broadcast_deadline = Some(expiration + i64::from(retention_grace));
+            broadcast_deadline = Some(expiration.saturating_add(i64::from(retention_grace)));
             let proxy_client = ProxyClient::new(&sender_proxy_url)?;
             let transfer_ids: Vec<String> = transfer_data.keys().cloned().collect();
             let expiration = expiration.to_string();
