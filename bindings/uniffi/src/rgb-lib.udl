@@ -8,6 +8,11 @@ namespace rgb_lib {
   [Throws=RgbLibError]
   Keys restore_keys(BitcoinNetwork bitcoin_network, string mnemonic, WitnessVersion witness_version);
 
+  // scriptPubKey (hex) paid by a witness recipient ID, e.g. to place a witness receive of this
+  // wallet as the output of an externally built HTLC claim or refund PSBT. None for blinded seals.
+  [Throws=RgbLibError]
+  string? script_hex_from_recipient_id(string recipient_id);
+
   [Throws=RgbLibError]
   void restore_backup(string backup_path, string password, string data_dir);
 
@@ -1360,6 +1365,14 @@ interface Wallet {
 
   [Throws=RgbLibError]
   OperationResult? provide_out_of_band_ack(Online online, string recipient_id);
+
+  // Accept a consignment received out-of-band for a seal on `txid:vout` that this wallet did not
+  // issue an invoice for (e.g. an HTLC lock paid to another party's witness receive). The
+  // consignment is validated against the indexer and its assignments are returned. For witness
+  // receives the seal is revealed in the consignment and `blinding` may be 0.
+  [Throws=RgbLibError]
+  sequence<Assignment> accept_transfer_consignment(
+    Online online, string consignment_path, string txid, u32 vout, u64 blinding);
 
   [Throws=RgbLibError]
   string send_btc(

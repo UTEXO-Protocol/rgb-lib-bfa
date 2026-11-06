@@ -1299,6 +1299,10 @@ fn restore_keys(
     rgb_lib::keys::restore_keys(bitcoin_network, mnemonic, witness_version)
 }
 
+fn script_hex_from_recipient_id(recipient_id: String) -> Result<Option<String>, RgbLibError> {
+    Ok(rgb_lib::utils::script_buf_from_recipient_id(recipient_id)?.map(|script| script.to_hex_string()))
+}
+
 fn restore_backup(
     backup_path: String,
     password: String,
@@ -2140,6 +2144,31 @@ impl Wallet {
             consignment_path,
             media_file_paths,
         )
+    }
+
+    fn accept_transfer_consignment(
+        &self,
+        online: Online,
+        consignment_path: String,
+        txid: String,
+        vout: u32,
+        blinding: u64,
+    ) -> Result<Vec<Assignment>, RgbLibError> {
+        let mut wallet = self._get_wallet();
+        let (consignment, assignments, _) = wallet.accept_transfer_consignment(
+            online,
+            std::path::PathBuf::from(consignment_path),
+            txid.clone(),
+            vout,
+            blinding,
+        )?;
+        // The rust-only accept imports the contract into the stock only; a wallet that has never
+        // seen this asset also needs its DB row (prepared sweeps reference it by foreign key).
+        let contract_id = consignment.contract_id().to_string();
+        if wallet.get_asset_metadata(contract_id).is_err() {
+            wallet.save_new_asset(online, consignment, txid)?;
+        }
+        Ok(assignments.into_iter().map(Assignment::from).collect())
     }
 
     fn provide_out_of_band_ack(
