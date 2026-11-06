@@ -674,6 +674,8 @@ impl ResolveClaim for MintClaimResolver<'_> {
 
 #[cfg(test)]
 mod tests {
+    use rgbstd::bitcoin::hashes::Hash as _;
+
     use super::*;
 
     /// An opout whose operation ID is filled with `b`, with an assignment type and number derived

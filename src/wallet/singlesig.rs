@@ -336,6 +336,16 @@ impl Wallet {
     ) -> Result<String, Error> {
         info!(self.logger(), "Signing PSBT...");
         let mut psbt = Psbt::from_str(&unsigned_psbt)?;
+        #[cfg(feature = "_online")]
+        self.guard_prepared_sweep_signing(&psbt)?;
+        #[cfg(not(feature = "_online"))]
+        {
+            // Wallet-only builds cannot fully admit a prepared sweep's online journal.
+            // Ordinary offline signing remains available, but every protected witness fails closed.
+            let txn = self.database().begin_transaction()?;
+            txn.ensure_no_prepared_sweep_mutation(&psbt.unsigned_tx)?;
+            txn.commit()?;
+        }
         self.sign_psbt_impl(&mut psbt, sign_options)?;
         info!(self.logger(), "Sign PSBT completed");
         Ok(psbt.to_string())
@@ -697,6 +707,7 @@ impl Wallet {
             expiration_timestamp as i64,
             transport_endpoints,
             RecipientType::Blind,
+            None,
             encryption,
         )?;
         let batch_transfer_idx =
@@ -779,6 +790,7 @@ impl Wallet {
             expiration_timestamp as i64,
             transport_endpoints,
             RecipientType::Witness,
+            None,
             encryption,
         )?;
         let batch_transfer_idx =
@@ -786,6 +798,69 @@ impl Wallet {
         self.update_backup_info(&txn, false)?;
         self.persist_and_commit(txn)?;
         info!(self.logger(), "Witness receive completed");
+        Ok(ReceiveData {
+            invoice: receive_data_internal.invoice_string,
+            recipient_id: receive_data_internal.recipient_id,
+            expiration_timestamp: receive_data_internal.expiration_timestamp as u64,
+            batch_transfer_idx,
+            public_key: hex::encode(&receive_data_internal.recipient_pubkey),
+        })
+    }
+
+    /// Like [`witness_receive`](Wallet::witness_receive), but for a script the wallet does not
+    /// own (e.g. an HTLC lock), given as hex.
+    ///
+    /// The transfer is fetched, validated and accepted by `refresh` as any witness receive, with
+    /// the paid output checked against the invoice script. Since the output is not a wallet UTXO
+    /// it is not listed as unspent and does not count towards the balance: the received
+    /// allocation is listed on the transfer and imported into the RGB stash, where it can be read
+    /// with `contract_assignments_for_outpoints` and spent by coloring a PSBT that spends the
+    /// output.
+    pub fn witness_receive_external(
+        &mut self,
+        online: Option<Online>,
+        script_pubkey: String,
+        asset_id: Option<String>,
+        assignment: Assignment,
+        expiration_timestamp: u64,
+        transport_endpoints: Vec<String>,
+        min_confirmations: u8,
+        encryption: Option<Encryption>,
+    ) -> Result<ReceiveData, Error> {
+        info!(
+            self.logger(),
+            "Receiving via witness TX on external script '{script_pubkey}' for asset '{:?}'...",
+            asset_id,
+        );
+        let script_pubkey =
+            ScriptBuf::from_hex(&script_pubkey).map_err(|e| Error::InvalidScript {
+                details: e.to_string(),
+            })?;
+        AddressPayload::from_script(&script_pubkey).map_err(|e| Error::InvalidScript {
+            details: e.to_string(),
+        })?;
+        if self.bdk_wallet().is_mine(script_pubkey.clone()) {
+            return Err(Error::InvalidScript {
+                details: s!("script belongs to this wallet, use witness_receive"),
+            });
+        }
+        let txn = self.database().begin_transaction()?;
+        let receive_data_internal = self.create_receive_data(
+            &txn,
+            online,
+            asset_id,
+            assignment,
+            expiration_timestamp as i64,
+            transport_endpoints,
+            RecipientType::Witness,
+            Some(script_pubkey),
+            encryption,
+        )?;
+        let batch_transfer_idx =
+            self.store_receive_transfer(&txn, &receive_data_internal, min_confirmations)?;
+        self.update_backup_info(&txn, false)?;
+        self.persist_and_commit(txn)?;
+        info!(self.logger(), "External witness receive completed");
         Ok(ReceiveData {
             invoice: receive_data_internal.invoice_string,
             recipient_id: receive_data_internal.recipient_id,
@@ -951,6 +1026,8 @@ impl Wallet {
     /// <div class="warning">Warning: draining all funds is a destructive and irreversible
     /// operation, only do this if you know what you're doing! After draining the wallet will not
     /// be usable anymore.</div>
+    ///
+    /// The inputs of active prepared sweeps are left out.
     ///
     /// If `dry_run` is true, the wallet does not reserve the selected vanilla TXOs. The returned
     /// PSBT can still be signed and completed with [`drain_to_end`](Wallet::drain_to_end) but

@@ -1248,6 +1248,7 @@ pub trait WalletOffline: WalletBackup {
         expiration_timestamp: i64,
         transport_endpoints: Vec<String>,
         recipient_type: RecipientType,
+        external_script: Option<ScriptBuf>,
         encryption: Option<Encryption>,
     ) -> Result<ReceiveDataInternal, Error> {
         let encryption = encryption.unwrap_or(Encryption::Required);
@@ -1299,12 +1300,21 @@ pub trait WalletOffline: WalletBackup {
                 let recipient_type_full = RecipientTypeFull::Blind { unblinded_utxo };
                 (beneficiary, recipient_type_full, Some(blind_seal), None)
             }
-            RecipientType::Witness => {
-                let script_pubkey = self.get_new_address()?.script_pubkey();
-                let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
-                let recipient_type_full = RecipientTypeFull::Witness { vout: None };
-                (beneficiary, recipient_type_full, None, Some(script_pubkey))
-            }
+            RecipientType::Witness => match external_script {
+                // the paid output is not a wallet UTXO, so there is no witness script to watch
+                Some(script_pubkey) => (
+                    beneficiary_from_script_buf(script_pubkey),
+                    RecipientTypeFull::External { vout: None },
+                    None,
+                    None,
+                ),
+                None => {
+                    let script_pubkey = self.get_new_address()?.script_pubkey();
+                    let beneficiary = beneficiary_from_script_buf(script_pubkey.clone());
+                    let recipient_type_full = RecipientTypeFull::Witness { vout: None };
+                    (beneficiary, recipient_type_full, None, Some(script_pubkey))
+                }
+            },
         };
 
         #[cfg(test)]
@@ -1315,6 +1325,15 @@ pub trait WalletOffline: WalletBackup {
         let beneficiary = XChainNet::with(network, beneficiary);
         let recipient_id = beneficiary.to_string();
         debug!(self.logger(), "Recipient ID: {recipient_id}");
+        // the receive files are keyed by recipient ID, so a script can only be received on once
+        if matches!(recipient_type_full, RecipientTypeFull::External { .. })
+            && txn
+                .iter_transfers()?
+                .iter()
+                .any(|t| t.recipient_id.as_deref() == Some(&recipient_id))
+        {
+            return Err(Error::RecipientIDAlreadyUsed);
+        }
         let (schema, contract_id) = if let Some(aid) = asset_id.clone() {
             let asset = txn.check_asset_exists(aid.clone())?;
             let contract_id = ContractId::from_str(&aid).expect("invalid contract ID");
@@ -1563,6 +1582,9 @@ pub trait WalletOffline: WalletBackup {
         colorings: &[DbColoring],
         txos: &[DbTxo],
     ) -> Result<(), Error> {
+        if txn.is_protected_sweep_batch(batch_transfer)? {
+            return Err(Error::CannotDeleteBatchTransfer);
+        }
         let mut txos_to_delete = HashSet::new();
         for asset_transfer in asset_transfers {
             txn.del_coloring(asset_transfer.idx)?;
@@ -1616,13 +1638,13 @@ pub trait WalletOffline: WalletBackup {
                 &db_data.txos,
             )?
         } else {
-            // delete all failed transfers
-            let mut batch_transfers: Vec<DbBatchTransfer> = db_data
-                .batch_transfers
-                .clone()
-                .into_iter()
-                .filter(|t| t.failed())
-                .collect();
+            // delete all failed transfers, except a cancelled sweep, kept as its tombstone
+            let mut batch_transfers = Vec::new();
+            for batch_transfer in db_data.batch_transfers.clone() {
+                if batch_transfer.failed() && !txn.is_protected_sweep_batch(&batch_transfer)? {
+                    batch_transfers.push(batch_transfer);
+                }
+            }
             for batch_transfer in batch_transfers.iter_mut() {
                 let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers);
                 if no_asset_only {
@@ -1910,10 +1932,8 @@ pub trait WalletOffline: WalletBackup {
         let mut vanilla = self.get_btc_balance_for_keychain(KeychainKind::Internal)?;
         let colored = self.get_btc_balance_for_keychain(KeychainKind::External)?;
 
-        let reserved: HashSet<BdkOutPoint> = self
-            .get_reserved_vanilla_outpoints(txn)?
-            .into_iter()
-            .collect();
+        let reserved: HashSet<BdkOutPoint> =
+            self.get_reserved_bdk_outpoints(txn)?.into_iter().collect();
         if !reserved.is_empty() {
             let reserved_sum: u64 = self
                 .internal_unspents()
@@ -2122,11 +2142,10 @@ pub trait WalletOffline: WalletBackup {
         Ok(local_asset_data)
     }
 
-    fn get_reserved_vanilla_outpoints(&self, txn: &DbTxn) -> Result<Vec<BdkOutPoint>, Error> {
+    fn get_reserved_bdk_outpoints(&self, txn: &DbTxn) -> Result<Vec<BdkOutPoint>, Error> {
         Ok(txn
             .iter_reserved_txos()?
             .into_iter()
-            .filter(|r| r.reserved_for_vanilla.is_some())
             .map(BdkOutPoint::from)
             .collect())
     }
@@ -2146,7 +2165,7 @@ pub trait WalletOffline: WalletBackup {
             .into_iter()
             .map(BdkOutPoint::from)
             .collect();
-        outpoints.extend(self.get_reserved_vanilla_outpoints(txn)?);
+        outpoints.extend(self.get_reserved_bdk_outpoints(txn)?);
         Ok(outpoints)
     }
 
@@ -2487,7 +2506,9 @@ pub trait WalletOffline: WalletBackup {
             } else {
                 match transfer.recipient_type.as_ref().unwrap() {
                     RecipientTypeFull::Blind { .. } => TransferKind::ReceiveBlind,
-                    RecipientTypeFull::Witness { .. } => TransferKind::ReceiveWitness,
+                    RecipientTypeFull::Witness { .. } | RecipientTypeFull::External { .. } => {
+                        TransferKind::ReceiveWitness
+                    }
                 }
             }
         } else {
@@ -2510,7 +2531,8 @@ pub trait WalletOffline: WalletBackup {
 
         let receive_utxo = match &transfer.recipient_type {
             Some(RecipientTypeFull::Blind { unblinded_utxo }) => Some(unblinded_utxo.clone()),
-            Some(RecipientTypeFull::Witness { vout }) => coloring_info
+            Some(RecipientTypeFull::Witness { vout })
+            | Some(RecipientTypeFull::External { vout }) => coloring_info
                 .receive_candidates
                 .iter()
                 .filter(|t| t.vout == vout.unwrap())

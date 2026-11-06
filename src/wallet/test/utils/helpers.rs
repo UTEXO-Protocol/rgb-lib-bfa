@@ -783,7 +783,6 @@ pub(crate) fn test_evm_chains(evm_rpc_urls: HashMap<u64, String>) -> HashMap<u64
         .collect()
 }
 
-#[cfg(feature = "_online")]
 pub(crate) fn default_rcv_expiration() -> u64 {
     (now().unix_timestamp() + DURATION_RCV_TRANSFER as i64) as u64
 }

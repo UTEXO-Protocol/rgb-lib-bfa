@@ -19,6 +19,8 @@ use std::path::MAIN_SEPARATOR_STR;
 use amplify::set;
 #[cfg(feature = "_online")]
 use bdk_wallet::bitcoin::Denomination;
+#[cfg(feature = "electrum")]
+use bdk_wallet::bitcoin::{Sequence, TxIn, Witness, absolute::LockTime, transaction::Version};
 use bdk_wallet::descriptor::ExtendedDescriptor;
 #[cfg(feature = "electrum")]
 use biscuit_auth::{KeyPair, builder::date, macros::*};
@@ -201,7 +203,6 @@ const UNKNOWN_IDX: i32 = 9999;
 const TINY_BTC_AMOUNT: u32 = 330;
 #[cfg(feature = "_online")]
 const QUEUE_DEPTH_EXCEEDED: &str = "Work queue depth exceeded";
-#[cfg(feature = "_online")]
 const DURATION_RCV_TRANSFER: u32 = 86400;
 #[cfg(feature = "_online")]
 const DURATION_SEND_TRANSFER: u32 = 3600;

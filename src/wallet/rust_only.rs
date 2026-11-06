@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[cfg(feature = "_online")]
+pub use super::prepared_sweep::{ColorPrepareResult, PreparedSweep};
+
 /// RGB asset-specific information to color a transaction
 #[derive(Debug, Clone)]
 pub struct AssetColoringInfo {
@@ -59,6 +62,19 @@ impl Wallet {
         psbt: &mut Psbt,
         coloring_info: ColoringInfo,
     ) -> Result<(Fascia, AssetBeneficiariesMap), Error> {
+        let txn = self.database().begin_transaction()?;
+        let (fascia, beneficiaries, _) = self.color_psbt_in_txn(&txn, psbt, coloring_info)?;
+        txn.commit()?;
+        Ok((fascia, beneficiaries))
+    }
+
+    /// Share the caller's admission/reservation transaction when preparing an external sweep.
+    pub(crate) fn color_psbt_in_txn(
+        &self,
+        txn: &DbTxn,
+        psbt: &mut Psbt,
+        coloring_info: ColoringInfo,
+    ) -> Result<(Fascia, AssetBeneficiariesMap, Option<u64>), Error> {
         info!(self.logger(), "Coloring PSBT...");
         let mut transaction = match psbt.clone().extract_tx() {
             Ok(tx) => tx,
@@ -87,8 +103,7 @@ impl Wallet {
             *psbt = Psbt::from_unsigned_tx(transaction).unwrap();
         }
 
-        let txn = self.database().begin_transaction()?;
-        let stock = self.rgb_stock(&txn)?;
+        let stock = self.rgb_stock(txn)?;
 
         let prev_outputs = psbt
             .unsigned_tx
@@ -224,12 +239,13 @@ impl Wallet {
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         psbt.set_as_unmodifiable();
         let fascia = psbt.rgb_commit().map_err(InternalError::from)?;
+        // the commitment entropy leaves the PSBT with the rest of the RGB data
+        let entropy = psbt.outputs.iter().find_map(|o| o.mpc_entropy());
         strip_rgb_data(psbt);
         check_psbt_parsable(psbt)?;
 
-        txn.commit()?;
         info!(self.logger(), "Color PSBT completed");
-        Ok((fascia, asset_beneficiaries))
+        Ok((fascia, asset_beneficiaries, entropy))
     }
 
     /// Color a PSBT, consume the RGB fascia and return the related consignment.
@@ -242,11 +258,13 @@ impl Wallet {
         coloring_info: ColoringInfo,
     ) -> Result<Vec<RgbTransfer>, Error> {
         info!(self.logger(), "Coloring PSBT and consuming...");
-        let (fascia, asset_beneficiaries) = self.color_psbt(psbt, coloring_info.clone())?;
+        let txn = self.database().begin_transaction()?;
+        txn.ensure_no_prepared_sweep_mutation(&psbt.unsigned_tx)?;
+        let (fascia, asset_beneficiaries, _) =
+            self.color_psbt_in_txn(&txn, psbt, coloring_info.clone())?;
 
         let witness_txid = psbt.get_txid();
 
-        let txn = self.database().begin_transaction()?;
         let mut stock = self.rgb_stock(&txn)?;
         stock.consume_fascia(fascia, None)?;
 
@@ -303,6 +321,51 @@ impl Wallet {
         Ok(())
     }
 
+    /// Inspect arbitrary outpoints for assignments of a given contract.
+    ///
+    /// Results are returned in the same order as `outpoints`, including duplicate entries.
+    ///
+    /// <div class="warning">This method is meant for special usage and is normally not needed, use
+    /// it only if you know what you're doing</div>
+    pub fn contract_assignments_for_outpoints(
+        &self,
+        contract_id: ContractId,
+        outpoints: Vec<Outpoint>,
+    ) -> Result<Vec<(Outpoint, Vec<Assignment>)>, Error> {
+        let parsed: Vec<(Outpoint, OutPoint)> = outpoints
+            .into_iter()
+            .map(|outpoint| {
+                let vout = outpoint.vout;
+                let txid = Txid::from_str(&outpoint.txid).map_err(|_| Error::InvalidTxid)?;
+                Ok((outpoint, OutPoint { txid, vout }))
+            })
+            .collect::<Result<_, Error>>()?;
+        let txn = self.database().begin_transaction()?;
+        let stock = self.rgb_stock(&txn)?;
+        stock
+            .genesis(contract_id)
+            .map_err(|_| Error::AssetNotFound {
+                asset_id: contract_id.to_string(),
+            })?;
+        let state = stock
+            .contract_assignments_for(contract_id, parsed.iter().map(|(_, outpoint)| *outpoint))?;
+        let mut by_outpoint: HashMap<OutPoint, Vec<Assignment>> = HashMap::new();
+        for (seal, opout_state_map) in state {
+            let btc_outpoint = seal.to_outpoint();
+            let assignments = by_outpoint.entry(btc_outpoint).or_default();
+            for (opout, state) in opout_state_map {
+                assignments.push(Assignment::from_opout_and_state(opout, &state));
+            }
+        }
+        Ok(parsed
+            .into_iter()
+            .map(|(outpoint, btc_outpoint)| {
+                let assignments = by_outpoint.get(&btc_outpoint).cloned().unwrap_or_default();
+                (outpoint, assignments)
+            })
+            .collect())
+    }
+
     /// Accept an RGB transfer using a consignment received out-of-band.
     ///
     /// Returns the consignment, the received assignments and the hex-encoded digests of the media
@@ -336,6 +399,21 @@ impl Wallet {
         );
 
         let txn = self.database().begin_transaction()?;
+        // This special off-chain acceptance API cannot bypass a prepared sweep's canonical
+        // confirmed consume. Inspect only the explicitly selected current witness; historical
+        // consumed ancestors remain valid inputs to ordinary later transfers.
+        if txn.is_prepared_rgb_sweep_txid(&txid)? {
+            return Err(Error::WrongOperation { txid });
+        }
+        if !super::prepared_sweep::prepared_sweep_ancestry_ready(&txn, &consignment, witness_id)? {
+            return Err(Error::WrongOperation { txid });
+        }
+        if let Some(witness) = consignment
+            .bundled_witnesses()
+            .find(|witness| witness.witness_id() == witness_id)
+        {
+            txn.ensure_no_prepared_sweep_mutation(&witness.tx)?;
+        }
         let mut stock = self.rgb_stock(&txn)?;
 
         let graph_seal = GraphSeal::with_blinded_vout(vout, blinding);
@@ -411,6 +489,7 @@ impl Wallet {
     ) -> Result<(), Error> {
         info!(self.logger(), "Consuming fascia...");
         let txn = self.database().begin_transaction()?;
+        txn.ensure_no_prepared_sweep_mutation(&fascia.seal_witness().tx)?;
         self.rgb_stock(&txn)?
             .consume_fascia(fascia.clone(), witness_ord)?;
         txn.commit()?;
@@ -660,5 +739,87 @@ impl Wallet {
             batch_transfer_idx,
             entropy: info_contents.entropy,
         })
+    }
+}
+
+#[cfg(all(test, not(feature = "_online")))]
+mod prepared_sweep_offline_signing_tests {
+    use super::*;
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    use serial_test::parallel;
+
+    #[test]
+    #[parallel]
+    fn wallet_only_signing_rejects_protected_rows_without_requiring_online_apis() {
+        let directory = crate::wallet::test::PrivateDataDir::new();
+        let wallet = directory.wallet(false, None);
+        let script = ScriptBuf::from_bytes([vec![0x51, 0x20], vec![1; 32]].concat());
+        let previous = BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: OutPoint::new(Txid::from_str(&"01".repeat(32)).unwrap(), 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(10000),
+                script_pubkey: script.clone(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(BdkTransaction {
+            version: bdk_wallet::bitcoin::transaction::Version::TWO,
+            lock_time: bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![bdk_wallet::bitcoin::TxIn {
+                previous_output: OutPoint::new(previous.compute_txid(), 0),
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: BdkAmount::from_sat(9000),
+                script_pubkey: script.clone(),
+            }],
+        })
+        .unwrap();
+        psbt.inputs[0].witness_utxo = Some(previous.output[0].clone());
+        psbt.inputs[0].non_witness_utxo = Some(previous);
+        let ordinary = wallet
+            .sign_psbt(psbt.to_string(), None)
+            .expect("ordinary watch-only signing must preserve partial PSBT semantics");
+        let ordinary = Psbt::from_str(&ordinary).unwrap();
+        assert_eq!(ordinary.unsigned_tx, psbt.unsigned_tx);
+        assert!(
+            ordinary
+                .inputs
+                .iter()
+                .all(|input| input.partial_sigs.is_empty()
+                    && input.tap_key_sig.is_none()
+                    && input.final_script_sig.is_none()
+                    && input.final_script_witness.is_none())
+        );
+        let txn = wallet.database().begin_transaction().unwrap();
+        let batch = txn
+            .set_batch_transfer(DbBatchTransferActMod {
+                incoming: ActiveValue::Set(false),
+                status: ActiveValue::Set(TransferStatus::Initiated),
+                min_confirmations: ActiveValue::Set(1),
+                created_at: ActiveValue::Set(1),
+                ..Default::default()
+            })
+            .unwrap();
+        txn.commit().unwrap();
+        let connection = block_on(Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            wallet.get_wallet_dir().join("rgb_lib_db").display()
+        )))
+        .unwrap();
+        block_on(connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO prepared_rgb_sweep (batch_transfer_idx, txid, phase, payload, payload_sha256) VALUES (?, ?, 'handed_off', X'00', 'unsupported-offline-receipt')",
+            [batch.into(), psbt.unsigned_tx.compute_txid().to_string().into()],
+        ))).unwrap();
+        block_on(connection.close()).unwrap();
+        // Even a HandedOff row cannot be admitted by a build that omits full proof validation.
+        assert!(matches!(
+            wallet.sign_psbt(psbt.to_string(), None),
+            Err(Error::WrongOperation { .. })
+        ));
     }
 }

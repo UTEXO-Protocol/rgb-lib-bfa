@@ -11,6 +11,10 @@ pub(crate) mod objects;
 pub(crate) mod offline;
 #[cfg(feature = "_online")]
 pub(crate) mod online;
+#[cfg(feature = "_online")]
+mod prepared_sweep;
+#[cfg(test)]
+mod prepared_sweep_fixture;
 pub mod rust_only;
 pub(crate) mod singlesig;
 

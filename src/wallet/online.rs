@@ -487,6 +487,7 @@ pub trait WalletOnline: WalletOffline {
         txn: &DbTxn,
         tx: BdkTransaction,
     ) -> Result<BdkTransaction, Error> {
+        txn.ensure_no_prepared_sweep_mutation(&tx)?;
         let tx = self.broadcast_tx(tx)?;
 
         // apply the broadcast TX into BDK directly so its outputs are immediately visible
@@ -579,6 +580,9 @@ pub trait WalletOnline: WalletOffline {
         r#type: WalletTransactionType,
     ) -> Result<(), Error> {
         let txid = psbt.unsigned_tx.compute_txid().to_string();
+        if txn.is_prepared_rgb_sweep_txid(&txid)? {
+            return Err(Error::WrongOperation { txid });
+        }
         if self.get_transfer_dir(&txid).exists() {
             return Err(Error::WrongOperation { txid });
         }
@@ -694,7 +698,7 @@ pub trait WalletOnline: WalletOffline {
         );
 
         let reserved: HashSet<BdkOutPoint> = self
-            .get_reserved_vanilla_outpoints(txn)?
+            .get_unspendable_bdk_outpoints(txn)?
             .into_iter()
             .collect();
         let (inputs, usable_btc_amount) = self.internal_unspents().fold(
@@ -815,8 +819,17 @@ pub trait WalletOnline: WalletOffline {
 
         let script_pubkey = self.get_script_pubkey(&address)?;
 
+        // a drain spends every UTXO, reserved ones included, except the inputs of active sweeps
+        let sweeps: HashSet<i32> = txn.prepared_sweep_active_batches()?.into_iter().collect();
+        let reserved: Vec<BdkOutPoint> = txn
+            .iter_reserved_txos()?
+            .into_iter()
+            .filter(|r| r.reserved_for_colored.is_some_and(|b| sweeps.contains(&b)))
+            .map(BdkOutPoint::from)
+            .collect();
         let mut tx_builder = self.bdk_wallet_mut().build_tx();
         tx_builder
+            .unspendable(reserved)
             .drain_wallet()
             .drain_to(script_pubkey)
             .fee_rate(fee_rate_checked);
@@ -959,6 +972,9 @@ pub trait WalletOnline: WalletOffline {
         txn: &DbTxn,
         batch_transfer: &DbBatchTransfer,
     ) -> Result<DbBatchTransfer, Error> {
+        if txn.is_protected_sweep_batch(batch_transfer)? {
+            return Err(Error::CannotFailBatchTransfer);
+        }
         self.set_hub_fail_status(batch_transfer.idx)?;
         self.clean_failed_witness_receives(txn, batch_transfer)?;
         txn.del_reserved_txos_for_batch_transfer(batch_transfer.idx)?;
@@ -1025,6 +1041,10 @@ pub trait WalletOnline: WalletOffline {
         db_data: &DbData,
         revoke_released: bool,
     ) -> Result<TryFailBatchTransferOutcome, Error> {
+        // External signers may retain a broadcastable sweep even while Initiated.
+        if txn.is_protected_sweep_batch(batch_transfer)? {
+            return Ok(TryFailBatchTransferOutcome::Denied);
+        }
         // an outgoing transfer is expired once its expiration has passed on the sender proxy's
         // clock too, as the proxy may release its TX until then
         let expired = if batch_transfer.incoming {
@@ -3144,6 +3164,9 @@ pub trait WalletOnline: WalletOffline {
             );
             refuse!();
         }
+        if !super::prepared_sweep::prepared_sweep_ancestry_ready(txn, &consignment, witness_id)? {
+            return Ok(None);
+        }
 
         // the mint paying this recipient, if any, is refused before it's checked, so that no lock
         // is made for it (see get_received_mint): by a wallet that doesn't accept mints; when
@@ -3220,10 +3243,12 @@ pub trait WalletOnline: WalletOffline {
         // asset on it, the mint included, when past the one of a bundle)
         let receive_outpoint = match &transfer.recipient_type {
             Some(RecipientTypeFull::Blind { unblinded_utxo }) => unblinded_utxo.clone(),
-            Some(RecipientTypeFull::Witness { .. }) => Outpoint {
-                txid: txid.clone(),
-                vout: vout.ok_or(InternalError::Unexpected)?,
-            },
+            Some(RecipientTypeFull::Witness { .. }) | Some(RecipientTypeFull::External { .. }) => {
+                Outpoint {
+                    txid: txid.clone(),
+                    vout: vout.ok_or(InternalError::Unexpected)?,
+                }
+            }
             _ => return Err(InternalError::Unexpected.into()),
         };
         let taken = self.count_utxo_taken_slots(
@@ -3574,7 +3599,7 @@ pub trait WalletOnline: WalletOffline {
 
         let utxo_idx = match transfer.recipient_type {
             Some(RecipientTypeFull::Blind { ref unblinded_utxo }) => {
-                txn.get_txo(unblinded_utxo)?.expect("utxo must exist").idx
+                Some(txn.get_txo(unblinded_utxo)?.expect("utxo must exist").idx)
             }
             Some(RecipientTypeFull::Witness { .. }) => {
                 let mut updated_transfer: DbTransferActMod = transfer.clone().into();
@@ -3590,7 +3615,25 @@ pub trait WalletOnline: WalletOffline {
                     pending_witness: ActiveValue::Set(true),
                     ..Default::default()
                 };
-                txn.set_txo(db_utxo)?
+                Some(txn.set_txo(db_utxo)?)
+            }
+            // the paid output is not the wallet's to spend: its TXO is recorded spent, so the
+            // received allocation is listed on the transfer but never counts in the balance
+            Some(RecipientTypeFull::External { .. }) => {
+                let mut updated_transfer: DbTransferActMod = transfer.clone().into();
+                updated_transfer.recipient_type =
+                    ActiveValue::Set(Some(RecipientTypeFull::External { vout }));
+                txn.update_transfer(&mut updated_transfer)?;
+                let db_utxo = DbTxoActMod {
+                    txid: ActiveValue::Set(txid.clone()),
+                    vout: ActiveValue::Set(vout.unwrap()),
+                    btc_amount: ActiveValue::Set(s!("0")),
+                    spent: ActiveValue::Set(true),
+                    exists: ActiveValue::Set(false),
+                    pending_witness: ActiveValue::Set(false),
+                    ..Default::default()
+                };
+                Some(txn.set_txo(db_utxo)?)
             }
             _ => return Err(InternalError::Unexpected.into()),
         };
@@ -3598,15 +3641,17 @@ pub trait WalletOnline: WalletOffline {
         // multisig wallet, while the cosigners haven't decided on it): replace them instead of
         // saving them twice
         txn.del_coloring(asset_transfer.idx)?;
-        for assignment in receiving.into_values() {
-            let db_coloring = DbColoringActMod {
-                txo_idx: ActiveValue::Set(utxo_idx),
-                asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
-                r#type: ActiveValue::Set(ColoringType::Receive),
-                assignment: ActiveValue::Set(assignment),
-                ..Default::default()
-            };
-            txn.set_coloring(db_coloring)?;
+        if let Some(utxo_idx) = utxo_idx {
+            for assignment in receiving.into_values() {
+                let db_coloring = DbColoringActMod {
+                    txo_idx: ActiveValue::Set(utxo_idx),
+                    asset_transfer_idx: ActiveValue::Set(asset_transfer.idx),
+                    r#type: ActiveValue::Set(ColoringType::Receive),
+                    assignment: ActiveValue::Set(assignment),
+                    ..Default::default()
+                };
+                txn.set_coloring(db_coloring)?;
+            }
         }
 
         // if the consignment contains unsafe history set status to WaitingSafeHeight and stop here
@@ -4329,6 +4374,11 @@ pub trait WalletOnline: WalletOffline {
             .txid
             .clone()
             .expect("batch transfer should have a TXID");
+        if incoming && !super::prepared_sweep::prepared_sweep_incoming_ready(txn, &txid)? {
+            // An out-of-band self-receive may have its own zero-confirmation policy. Only the
+            // protected sweep's independently confirmed, atomic consume can advance stock first.
+            return Ok(None);
+        }
         debug!(
             self.logger(),
             "Getting details of transaction with ID '{}'...", txid
@@ -4389,6 +4439,16 @@ pub trait WalletOnline: WalletOffline {
                 .expect("transfer should have a recipient ID");
             debug!(self.logger(), "Recipient ID: {recipient_id}");
 
+            let valid_consignment =
+                self.load_received_valid_transfer(batch_transfer, &recipient_id)?;
+            if !super::prepared_sweep::prepared_sweep_ancestry_ready(
+                txn,
+                &valid_consignment,
+                RgbTxid::from_str(&txid).map_err(|_| Error::InvalidTxid)?,
+            )? {
+                return Ok(None);
+            }
+
             if let Some(RecipientTypeFull::Witness { vout }) = transfer.recipient_type {
                 if !skip_sync {
                     self.sync_wallet(
@@ -4411,8 +4471,6 @@ pub trait WalletOnline: WalletOffline {
             }
 
             // accept consignment
-            let valid_consignment =
-                self.load_received_valid_transfer(batch_transfer, &recipient_id)?;
             let mut stock = self.rgb_stock(txn)?;
             stock.accept_transfer(valid_consignment.clone(), &self.blockchain_resolver())?;
             self.delete_valid_consignment(&recipient_id)?;
@@ -4482,6 +4540,11 @@ pub trait WalletOnline: WalletOffline {
         filter: &[RefreshFilter],
         skip_sync: bool,
     ) -> Result<Option<DbBatchTransfer>, Error> {
+        if txn.is_prepared_rgb_sweep(transfer.idx)? {
+            // Exact native reconciliation owns these records; generic legacy/expiry handling
+            // cannot fail them or consume their RGB state.
+            return Ok(None);
+        }
         debug!(self.logger(), "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming;
         if !filter.is_empty() {
@@ -4704,6 +4767,7 @@ pub trait WalletOnline: WalletOffline {
         filter: Vec<RefreshFilter>,
         skip_sync: bool,
     ) -> Result<RefreshResult, Error> {
+        super::prepared_sweep::release_lost_sweeps(self, txn)?;
         let mut db_data = txn.get_db_data(false)?;
 
         if asset_id.is_some() {
@@ -7097,6 +7161,7 @@ pub trait WalletOnline: WalletOffline {
         // before reading the transfer data, which doesn't parse for a send from before the proxy
         // protocol update (failed by the upgrade)
         let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+        txn.ensure_no_prepared_sweep_mutation(&signed_psbt.unsigned_tx)?;
         if let Some(existing) = txn
             .get_batch_transfers_by_txid(&txid)?
             .into_iter()
@@ -7548,6 +7613,7 @@ pub trait WalletOnline: WalletOffline {
     /// status brought back.
     fn check_end_initiated(&self, txn: &DbTxn, signed_psbt: &Psbt) -> Result<(), Error> {
         let txid = signed_psbt.unsigned_tx.compute_txid().to_string();
+        txn.ensure_no_prepared_sweep_mutation(&signed_psbt.unsigned_tx)?;
         if let Some(existing) = txn
             .get_batch_transfers_by_txid(&txid)?
             .into_iter()

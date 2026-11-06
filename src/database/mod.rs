@@ -1,5 +1,6 @@
 mod bdk;
 pub(crate) mod entities;
+mod prepared_sweep;
 pub(crate) mod rgb;
 
 use super::*;

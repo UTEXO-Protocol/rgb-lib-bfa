@@ -505,6 +505,13 @@ pub enum Error {
         details: String,
     },
 
+    /// The provided script is invalid or not usable for the requested operation
+    #[error("Invalid script: {details}")]
+    InvalidScript {
+        /// Error details
+        details: String,
+    },
+
     /// The provided asset ticker is invalid
     #[error("Invalid ticker: {details}")]
     InvalidTicker {
