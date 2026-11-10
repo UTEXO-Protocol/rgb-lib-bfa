@@ -266,10 +266,15 @@ fn invoice_expiration_margin() -> u32 {
     INVOICE_EXPIRATION_MARGIN_SECS
 }
 
-/// Check an outgoing operation expires at least the clock skew margin after its creation: one
-/// expiring sooner could already be expired on the sender proxy's clock.
+/// Check the expiration of an outgoing operation: it must be at least the clock skew margin in
+/// the future, since one expiring sooner could already be expired on the sender proxy's clock,
+/// and at most [`MAX_EXPIRATION_SECS`] in the future. For a proxy recipient the invoice
+/// expiration bounds it further, but a donation has none.
 fn check_operation_expiration(expiration_timestamp: i64) -> Result<(), Error> {
-    if expiration_timestamp < now().unix_timestamp() + i64::from(clock_skew_margin()) {
+    let now_ts = now().unix_timestamp();
+    if expiration_timestamp < now_ts + i64::from(clock_skew_margin())
+        || expiration_timestamp > now_ts + i64::from(MAX_EXPIRATION_SECS)
+    {
         return Err(Error::InvalidExpiration);
     }
     Ok(())
@@ -5590,13 +5595,6 @@ pub trait WalletOnline: WalletOffline {
         let operation_sk = gen_ed25519();
         let operation_secret_key = operation_sk.to_bytes().to_vec();
         let now_ts = now().unix_timestamp();
-        // an operation cannot expire arbitrarily far in the future (see [`MAX_EXPIRATION_SECS`]);
-        // for a proxy recipient the invoice expiration bounds it further, but a donation has none
-        if expiration_timestamp
-            .is_some_and(|expiration| expiration > now_ts + i64::from(MAX_EXPIRATION_SECS))
-        {
-            return Err(Error::InvalidExpiration);
-        }
         // earliest invoice expiration among the proxy recipients, bounding the operation one
         let mut min_invoice_expiration: Option<i64> = None;
 
