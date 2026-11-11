@@ -162,7 +162,7 @@ jobs:
             {
               "version": "${{ needs.prepare.outputs.version }}",
               "source_repo": "rgb-lib-bfa",
-              "branch": "release/bfa"
+              "branch": "release/bfa-htlc"
             }
 
   trigger-mobile-bindings:
