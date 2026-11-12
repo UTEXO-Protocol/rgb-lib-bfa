@@ -1559,6 +1559,15 @@ impl Wallet {
         self._get_wallet().get_asset_metadata(asset_id)
     }
 
+    fn import_contract(
+        &self,
+        contract_path: String,
+        expected_asset_id: Option<String>,
+    ) -> Result<String, RgbLibError> {
+        self._get_wallet()
+            .import_contract(contract_path, expected_asset_id)
+    }
+
     fn get_fee_estimation(&self, online: Online, blocks: u16) -> Result<f64, RgbLibError> {
         self._get_wallet().get_fee_estimation(online, blocks)
     }
@@ -2179,6 +2188,15 @@ impl MultisigWallet {
 
     fn get_asset_metadata(&self, asset_id: String) -> Result<Metadata, RgbLibError> {
         self._get_wallet().get_asset_metadata(asset_id)
+    }
+
+    fn import_contract(
+        &self,
+        contract_path: String,
+        expected_asset_id: Option<String>,
+    ) -> Result<String, RgbLibError> {
+        self._get_wallet()
+            .import_contract(contract_path, expected_asset_id)
     }
 
     fn get_fee_estimation(&self, online: Online, blocks: u16) -> Result<f64, RgbLibError> {

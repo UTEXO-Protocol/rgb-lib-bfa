@@ -13,6 +13,23 @@ pub(crate) const CONSIGNMENT_RCV_FILE: &str = "rcv_compose.rgbc";
 
 const ASSET_ID_PREFIX: &str = "rgb:";
 
+/// A genesis import has no witnesses to resolve and must match the wallet's network.
+struct ContractImportResolver(ChainNet);
+
+impl ResolveWitness for ContractImportResolver {
+    fn resolve_witness(&self, _: RgbTxid) -> Result<WitnessStatus, WitnessResolverError> {
+        Err(WitnessResolverError::NotSupported)
+    }
+
+    fn check_chain_net(&self, network: ChainNet) -> Result<(), WitnessResolverError> {
+        if network == self.0 {
+            Ok(())
+        } else {
+            Err(WitnessResolverError::WrongChainNet)
+        }
+    }
+}
+
 pub(crate) const UDA_FIXED_INDEX: u32 = 0;
 
 pub(crate) const MAX_ATTACHMENTS: usize = 20;
@@ -3144,6 +3161,81 @@ pub trait WalletOffline: WalletBackup {
 
 /// Offline operations for a wallet.
 pub trait RgbWalletOpsOffline: WalletOffline + WalletBackup {
+    /// Validate and register an RGB contract before receiving any of its assets.
+    ///
+    /// Accepts a binary contract file, including the validated contract format saved at issuance.
+    /// Any validation status stored in the file is discarded and the genesis is validated again
+    /// against the wallet's Bitcoin network and supported schemas. Transfer files and contracts
+    /// containing transfer history are rejected. No indexer, proxy or EVM connection is needed.
+    ///
+    /// If `expected_asset_id` is provided, it must identify this contract. On success, returns
+    /// the canonical asset ID. The contract, its metadata and the backup timestamp are saved in
+    /// one database transaction. Re-importing an already registered contract validates the file
+    /// again and leaves the existing wallet state unchanged.
+    ///
+    /// Registration creates no transfers or spendable balance. Subsequent receives still require
+    /// the normal transfer validation, including witness, mint claim and reject-list checks.
+    /// Media references are recorded but their files are not downloaded by this operation.
+    fn import_contract(
+        &mut self,
+        contract_path: String,
+        expected_asset_id: Option<String>,
+    ) -> Result<String, Error> {
+        info!(self.logger(), "Importing contract...");
+        check_file_exists(&contract_path)?;
+        let contract = match UniversalFile::load_file(&contract_path) {
+            Ok(UniversalFile::Contract(contract)) => contract,
+            // Issuance exports a ValidContract. Its saved validation status is untrusted.
+            Err(LoadError::InvalidMagic) => ValidContract::load_file(&contract_path)
+                .map_err(|_| Error::InvalidConsignment)?
+                .into_consignment(),
+            _ => return Err(Error::InvalidConsignment),
+        };
+        let contract_id = contract.contract_id();
+        let asset_id = contract_id.to_string();
+        if let Some(expected) = expected_asset_id {
+            let expected_id =
+                ContractId::from_str(&expected).map_err(|_| Error::InvalidContractId {
+                    contract_id: expected.clone(),
+                })?;
+            if expected_id != contract_id {
+                return Err(Error::ContractIdMismatch {
+                    expected,
+                    actual: asset_id,
+                });
+            }
+        }
+        let schema = AssetSchema::try_from(contract.schema_id())?;
+        self.check_schema_support(&schema)?;
+        let resolver = ContractImportResolver(self.chain_net());
+        let config = ValidationConfig {
+            chain_net: self.chain_net(),
+            ..Default::default()
+        };
+        let valid_contract = contract
+            .validate(&schema.schema_rules(), &resolver, &config)
+            .map_err(|e| Error::ConsignmentValidationFailed {
+                details: match e {
+                    ValidationError::InvalidConsignment(failure) => failure.to_string(),
+                    error => error.to_string(),
+                },
+            })?;
+
+        let txn = self.database().begin_transaction()?;
+        let mut stock = self.rgb_stock(&txn)?;
+        if txn.get_asset(asset_id.clone())?.is_some() {
+            // A metadata row alone does not establish that the RGB genesis is present.
+            stock.genesis(contract_id)?;
+        } else {
+            stock.import_contract(valid_contract.clone(), &resolver)?;
+            self.save_new_asset_internal(&txn, &stock, contract_id, schema, valid_contract, None)?;
+            self.update_backup_info(&txn, false)?;
+        }
+        txn.commit()?;
+        info!(self.logger(), "Import contract completed");
+        Ok(asset_id)
+    }
+
     /// Return the data that defines the wallet.
     fn get_wallet_data(&self) -> WalletData {
         self.wallet_data().clone()

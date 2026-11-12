@@ -107,6 +107,15 @@ pub enum Error {
         details: String,
     },
 
+    /// The imported contract has a different asset ID from the one requested
+    #[error("Contract asset ID mismatch: expected {expected}, got {actual}")]
+    ContractIdMismatch {
+        /// Requested asset ID
+        expected: String,
+        /// Asset ID of the supplied contract
+        actual: String,
+    },
+
     /// A database error has been encountered
     #[error("Database error: {details}")]
     Database {

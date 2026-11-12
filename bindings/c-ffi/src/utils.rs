@@ -489,6 +489,20 @@ pub(crate) fn get_received_mint(
     Ok(serde_json::to_string(&res)?)
 }
 
+pub(crate) fn import_contract(
+    wallet: &COpaqueStruct,
+    contract_path: *const c_char,
+    expected_asset_id: *const c_char,
+) -> Result<String, Error> {
+    let contract_path =
+        convert_optional_string(contract_path).ok_or_else(|| RgbLibError::InvalidFilePath {
+            file_path: String::new(),
+        })?;
+    let expected_asset_id = convert_optional_string(expected_asset_id);
+    let wallet = Wallet::from_opaque(wallet)?;
+    Ok(wallet.import_contract(contract_path, expected_asset_id)?)
+}
+
 pub(crate) fn go_online(
     wallet: &COpaqueStruct,
     online_options: *const c_char,
@@ -1122,4 +1136,28 @@ pub(crate) fn witness_receive(
         encryption,
     )?;
     Ok(serde_json::to_string(&res)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_contract_rejects_null_path() {
+        let wallet = COpaqueStruct::raw(std::ptr::null::<c_void>());
+        let result = rgblib_import_contract(&wallet, std::ptr::null(), std::ptr::null());
+        assert!(matches!(result.result, CResultValue::Err));
+        assert!(ptr_to_string(result.inner).contains("InvalidFilePath"));
+        free_string(result.inner);
+    }
+
+    #[test]
+    fn import_contract_allows_null_expected_id_and_checks_wallet_type() {
+        let wallet = COpaqueStruct::raw(std::ptr::null::<c_void>());
+        let path = CString::new("contract.rgb").unwrap();
+        let result = rgblib_import_contract(&wallet, path.as_ptr(), std::ptr::null());
+        assert!(matches!(result.result, CResultValue::Err));
+        assert_eq!(ptr_to_string(result.inner), "TypeMismatch");
+        free_string(result.inner);
+    }
 }

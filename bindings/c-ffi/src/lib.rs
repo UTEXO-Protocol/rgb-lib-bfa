@@ -316,6 +316,17 @@ pub extern "C" fn rgblib_go_online(
     go_online(wallet, online_options).into()
 }
 
+/// Register a genesis-only contract and return its asset ID.
+/// `expected_asset_id` may be NULL to accept any valid contract ID.
+#[unsafe(no_mangle)]
+pub extern "C" fn rgblib_import_contract(
+    wallet: &COpaqueStruct,
+    contract_path: *const c_char,
+    expected_asset_id: *const c_char,
+) -> CResultString {
+    import_contract(wallet, contract_path, expected_asset_id).into()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rgblib_inflate(
     wallet: &COpaqueStruct,

@@ -40,6 +40,7 @@ interface RgbLibError {
   CannotUseSchemaOnMainnet(AssetSchema asset_schema);
   ConsignmentRejected(sequence<string> opouts);
   ConsignmentValidationFailed(string details);
+  ContractIdMismatch(string expected, string actual);
   Database(string details);
   DuplicateProxyAuthKey(string details);
   EmptyFile(string file_path);
@@ -1178,6 +1179,9 @@ interface Wallet {
   Metadata get_asset_metadata(string asset_id);
 
   [Throws=RgbLibError]
+  string import_contract(string contract_path, string? expected_asset_id);
+
+  [Throws=RgbLibError]
   f64 get_fee_estimation(Online online, u16 blocks);
 
   [Throws=RgbLibError]
@@ -1385,6 +1389,9 @@ interface MultisigWallet {
 
   [Throws=RgbLibError]
   Metadata get_asset_metadata(string asset_id);
+
+  [Throws=RgbLibError]
+  string import_contract(string contract_path, string? expected_asset_id);
 
   [Throws=RgbLibError]
   f64 get_fee_estimation(Online online, u16 blocks);

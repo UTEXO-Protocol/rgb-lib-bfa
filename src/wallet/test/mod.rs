@@ -681,6 +681,7 @@ mod get_wallet_data;
 mod get_wallet_dir;
 #[cfg(feature = "_online")]
 mod go_online;
+mod import_contract;
 #[cfg(feature = "electrum")]
 mod inflate;
 #[cfg(feature = "electrum")]
