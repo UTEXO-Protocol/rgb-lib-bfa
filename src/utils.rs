@@ -678,6 +678,47 @@ pub(crate) fn is_rgb_key(key: &bdk_wallet::bitcoin::psbt::raw::ProprietaryKey) -
     .contains(&key.prefix.as_slice())
 }
 
+/// Check that the output map of every asset in `coloring_info` can safely color `psbt`, whose
+/// OP_RETURN output is the first one when `shift` is set (output indexes in the coloring info then
+/// exclude it and shift by one, as in `color_psbt`).
+///
+/// A clean PSBT colored with a bad output map can still burn or misplace assets, so every output
+/// receiving assets must exist, must not be the OP_RETURN output and must pay a script that can
+/// carry an RGB seal (P2PKH, P2SH, P2WPKH, P2WSH or P2TR). Flows that save a colored batch should
+/// run this again when saving it.
+#[cfg(feature = "wallet")]
+pub(crate) fn check_output_map(
+    psbt: &Psbt,
+    coloring_info: &crate::wallet::rust_only::ColoringInfo,
+    shift: bool,
+) -> Result<(), Error> {
+    let invalid = |details: &str| Error::InvalidColoringInfo {
+        details: details.to_string(),
+    };
+    for asset_coloring_info in coloring_info.asset_info_map.values() {
+        for (index, amount) in &asset_coloring_info.output_map {
+            if *amount == 0 {
+                continue;
+            }
+            let vout = index
+                .checked_add(u32::from(shift))
+                .ok_or_else(|| invalid("vout in output_map is too large"))?;
+            let output = psbt.unsigned_tx.output.get(vout as usize).ok_or_else(|| {
+                invalid("invalid vout in output_map, does not exist in the given PSBT")
+            })?;
+            if output.script_pubkey.is_op_return() {
+                return Err(invalid("output_map assigns assets to the OP_RETURN output"));
+            }
+            if AddressPayload::from_script(&output.script_pubkey).is_err() {
+                return Err(invalid(
+                    "output_map assigns assets to an output whose script can't carry an RGB seal",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Maximum number of inputs, and of outputs, of a PSBT built outside of the wallet.
 #[cfg(feature = "_online")]
 const MAX_EXTERNAL_PSBT_IO: usize = 1000;
@@ -1552,6 +1593,129 @@ mod tests {
             get_indexer_and_resolver(&IndexerConfig::Electrum { url }, BitcoinNetwork::Regtest);
         // Indexer is not Debug, so the Ok variant cannot be printed by assert_matches
         assert!(matches!(result, Err(Error::InvalidIndexer { .. })));
+    }
+
+    #[cfg(feature = "wallet")]
+    mod output_map {
+        use super::*;
+        use crate::wallet::rust_only::{AssetColoringInfo, ColoringInfo};
+        use bdk_wallet::bitcoin::{absolute::LockTime, transaction::Version};
+        use serial_test::parallel;
+
+        const CONTRACT: &str = "rgb:Ar4ouaLv-b7f7Dc_-z5EMvtu-FA5KNh1-nlae~jk-8xMBo7E";
+
+        fn build(scripts: Vec<ScriptBuf>) -> Psbt {
+            Psbt::from_unsigned_tx(BdkTransaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![],
+                output: scripts
+                    .into_iter()
+                    .map(|script_pubkey| TxOut {
+                        value: BdkAmount::from_sat(1000),
+                        script_pubkey,
+                    })
+                    .collect(),
+            })
+            .unwrap()
+        }
+
+        fn coloring(output_map: &[(u32, u64)]) -> ColoringInfo {
+            ColoringInfo {
+                asset_info_map: HashMap::from([(
+                    ContractId::from_str(CONTRACT).unwrap(),
+                    AssetColoringInfo {
+                        output_map: output_map.iter().copied().collect(),
+                        static_blinding: None,
+                    },
+                )]),
+                static_blinding: None,
+                nonce: None,
+            }
+        }
+
+        fn details(result: Result<(), Error>) -> String {
+            match result {
+                Err(Error::InvalidColoringInfo { details }) => details,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        fn p2wpkh() -> ScriptBuf {
+            ScriptBuf::from_bytes([vec![0x00, 0x14], vec![1; 20]].concat())
+        }
+
+        fn p2tr() -> ScriptBuf {
+            // x-only key of the secp256k1 generator, a valid BIP340 key
+            let key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+            ScriptBuf::from_bytes([vec![0x51, 0x20], hex::decode(key).unwrap()].concat())
+        }
+
+        #[test]
+        #[parallel]
+        fn accepts_outputs_that_can_carry_a_seal() {
+            // P2WPKH at 0, OP_RETURN last
+            let psbt = build(vec![p2wpkh(), ScriptBuf::new_op_return([])]);
+            check_output_map(&psbt, &coloring(&[(0, 10)]), false).unwrap();
+            // OP_RETURN first: index 0 is the P2TR output at vout 1
+            let psbt_tr = build(vec![ScriptBuf::new_op_return([]), p2tr()]);
+            check_output_map(&psbt_tr, &coloring(&[(0, 10)]), true).unwrap();
+            // an output receiving nothing is not checked
+            check_output_map(&psbt, &coloring(&[(7, 0)]), false).unwrap();
+        }
+
+        #[test]
+        #[parallel]
+        fn rejects_missing_outputs() {
+            let missing = "invalid vout in output_map, does not exist in the given PSBT";
+            let psbt = build(vec![p2wpkh(), ScriptBuf::new_op_return([])]);
+            // vout == number of outputs is one past the last output
+            assert_eq!(
+                details(check_output_map(&psbt, &coloring(&[(2, 10)]), false)),
+                missing
+            );
+            let psbt_tr = build(vec![ScriptBuf::new_op_return([]), p2tr()]);
+            assert_eq!(
+                details(check_output_map(&psbt_tr, &coloring(&[(1, 10)]), true)),
+                missing
+            );
+            assert_eq!(
+                details(check_output_map(
+                    &psbt_tr,
+                    &coloring(&[(u32::MAX, 10)]),
+                    true
+                )),
+                "vout in output_map is too large"
+            );
+        }
+
+        #[test]
+        #[parallel]
+        fn rejects_the_opreturn_output() {
+            let psbt = build(vec![p2wpkh(), ScriptBuf::new_op_return([])]);
+            assert_eq!(
+                details(check_output_map(&psbt, &coloring(&[(1, 10)]), false)),
+                "output_map assigns assets to the OP_RETURN output"
+            );
+        }
+
+        #[test]
+        #[parallel]
+        fn rejects_scripts_that_cannot_carry_a_seal() {
+            let unsupported =
+                "output_map assigns assets to an output whose script can't carry an RGB seal";
+            // bare OP_TRUE, and a future SegWit version
+            for script in [
+                ScriptBuf::from_bytes(vec![0x51]),
+                ScriptBuf::from_bytes([vec![0x52, 0x20], vec![1; 32]].concat()),
+            ] {
+                let psbt = build(vec![script, ScriptBuf::new_op_return([])]);
+                assert_eq!(
+                    details(check_output_map(&psbt, &coloring(&[(0, 10)]), false)),
+                    unsupported
+                );
+            }
+        }
     }
 
     #[cfg(feature = "_online")]

@@ -85,6 +85,8 @@ impl Wallet {
             *psbt = Psbt::from_unsigned_tx(transaction).unwrap();
         }
 
+        check_output_map(psbt, &coloring_info, opreturn_first)?;
+
         let txn = self.database().begin_transaction()?;
         let stock = self.rgb_stock(&txn)?;
 
@@ -150,11 +152,6 @@ impl Wallet {
                         .ok_or_else(|| Error::InvalidColoringInfo {
                             details: s!("total amount in output_map exceeds u64::MAX"),
                         })?;
-                if vout as usize > psbt.outputs.len() {
-                    return Err(Error::InvalidColoringInfo {
-                        details: s!("invalid vout in output_map, does not exist in the given PSBT"),
-                    });
-                }
                 let graph_seal = if let Some(blinding) = asset_coloring_info.static_blinding {
                     GraphSeal::with_blinded_vout(vout, blinding)
                 } else {

@@ -557,11 +557,17 @@ fn color_psbt_overflow_fail() {
     // total amount in output_map overflows u64: two valid vouts whose amounts sum to
     // more than u64::MAX (the checked sum must error before reaching the available check)
     let address = BdkAddress::from_str(&recv_party.get_address()).unwrap();
+    // the funded UTXO only covers two outputs at the dust limit (330 sats)
+    let address_2 = BdkAddress::from_str(&recv_party.get_address()).unwrap();
     let mut tx_builder = party_send.wallet.bdk_wallet_mut().build_tx();
     tx_builder
         .add_recipient(
             address.assume_checked().script_pubkey(),
-            BdkAmount::from_sat(amt_sat),
+            BdkAmount::from_sat(330),
+        )
+        .add_recipient(
+            address_2.assume_checked().script_pubkey(),
+            BdkAmount::from_sat(330),
         )
         .fee_rate(FeeRate::from_sat_per_vb_u32(FEE_RATE as u32));
     let mut psbt = tx_builder.finish().unwrap();
